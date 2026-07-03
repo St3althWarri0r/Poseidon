@@ -121,6 +121,16 @@ Custom screeners, written by you or by Claude, saved in the platform:
   change is audited. A broken active algorithm demotes itself to draft at
   startup instead of blocking the platform.
 
+Rotation models (Composer symphonies, tactical allocation trees) port
+naturally: compute the target book and emit one `long` signal per holding
+with `target_weight` in the evidence, plus `exit` signals for holdings
+that fell out — in autonomous mode the AI executes the rebalance through
+the risk engine with no human input. Indicator primitives matching
+Composer's (`ctx.rsi`, `ctx.sma`, `ctx.cumulative_return`,
+`ctx.moving_average_return`, Wilder RSI, percent units) are built in, and
+`examples/algorithms/tqqq_ftlt.py` ships a complete faithful port of a
+real symphony as the template.
+
 A word on trust: algorithms run in-process, like installed plugins. The
 static screen is a guardrail against accidents, not a sandbox — read
 anything you paste from the internet before activating it.

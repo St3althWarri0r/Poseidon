@@ -36,6 +36,7 @@ import structlog
 from ..core.errors import DataError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
+from . import indicators
 from .base import Signal, Strategy
 
 log = structlog.get_logger(__name__)
@@ -125,6 +126,23 @@ class AlgoContext:
 
     def log(self, message: str) -> None:
         log.info("algo log", algo=self.algo_name, message=str(message)[:400])
+
+    # Indicator primitives (Composer-compatible; see strategy/indicators.py).
+    @staticmethod
+    def rsi(closes: list[float], window: int = 14) -> float | None:
+        return indicators.rsi(closes, window)
+
+    @staticmethod
+    def sma(closes: list[float], window: int) -> float | None:
+        return indicators.sma(closes, window)
+
+    @staticmethod
+    def cumulative_return(closes: list[float], window: int) -> float | None:
+        return indicators.cumulative_return(closes, window)
+
+    @staticmethod
+    def moving_average_return(closes: list[float], window: int) -> float | None:
+        return indicators.moving_average_return(closes, window)
 
 
 class CustomAlgorithm(Strategy):

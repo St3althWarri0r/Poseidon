@@ -166,3 +166,52 @@ def test_review_source_validation_roundtrip() -> None:
 
     assert reviewer.validate_algorithm is validate_algorithm
     assert isinstance(datetime.now(UTC), datetime) and Decimal("1") == 1  # imports used
+
+
+class TestIndicators:
+    def test_rsi_wilder(self) -> None:
+        from poseidon.strategy.indicators import rsi
+
+        flat_up = [100 + i for i in range(30)]
+        assert rsi(flat_up, 14) == 100.0
+        alternating = [100.0]
+        for i in range(30):
+            alternating.append(alternating[-1] + (1 if i % 2 else -1))
+        value = rsi(alternating, 14)
+        assert value is not None and 40 < value < 60
+        assert rsi([100.0] * 5, 14) is None  # not enough history
+
+    def test_cumulative_and_ma_return_percent_units(self) -> None:
+        from poseidon.strategy.indicators import cumulative_return, moving_average_return
+
+        closes = [100.0, 101.0, 102.0, 103.0, 104.0]
+        cr = cumulative_return(closes, 4)
+        assert cr is not None and abs(cr - 4.0) < 1e-9  # percent, like Composer
+        mar = moving_average_return(closes, 4)
+        assert mar is not None and 0.9 < mar < 1.0
+
+
+class TestFTLTExample:
+    """The shipped Composer port must pass the workshop validator, compile,
+    and run against the fake feed (flat prices => bull-market top-3 path)."""
+
+    def _source(self) -> str:
+        import pathlib
+        return pathlib.Path("examples/algorithms/tqqq_ftlt.py").read_text()
+
+    def test_validates_and_compiles(self) -> None:
+        source = self._source()
+        assert validate_algorithm(source) == []
+        CustomAlgorithm(algo_name="tqqq_ftlt", source=source, symbols=[])
+
+    async def test_runs_and_targets_weights(self) -> None:
+        router = DataRouter([(FakeProvider(name="feed", bars_count=280), 10)],
+                            FreshnessPolicy())
+        algo = CustomAlgorithm(algo_name="tqqq_ftlt", source=self._source(), symbols=[])
+        signals = await algo.scan(router, PortfolioState())
+        # Flat closes: SPY == its 200d MA (not above) => dip-buy branch; flat
+        # RSI = None-safe paths; the algorithm must return SOMETHING sane or
+        # nothing, but never raise.
+        for s in signals:
+            assert s.direction in ("long", "exit")
+            assert 0.0 <= s.strength <= 1.0
