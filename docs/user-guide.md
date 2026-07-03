@@ -54,23 +54,28 @@ you're notified). A daily digest lands on your notification channels at
 
 ## The dashboard (http://127.0.0.1:8321)
 
-- **Header**: mode selector, market session, overall health, circuit
-  state, *Run cycle* (manual review), **HALT** (kill switch — opens the
-  circuit breaker until *Resume*).
-- **Tiles**: equity, day P&L, cash/buying power, drawdown, gross/options
-  exposure.
-- **Equity chart** with crosshair inspection.
-- **Risk limits**: live meters for daily/weekly loss and drawdown against
-  their limits, plus the order budget for the day.
-- **Pending approvals** (Mode 2): the proposal with thesis, confidence,
-  max loss, and countdown; Approve/Reject buttons.
-- **Positions / Orders**: live tables; open orders can be canceled.
-- **AI reasoning log**: every decision with its rationale and the data
-  sources actually used.
-- **System / Data providers**: component health, broker connection,
-  provider latency and penalty status.
-- **Event feed**: the live event bus (fills, syncs, violations, health
-  transitions).
+A sidebar-navigated app with six views. The header is always present:
+mode switch (Research / Approval / Auto), market session, **market
+regime**, health, circuit state, *Run cycle*, and **HALT** (kill switch —
+opens the circuit breaker until *Resume*; asks for confirmation). Action
+feedback arrives as toasts; the AI Desk item shows a badge while trades
+await your approval.
+
+- **Overview** — equity, day P&L, cash/buying power, drawdown, exposure,
+  and regime tiles; the equity curve with crosshair inspection; loss-limit
+  meters; allocation; and the live event feed.
+- **Portfolio** — positions (with portfolio weight), armed guardian exit
+  plans, and the order blotter (fills show their slippage; open orders can
+  be canceled).
+- **AI Desk** — pending approvals with thesis/confidence/max-loss and
+  countdown; the full reasoning log; AI token usage and estimated spend.
+- **Risk** — 1-day VaR/expected shortfall, portfolio beta, annualized
+  vol, most-correlated pair, the market-regime read (trend, vol
+  percentile, drawdown), loss-limit meters, and metric coverage.
+- **Performance** — portfolio and trade statistics, per-strategy
+  attribution, monthly returns, and the execution-quality (TCA) report.
+- **System** — component health, data-provider latency/penalty status,
+  scheduler runtime, and the tamper-evident audit trail.
 
 ## Approvals (Mode 2)
 

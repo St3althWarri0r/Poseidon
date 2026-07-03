@@ -63,6 +63,25 @@ make VaR a hard pre-trade limit; while it is enabled, missing or stale
 (>1 h) metrics block new risk — an explicit VaR mandate with no current
 VaR estimate means no new positions.
 
+## Market regime & vol-targeted sizing
+
+Two advisory inputs that shape the AI's posture without being trade
+signals:
+
+- **Regime**: from live benchmark history, a four-state read —
+  ``risk_on`` (uptrend, unexceptional vol), ``neutral``, ``risk_off``
+  (downtrend and/or elevated vol), ``stress`` (vol extreme or ≥15% index
+  drawdown) — built from trend vs. 50/200-day averages, the 20-day
+  realized vol's percentile within its own 1-year range, and drawdown
+  from the 1-year high. It is injected into every review-cycle prompt
+  and shown in the dashboard header. Insufficient history reads
+  ``unknown`` and the AI is told nothing.
+- **Vol-targeted sizing** (`suggest_position_size` tool): shares such
+  that one typical day moves the position by `position_risk_budget_pct`
+  of equity — equal risk per position instead of equal notional — capped
+  by the position-size limit and live buying power. Advisory: the risk
+  engine still validates every order.
+
 ### Risk-reducing order exemptions
 
 Halts and entry filters exist to stop *new* risk — they must never trap

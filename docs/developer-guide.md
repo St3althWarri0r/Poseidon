@@ -6,7 +6,7 @@
 git clone https://github.com/St3althWarri0r/Aegis-Trader && cd Aegis-Trader
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest            # 144 tests, a few seconds
+pytest            # 154 tests, a few seconds
 ruff check src tests
 mypy src          # strict mode
 ```

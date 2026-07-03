@@ -13,6 +13,7 @@ from typing import Any
 
 import structlog
 
+from ..core.config import RiskConfig
 from ..core.errors import DataError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
@@ -25,12 +26,14 @@ _MAX_RESULT_CHARS = 60_000  # keep tool results bounded for the context window
 
 class ToolDispatcher:
     def __init__(self, router: DataRouter, portfolio: PortfolioState, risk: RiskEngine,
-                 *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY") -> None:
+                 *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY",
+                 risk_config: RiskConfig | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
         self._allow_delayed = allow_delayed_quotes
         self._benchmark = benchmark_symbol
+        self._risk_config = risk_config or RiskConfig()
         self.sources_used: set[str] = set()
 
     async def dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
@@ -117,6 +120,31 @@ class ToolDispatcher:
 
     async def _tool_get_risk_status(self) -> dict[str, Any]:
         return self._risk.status()
+
+    async def _tool_suggest_position_size(self, symbol: str) -> dict[str, Any]:
+        """Vol-targeted size suggestion, from live quote + live bar history."""
+        from ..analytics.sizing import daily_volatility, suggest_size
+
+        quote = await self._router.quote(symbol, allow_delayed=self._allow_delayed)
+        self.sources_used.add(quote.source)
+        price = quote.mid or quote.last
+        if price is None or price <= 0:
+            raise DataError(f"no usable live price for {symbol}")
+        bars = await self._router.bars(symbol, timeframe="1d", limit=60)
+        vol = daily_volatility([float(b.close) for b in bars])
+        if vol is None:
+            raise DataError(f"not enough daily history to estimate {symbol} volatility")
+        account = self._portfolio.account
+        if account is None:
+            raise DataError("no account snapshot — sync the portfolio first")
+        result = suggest_size(
+            equity=float(account.equity), price=float(price), daily_vol=vol,
+            risk_budget_pct=self._risk_config.position_risk_budget_pct,
+            max_position_pct=self._risk_config.max_position_pct,
+            buying_power=float(account.buying_power),
+        )
+        result["symbol"] = symbol.upper()
+        return result
 
     async def _tool_get_risk_metrics(self) -> dict[str, Any]:
         from ..analytics.risk_metrics import gather_risk_metrics

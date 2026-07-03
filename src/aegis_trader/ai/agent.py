@@ -83,7 +83,7 @@ class ClaudeAgent:
 
     async def run_cycle(self, *, mode: TradingMode, watchlist: list[str],
                         enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
-                        market_session: str) -> Decision:
+                        market_session: str, market_regime: str | None = None) -> Decision:
         """Run one full review cycle and return the validated Decision."""
         cycle_id = uuid.uuid4().hex[:12]
         self._dispatcher.sources_used.clear()
@@ -92,7 +92,7 @@ class ClaudeAgent:
         user_prompt = self._cycle_prompt(
             cycle_id=cycle_id, mode=mode, watchlist=watchlist,
             enabled_strategies=enabled_strategies, strategy_signals=strategy_signals,
-            market_session=market_session,
+            market_session=market_session, market_regime=market_regime,
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         decision_input: dict[str, Any] | None = None
@@ -183,14 +183,19 @@ class ClaudeAgent:
     @staticmethod
     def _cycle_prompt(*, cycle_id: str, mode: TradingMode, watchlist: list[str],
                       enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
-                      market_session: str) -> str:
+                      market_session: str, market_regime: str | None = None) -> str:
         import json
 
         signals = json.dumps(strategy_signals, default=str) if strategy_signals else "none"
+        regime_line = (
+            f"Market regime (computed from live benchmark history; use it for posture "
+            f"and sizing, not as a trade signal): {market_regime}\n"
+        ) if market_regime else ""
         return (
             f"Review cycle {cycle_id} at {datetime.now(UTC).isoformat()}.\n"
             f"Operating mode: {mode.value}\n"
             f"Market session: {market_session}\n"
+            f"{regime_line}"
             f"Watchlist: {', '.join(watchlist) if watchlist else '(empty)'}\n"
             f"Enabled strategies: {', '.join(enabled_strategies) if enabled_strategies else 'none — observation only'}\n"
             f"Quantitative strategy signals this cycle (candidates to verify with live data, "

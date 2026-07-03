@@ -181,6 +181,15 @@ DATA_TOOLS: list[dict[str, Any]] = [
         {}, [],
     ),
     _simple_tool(
+        "suggest_position_size",
+        "Volatility-targeted position size for a symbol, from the live quote and "
+        "live bar history: shares such that one typical day moves the position by "
+        "the configured risk budget (equalizing risk across positions), capped by "
+        "the position-size limit and live buying power. Advisory — use it as your "
+        "sizing baseline instead of round numbers; the risk engine still validates.",
+        {"symbol": {"type": "string"}}, ["symbol"],
+    ),
+    _simple_tool(
         "get_risk_metrics",
         "Portfolio risk metrics computed from live bar history: 1-day historical "
         "VaR and expected shortfall (95/99%), portfolio beta to the benchmark, "

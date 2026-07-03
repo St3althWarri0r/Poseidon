@@ -103,6 +103,10 @@ class RiskConfig(StrictModel):
     # enabled, fresh risk metrics are REQUIRED before opening new risk.
     max_portfolio_var_pct: float = Field(default=0.0, ge=0, le=1)
     benchmark_symbol: str = "SPY"  # beta/correlation benchmark for risk metrics
+    # Vol-targeted sizing: per-position daily risk budget as a fraction of
+    # equity (0.005 = a position sized so one typical day moves it by
+    # ~0.5% of account equity). Advisory input to the AI's sizing tool.
+    position_risk_budget_pct: float = Field(default=0.005, gt=0, le=0.1)
 
 
 class GuardianConfig(StrictModel):

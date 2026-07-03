@@ -109,6 +109,7 @@ class ApplicationKernel:
             self.router, self.portfolio, self.risk,
             allow_delayed_quotes=cfg.data.allow_delayed_for_research,
             benchmark_symbol=cfg.risk.benchmark_symbol,
+            risk_config=cfg.risk,
         )
         api_key = self.vault.get(cfg.ai.api_key_credential)
         self.agent = ClaudeAgent(cfg.ai, api_key, dispatcher)
@@ -301,6 +302,7 @@ class ApplicationKernel:
                     enabled_strategies=self.strategies.enabled_names,
                     strategy_signals=[s.as_dict() for s in signals],
                     market_session=self.clock.session().value,
+                    market_regime=await self._regime_line(),
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -348,6 +350,29 @@ class ApplicationKernel:
 
     async def _risk_metrics_job(self) -> None:
         await self.refresh_risk_metrics()
+
+    async def _regime_line(self) -> str | None:
+        """Regime summary for the cycle prompt. Uses the cached metrics when
+        fresh; otherwise computes from live benchmark bars alone (one call).
+        Returns None when history is unavailable — the AI is told nothing
+        rather than something stale."""
+        from .analytics.regime import compute_regime
+
+        metrics = self.portfolio.risk_metrics
+        age = self.portfolio.risk_metrics_age_seconds()
+        if metrics is not None and age is not None and age < 1800:
+            regime = metrics.get("regime")
+            if isinstance(regime, dict) and regime.get("state") not in (None, "unknown"):
+                return (f"{regime['state']} ({regime.get('detail', '')}) — "
+                        f"benchmark {regime.get('benchmark')}")
+        try:
+            bars = await self.router.bars(self.config.risk.benchmark_symbol,
+                                          timeframe="1d", limit=300)
+        except DataError:
+            return None
+        report = compute_regime([float(b.close) for b in bars],
+                                benchmark=self.config.risk.benchmark_symbol)
+        return report.summary_line() if report.state != "unknown" else None
 
     async def refresh_risk_metrics(self) -> dict[str, object]:
         """Recompute portfolio VaR/beta/correlation from live bar history

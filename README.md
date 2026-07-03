@@ -42,6 +42,14 @@ from live, authoritative data providers — never from memory, never estimated.
   volatility, recomputed from live bar history every 15 minutes and
   available to the AI as a tool; optionally enforced as a hard VaR limit
   on new risk.
+- **Regime-aware, risk-equalized** — a live market-regime read (trend,
+  vol percentile, drawdown → risk-on/neutral/risk-off/stress) feeds every
+  review cycle, and a vol-targeted sizing tool gives the AI equal-risk
+  share counts instead of round numbers.
+- **Professional dashboard** — a sidebar-navigated dark UI (Overview,
+  Portfolio, AI Desk, Risk, Performance, System) with live tiles, equity
+  curve, approvals with one-click actions, toasts, and the full audit
+  trail. No frameworks, no CDNs — self-contained and localhost-only.
 - **Execution quality (TCA)** — arrival price captured at risk validation,
   signed slippage in bps on every fill, and a standing best-execution
   report (fill rate, per-side/per-symbol cost, time-to-fill).
@@ -72,7 +80,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 144 unit/integration tests, paper trading, historical
+- **Testing** — 154 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 

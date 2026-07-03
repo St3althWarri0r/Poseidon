@@ -26,6 +26,7 @@ import structlog
 
 from ..core.enums import AssetClass
 from ..core.errors import DataError
+from .regime import RegimeReport, compute_regime
 
 if TYPE_CHECKING:
     from ..data.router import DataRouter
@@ -52,6 +53,7 @@ class RiskMetricsReport:
     positions_covered: int
     positions_total: int
     uncovered_symbols: list[str]
+    regime: RegimeReport | None = None  # benchmark regime, attached by the gatherer
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +73,7 @@ class RiskMetricsReport:
             "positions_covered": self.positions_covered,
             "positions_total": self.positions_total,
             "uncovered_symbols": self.uncovered_symbols,
+            "regime": self.regime.as_dict() if self.regime else None,
         }
 
 
@@ -201,13 +204,19 @@ async def gather_risk_metrics(router: DataRouter, portfolio: PortfolioState,
         returns_by_symbol[symbol] = rets
 
     benchmark_returns: list[float] | None = None
+    benchmark_closes: list[float] = []
     try:
-        bench_bars = await router.bars(benchmark, timeframe="1d", limit=_WINDOW_BARS)
-        benchmark_returns = _returns([float(b.close) for b in bench_bars])
+        # 300 bars: enough for the regime's 200-day average AND the ~6-month
+        # return window used for beta.
+        bench_bars = await router.bars(benchmark, timeframe="1d", limit=300)
+        benchmark_closes = [float(b.close) for b in bench_bars]
+        benchmark_returns = _returns(benchmark_closes[-_WINDOW_BARS:])
     except DataError:
         log.warning("benchmark history unavailable; beta will be null", benchmark=benchmark)
 
-    return compute_risk_metrics(
+    report = compute_risk_metrics(
         weights, returns_by_symbol, benchmark_returns,
         benchmark=benchmark, positions_total=len(positions), uncovered=uncovered,
     )
+    report.regime = compute_regime(benchmark_closes, benchmark=benchmark)
+    return report

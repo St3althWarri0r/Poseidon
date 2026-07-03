@@ -67,7 +67,8 @@ Every limit is enforced pre-trade by the risk engine
 `circuit_breaker_cooldown_seconds`, `slippage_limit_pct`,
 `max_portfolio_var_pct` (0 disables the VaR halt; enabling it requires
 fresh risk metrics before new risk), `benchmark_symbol` (beta/correlation
-benchmark, default SPY).
+/regime benchmark, default SPY), `position_risk_budget_pct` (per-position
+daily risk budget for the AI's vol-targeted sizing tool, default 0.5%).
 
 Every rule is documented with its rationale in docs/risk-controls.md.
 

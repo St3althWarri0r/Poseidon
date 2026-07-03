@@ -111,6 +111,9 @@ risk:
   # metrics and is blocked while 1-day VaR(95) exceeds this % of equity.
   max_portfolio_var_pct: 0
   benchmark_symbol: SPY
+  # Vol-targeted sizing: one typical day should move a position by this
+  # fraction of equity (feeds the AI's suggest_position_size tool).
+  position_risk_budget_pct: 0.005
 
 # Position guardian: enforces each decision's stop-loss / take-profit against
 # live quotes between review cycles (research: alert only; approval: proposes
