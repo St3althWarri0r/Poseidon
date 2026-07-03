@@ -9,17 +9,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from aegis_trader.core.config import GuardianConfig
-from aegis_trader.core.enums import (
+from poseidon.core.config import GuardianConfig
+from poseidon.core.enums import (
     DecisionAction,
     MarketSession,
     OrderSide,
     OrderStatus,
     TradingMode,
 )
-from aegis_trader.core.models import Order, Position, Quote
-from aegis_trader.execution.guardian import PositionGuardian
-from aegis_trader.storage.db import Database
+from poseidon.core.models import Order, Position, Quote
+from poseidon.execution.guardian import PositionGuardian
+from poseidon.storage.db import Database
 
 
 class KernelStub:

@@ -8,10 +8,10 @@ from decimal import Decimal
 
 import pytest
 
-from aegis_trader.backtest.analysis import monte_carlo, stress_test, walk_forward
-from aegis_trader.backtest.engine import BacktestConfig, BacktestEngine, BacktestResult
-from aegis_trader.core.models import Bar
-from aegis_trader.strategy.builtin.trend import MomentumStrategy
+from poseidon.backtest.analysis import monte_carlo, stress_test, walk_forward
+from poseidon.backtest.engine import BacktestConfig, BacktestEngine, BacktestResult
+from poseidon.core.models import Bar
+from poseidon.strategy.builtin.trend import MomentumStrategy
 
 
 def synthetic_history(symbol: str = "TEST", days: int = 250, drift: float = 0.001,

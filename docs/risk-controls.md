@@ -44,7 +44,7 @@ gap must not halt all trading; it is a filter, not a price.
 ## Portfolio risk metrics
 
 On a 15-minute market-hours schedule (and on demand via
-`GET /api/risk-metrics` or the AI's `get_risk_metrics` tool), Aegis
+`GET /api/risk-metrics` or the AI's `get_risk_metrics` tool), Poseidon
 computes from live bar history what a risk desk actually watches:
 
 - **1-day historical VaR and expected shortfall** (95%/99%) of the current
@@ -152,7 +152,7 @@ trigger is audited and notified.
 ## Execution quality (TCA)
 
 Every order records its **arrival price** — the live mid at the moment it
-passed final risk validation. On fill, Aegis computes signed
+passed final risk validation. On fill, Poseidon computes signed
 implementation shortfall in basis points (positive always = cost: paid
 more on a buy, received less on a sell). `GET /api/execution` aggregates
 fill rate, average/median/worst slippage, per-side and per-symbol cost,

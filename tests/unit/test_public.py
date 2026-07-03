@@ -9,8 +9,8 @@ from typing import Any
 
 import pytest
 
-from aegis_trader.brokers.plugins.public_com import PublicBroker, _client_uuid
-from aegis_trader.core.enums import (
+from poseidon.brokers.plugins.public_com import PublicBroker, _client_uuid
+from poseidon.core.enums import (
     AssetClass,
     OptionRight,
     OrderSide,
@@ -18,14 +18,14 @@ from aegis_trader.core.enums import (
     OrderType,
     TimeInForce,
 )
-from aegis_trader.core.errors import (
+from poseidon.core.errors import (
     BrokerAuthError,
     BrokerError,
     ProviderAuthError,
     ProviderError,
 )
-from aegis_trader.core.models import OptionLeg, Order
-from aegis_trader.data.providers.public_data import PublicDataProvider
+from poseidon.core.models import OptionLeg, Order
+from poseidon.data.providers.public_data import PublicDataProvider
 
 
 def make_broker() -> PublicBroker:

@@ -1,25 +1,25 @@
 services:
-  aegis:
+  poseidon:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: aegis-trader:latest
-    container_name: aegis-trader
+    image: poseidon:latest
+    container_name: poseidon
     restart: unless-stopped
     ports:
       - "127.0.0.1:8321:8321"   # dashboard stays loopback-only on the host
     volumes:
-      - aegis-data:/data
+      - poseidon-data:/data
     environment:
       # Provide the vault passphrase via an env file or docker secret —
-      # NEVER commit it. AEGIS_* variables override aegis.yaml values.
-      AEGIS_VAULT_PASSPHRASE_FILE: /run/secrets/aegis_vault_passphrase
+      # NEVER commit it. POSEIDON_* variables override poseidon.yaml values.
+      POSEIDON_VAULT_PASSPHRASE_FILE: /run/secrets/aegis_vault_passphrase
     secrets:
       - aegis_vault_passphrase
     stop_grace_period: 30s
 
 volumes:
-  aegis-data:
+  poseidon-data:
 
 secrets:
   aegis_vault_passphrase:

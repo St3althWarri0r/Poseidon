@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from aegis_trader.ai.agent import SYSTEM_PROMPT, ClaudeAgent
-from aegis_trader.ai.schemas import ALL_TOOLS, SUBMIT_DECISION_TOOL
-from aegis_trader.core.config import AIConfig
-from aegis_trader.core.enums import DecisionAction, OrderSide
+from poseidon.ai.agent import SYSTEM_PROMPT, ClaudeAgent
+from poseidon.ai.schemas import ALL_TOOLS, SUBMIT_DECISION_TOOL
+from poseidon.core.config import AIConfig
+from poseidon.core.enums import DecisionAction, OrderSide
 
 
 def make_agent() -> ClaudeAgent:

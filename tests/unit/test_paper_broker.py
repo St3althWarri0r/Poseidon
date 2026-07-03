@@ -6,10 +6,10 @@ from decimal import Decimal
 
 import pytest
 
-from aegis_trader.brokers.plugins.paper import PaperBroker
-from aegis_trader.core.enums import OrderSide, OrderStatus, OrderType
-from aegis_trader.core.errors import BrokerError
-from aegis_trader.core.models import Order
+from poseidon.brokers.plugins.paper import PaperBroker
+from poseidon.core.enums import OrderSide, OrderStatus, OrderType
+from poseidon.core.errors import BrokerError
+from poseidon.core.models import Order
 
 from ..conftest import make_quote
 

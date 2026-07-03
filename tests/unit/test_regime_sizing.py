@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from aegis_trader.analytics.regime import compute_regime
-from aegis_trader.analytics.sizing import daily_volatility, suggest_size
+from poseidon.analytics.regime import compute_regime
+from poseidon.analytics.sizing import daily_volatility, suggest_size
 
 
 def steady_series(n: int, *, start: float = 100.0, drift: float = 0.001,

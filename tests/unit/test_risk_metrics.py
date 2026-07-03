@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from aegis_trader.analytics.execution import execution_quality, slippage_bps
-from aegis_trader.analytics.risk_metrics import compute_risk_metrics
-from aegis_trader.core.enums import OrderSide
+from poseidon.analytics.execution import execution_quality, slippage_bps
+from poseidon.analytics.risk_metrics import compute_risk_metrics
+from poseidon.core.enums import OrderSide
 
 
 def metrics(weights, returns, bench=None, uncovered=()):  # type: ignore[no-untyped-def]

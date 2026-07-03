@@ -1,0 +1,199 @@
+"""Algorithm workshop: persistence and lifecycle for custom algorithms.
+
+The workshop owns the ``algorithms`` table and the live wiring into the
+strategy engine. States:
+
+  * ``draft``    — saved, validated for syntax/contract, not running.
+                   Everything Claude proposes lands here; only the
+                   operator promotes it.
+  * ``active``   — compiled and scanning each review cycle alongside the
+                   built-in strategies (signals only — never orders).
+  * ``archived`` — kept for reference, never runs.
+
+Every state change is audited.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+from ..core.errors import ConfigError
+from ..security.audit import AuditLog
+from ..storage.db import Database
+from .custom import CustomAlgorithm, validate_algorithm
+from .engine import StrategyEngine
+
+if TYPE_CHECKING:
+    pass
+
+log = structlog.get_logger(__name__)
+
+_COLUMNS = ("id, name, description, source, symbols, params, status, "
+            "created_by, review_notes, created_at, updated_at")
+
+
+def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+    keys = [c.strip() for c in _COLUMNS.split(",")]
+    record = dict(zip(keys, row, strict=True))
+    record["symbols"] = json.loads(record["symbols"] or "[]")
+    record["params"] = json.loads(record["params"] or "{}")
+    return record
+
+
+class AlgorithmWorkshop:
+    def __init__(self, db: Database, engine: StrategyEngine, audit: AuditLog,
+                 *, default_symbols: list[str]) -> None:
+        self._db = db
+        self._engine = engine
+        self._audit = audit
+        self._default_symbols = default_symbols
+
+    # -- queries ---------------------------------------------------------------
+
+    async def list_all(self) -> list[dict[str, Any]]:
+        rows = await self._db.fetch_all(
+            f"SELECT {_COLUMNS} FROM algorithms ORDER BY updated_at DESC"
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get(self, algo_id: str) -> dict[str, Any]:
+        row = await self._db.fetch_one(
+            f"SELECT {_COLUMNS} FROM algorithms WHERE id = ?", (algo_id,)
+        )
+        if row is None:
+            raise KeyError(f"unknown algorithm {algo_id}")
+        return _row_to_dict(row)
+
+    # -- lifecycle ---------------------------------------------------------------
+
+    async def create(self, *, name: str, source: str, description: str = "",
+                     symbols: list[str] | None = None, params: dict[str, Any] | None = None,
+                     created_by: str = "user", review_notes: str = "") -> dict[str, Any]:
+        name = self._clean_name(name)
+        problems = validate_algorithm(source)
+        if problems:
+            raise ConfigError("algorithm failed validation: " + "; ".join(problems))
+        now = datetime.now(UTC).isoformat()
+        algo_id = uuid.uuid4().hex[:12]
+        await self._db.execute(
+            "INSERT INTO algorithms (id, name, description, source, symbols, params, status, "
+            "created_by, review_notes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+            (algo_id, name, description, source,
+             json.dumps([s.upper() for s in (symbols or [])]), json.dumps(params or {}),
+             created_by, review_notes, now, now),
+        )
+        await self._audit.append(created_by if created_by == "claude" else "human",
+                                 "algorithm.created", {"id": algo_id, "name": name})
+        log.info("algorithm saved as draft", id=algo_id, name=name, by=created_by)
+        return await self.get(algo_id)
+
+    async def update(self, algo_id: str, *, source: str | None = None,
+                     description: str | None = None, symbols: list[str] | None = None,
+                     params: dict[str, Any] | None = None,
+                     review_notes: str | None = None) -> dict[str, Any]:
+        record = await self.get(algo_id)
+        if source is not None:
+            problems = validate_algorithm(source)
+            if problems:
+                raise ConfigError("algorithm failed validation: " + "; ".join(problems))
+            record["source"] = source
+        if description is not None:
+            record["description"] = description
+        if symbols is not None:
+            record["symbols"] = [s.upper() for s in symbols]
+        if params is not None:
+            record["params"] = params
+        if review_notes is not None:
+            record["review_notes"] = review_notes
+        await self._db.execute(
+            "UPDATE algorithms SET description=?, source=?, symbols=?, params=?, "
+            "review_notes=?, updated_at=? WHERE id=?",
+            (record["description"], record["source"], json.dumps(record["symbols"]),
+             json.dumps(record["params"]), record["review_notes"],
+             datetime.now(UTC).isoformat(), algo_id),
+        )
+        await self._audit.append("human", "algorithm.updated", {"id": algo_id, "name": record["name"]})
+        # An edited active algorithm hot-reloads so what runs is what you see.
+        if record["status"] == "active":
+            await self.activate(algo_id)
+        return await self.get(algo_id)
+
+    async def activate(self, algo_id: str) -> dict[str, Any]:
+        record = await self.get(algo_id)
+        strategy = CustomAlgorithm(
+            algo_name=record["name"], source=record["source"],
+            symbols=record["symbols"] or self._default_symbols,
+            options=record["params"],
+        )
+        self._engine.add_strategy(strategy)
+        await self._set_status(algo_id, "active")
+        await self._audit.append("human", "algorithm.activated",
+                                 {"id": algo_id, "name": record["name"]})
+        log.info("algorithm activated", name=record["name"])
+        return await self.get(algo_id)
+
+    async def deactivate(self, algo_id: str, *, archive: bool = False) -> dict[str, Any]:
+        record = await self.get(algo_id)
+        self._engine.remove_strategy(f"algo:{record['name']}")
+        await self._set_status(algo_id, "archived" if archive else "draft")
+        await self._audit.append("human", "algorithm.deactivated",
+                                 {"id": algo_id, "name": record["name"]})
+        return await self.get(algo_id)
+
+    async def delete(self, algo_id: str) -> None:
+        record = await self.get(algo_id)
+        self._engine.remove_strategy(f"algo:{record['name']}")
+        await self._db.execute("DELETE FROM algorithms WHERE id = ?", (algo_id,))
+        await self._audit.append("human", "algorithm.deleted",
+                                 {"id": algo_id, "name": record["name"]})
+
+    async def load_active(self) -> int:
+        """Startup: compile and register every active algorithm. One broken
+        algorithm demotes itself to draft (with a note) instead of blocking
+        boot — the platform must come up."""
+        count = 0
+        for record in await self.list_all():
+            if record["status"] != "active":
+                continue
+            try:
+                strategy = CustomAlgorithm(
+                    algo_name=record["name"], source=record["source"],
+                    symbols=record["symbols"] or self._default_symbols,
+                    options=record["params"],
+                )
+            except (ValueError, KeyError) as exc:
+                log.error("active algorithm failed to compile; demoted to draft",
+                          name=record["name"], error=str(exc))
+                await self._set_status(record["id"], "draft")
+                await self._db.execute(
+                    "UPDATE algorithms SET review_notes = ? WHERE id = ?",
+                    (f"demoted at startup: {exc}", record["id"]),
+                )
+                continue
+            self._engine.add_strategy(strategy)
+            count += 1
+        if count:
+            log.info("workshop algorithms loaded", active=count)
+        return count
+
+    # -- internals ---------------------------------------------------------------
+
+    async def _set_status(self, algo_id: str, status: str) -> None:
+        await self._db.execute(
+            "UPDATE algorithms SET status=?, updated_at=? WHERE id=?",
+            (status, datetime.now(UTC).isoformat(), algo_id),
+        )
+
+    @staticmethod
+    def _clean_name(name: str) -> str:
+        cleaned = "".join(c for c in name.strip().lower().replace(" ", "_")
+                          if c.isalnum() or c in "_-")[:48]
+        if not cleaned:
+            raise ConfigError("algorithm name must contain letters or digits")
+        return cleaned

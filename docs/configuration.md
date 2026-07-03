@@ -1,20 +1,20 @@
 # Configuration reference
 
-File: `~/.config/aegis-trader/aegis.yaml` (override with `aegis
+File: `~/.config/poseidon/poseidon.yaml` (override with `poseidon
 --config`). Validated strictly at startup — unknown keys and invalid values
-refuse to boot. Environment variables `AEGIS_SECTION__FIELD=value` override
-file values (e.g. `AEGIS_AI__MODEL=claude-opus-4-8`,
-`AEGIS_DASHBOARD__HOST=0.0.0.0`).
+refuse to boot. Environment variables `POSEIDON_SECTION__FIELD=value` override
+file values (e.g. `POSEIDON_AI__MODEL=claude-opus-4-8`,
+`POSEIDON_DASHBOARD__HOST=0.0.0.0`).
 
 Secrets never appear in this file: fields named `credential` hold the
-*name* of a vault entry (`aegis vault set <name>`).
+*name* of a vault entry (`poseidon vault set <name>`).
 
 ## Top level
 
 | Field | Default | Notes |
 | --- | --- | --- |
 | `mode` | `research` | `research` / `approval` / `autonomous`; switchable live from the dashboard |
-| `data_dir` | `~/.local/share/aegis-trader` | DB, logs, vault, paper state |
+| `data_dir` | `~/.local/share/poseidon` | DB, logs, vault, paper state |
 | `log_level` | `INFO` | console + rotating JSON file logs |
 
 ## `ai`
@@ -130,6 +130,6 @@ update availability. Repeats are deduplicated for 5 minutes.
 
 ## Validation
 
-`aegis config validate` checks the file without starting anything;
-`aegis doctor` additionally checks the vault, credentials, calendar
+`poseidon config validate` checks the file without starting anything;
+`poseidon doctor` additionally checks the vault, credentials, calendar
 coverage, and database.

@@ -7,11 +7,11 @@ from decimal import Decimal
 
 import pytest
 
-from aegis_trader.core.clock import FreshnessPolicy
-from aegis_trader.core.errors import ProviderError
-from aegis_trader.core.models import Bar, Quote
-from aegis_trader.data.base import DataCapability, MarketDataProvider
-from aegis_trader.data.router import DataRouter
+from poseidon.core.clock import FreshnessPolicy
+from poseidon.core.errors import ProviderError
+from poseidon.core.models import Bar, Quote
+from poseidon.data.base import DataCapability, MarketDataProvider
+from poseidon.data.router import DataRouter
 
 
 class FakeProvider(MarketDataProvider):

@@ -1,0 +1,316 @@
+"""Command-line interface.
+
+    poseidon run                    start the platform (24/7 service entry point)
+    poseidon doctor                 self-diagnostics
+    poseidon vault init|unlock-check|set|rm|list
+    poseidon config validate|example
+    poseidon audit verify|tail
+    poseidon update check|apply
+    poseidon cycle                  trigger one review cycle and exit
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import getpass
+import sys
+from pathlib import Path
+
+from . import __version__
+from .core.config import AppConfig, default_config_dir, load_config
+from .core.errors import ConfigError, PoseidonError, VaultError
+from .core.logging import configure_logging
+from .security.vault import Vault
+
+
+def _load(args: argparse.Namespace) -> AppConfig:
+    return load_config(Path(args.config) if args.config else None)
+
+
+def _vault_for(config: AppConfig) -> Vault:
+    return Vault(config.data_dir / "vault.bin")
+
+
+def _unlock(vault: Vault, *, interactive_ok: bool = True) -> None:
+    if vault.unlock_from_environment():
+        return
+    if not interactive_ok:
+        raise VaultError(
+            "no vault passphrase available — set POSEIDON_VAULT_PASSPHRASE(_FILE) "
+            "or a systemd credential (docs/security.md)"
+        )
+    vault.unlock(getpass.getpass("Vault passphrase: "))
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    config = _load(args)
+    configure_logging(config.data_dir / "logs", config.log_level)
+    vault = _vault_for(config)
+    if not vault.exists:
+        print("No vault found. Run `poseidon vault init` first.", file=sys.stderr)
+        return 2
+    _unlock(vault, interactive_ok=sys.stdin.isatty())
+
+    from .app import ApplicationKernel
+
+    async def main() -> None:
+        kernel = ApplicationKernel(config, vault)
+        await kernel.start()
+        await kernel.run_forever()
+
+    asyncio.run(main())
+    return 0
+
+
+def cmd_cycle(args: argparse.Namespace) -> int:
+    config = _load(args)
+    configure_logging(config.data_dir / "logs", config.log_level)
+    vault = _vault_for(config)
+    _unlock(vault)
+
+    from .app import ApplicationKernel
+
+    async def main() -> None:
+        kernel = ApplicationKernel(config, vault)
+        await kernel.start()
+        try:
+            await kernel.run_review_cycle()
+        finally:
+            await kernel.stop()
+
+    asyncio.run(main())
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Self-diagnostics: config, vault, calendar, DB, providers, broker, AI key."""
+    problems = 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal problems
+        mark = "OK " if ok else "FAIL"
+        print(f"[{mark}] {label}" + (f" — {detail}" if detail else ""))
+        if not ok:
+            problems += 1
+
+    try:
+        config = _load(args)
+        check("configuration parses", True, f"mode={config.mode.value}")
+    except ConfigError as exc:
+        check("configuration parses", False, str(exc))
+        return 1
+
+    from .core.clock import MarketClock, calendar_covers
+
+    clock = MarketClock()
+    check("holiday calendar covers today", calendar_covers(clock.now_eastern().date()))
+    check("data providers configured", bool(config.data.providers),
+          ", ".join(p.name for p in config.data.providers if p.enabled) or "none")
+    primary = config.primary_broker()
+    check("primary broker configured",
+          config.mode.value == "research" or primary is not None,
+          (primary.name if primary is not None else "none"))
+
+    vault = _vault_for(config)
+    check("vault exists", vault.exists, str(config.data_dir / "vault.bin"))
+    if vault.exists:
+        try:
+            _unlock(vault)
+            check("vault unlocks", True)
+            names = set(vault.names())
+            check("anthropic api key stored", config.ai.api_key_credential in names,
+                  config.ai.api_key_credential)
+            for provider in config.data.providers:
+                if provider.enabled and provider.credential:
+                    check(f"credential '{provider.credential}' (provider {provider.name})",
+                          provider.credential in names)
+            broker_cfg = config.primary_broker()
+            if broker_cfg and broker_cfg.credential:
+                check(f"credential '{broker_cfg.credential}' (broker {broker_cfg.name})",
+                      broker_cfg.credential in names)
+        except VaultError as exc:
+            check("vault unlocks", False, str(exc))
+
+    async def db_check() -> bool:
+        from .storage.db import Database
+
+        db = Database(config.data_dir / "poseidon.db")
+        try:
+            await db.open()
+            await db.close()
+            return True
+        except Exception:
+            return False
+
+    check("database opens", asyncio.run(db_check()))
+    print(f"\n{problems} problem(s) found." if problems else "\nAll checks passed.")
+    return 1 if problems else 0
+
+
+def cmd_vault(args: argparse.Namespace) -> int:
+    config = _load(args)
+    vault = _vault_for(config)
+    action: str = args.vault_action
+    if action == "init":
+        if vault.exists:
+            print("Vault already exists.", file=sys.stderr)
+            return 2
+        p1 = getpass.getpass("New vault passphrase (min 8 chars): ")
+        p2 = getpass.getpass("Repeat: ")
+        if p1 != p2:
+            print("Passphrases do not match.", file=sys.stderr)
+            return 2
+        vault.create(p1)
+        print(f"Vault created at {config.data_dir / 'vault.bin'}")
+        return 0
+    _unlock(vault)
+    if action == "unlock-check":
+        print("Vault unlocked successfully.")
+    elif action == "set":
+        value = args.value
+        if value is None:
+            value = getpass.getpass(f"Value for '{args.name}' (input hidden): ")
+        vault.set(args.name, value)
+        print(f"Stored credential '{args.name}'.")
+    elif action == "rm":
+        vault.delete(args.name)
+        print(f"Removed credential '{args.name}'.")
+    elif action == "list":
+        for name in vault.names():
+            print(name)
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    if args.config_action == "validate":
+        try:
+            config = _load(args)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Configuration valid. mode={config.mode.value}, "
+              f"providers={len([p for p in config.data.providers if p.enabled])}, "
+              f"brokers={len([b for b in config.brokers if b.enabled])}, "
+              f"strategies={len([s for s in config.strategies if s.enabled])}")
+        return 0
+    if args.config_action == "example":
+        example = Path(__file__).resolve().parents[2] / "config" / "poseidon.example.yaml"
+        target = default_config_dir() / "poseidon.yaml"
+        if target.exists():
+            print(f"{target} already exists; not overwriting.", file=sys.stderr)
+            return 2
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"Wrote starter config to {target}")
+        return 0
+    return 2
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    config = _load(args)
+
+    async def main() -> int:
+        from .security.audit import AuditLog
+        from .storage.db import Database
+
+        db = Database(config.data_dir / "poseidon.db")
+        await db.open()
+        try:
+            audit = AuditLog(db)
+            if args.audit_action == "verify":
+                ok, bad = await audit.verify_chain()
+                print("Audit chain verified — no tampering detected." if ok
+                      else f"AUDIT CHAIN BROKEN at seq {bad}!")
+                return 0 if ok else 1
+            for record in reversed(await audit.tail(args.n)):
+                print(f"{record.seq:>6}  {record.at.isoformat()}  {record.actor:<8} "
+                      f"{record.action:<24} {record.payload}")
+            return 0
+        finally:
+            await db.close()
+
+    return asyncio.run(main())
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    config = _load(args)
+
+    async def main() -> int:
+        from .core.events import EventBus
+        from .updater import UpdateService
+
+        service = UpdateService(config.updates, EventBus())
+        if args.update_action == "check":
+            remote = await service.check_once()
+            print(f"Update available: {remote[:12]}" if remote else "Up to date.")
+            return 0
+        applied = await service._apply()  # noqa: SLF001 — CLI is a trusted caller
+        print("Update applied. Restart the service." if applied else "Update failed; see logs.")
+        return 0 if applied else 1
+
+    return asyncio.run(main())
+
+
+# ---------------------------------------------------------------- parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="poseidon", description="Poseidon — autonomous AI trading platform")
+    parser.add_argument("--version", action="version", version=f"poseidon {__version__}")
+    parser.add_argument("--config", "-c", help="path to poseidon.yaml (default: ~/.config/poseidon/poseidon.yaml)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("run", help="start the platform").set_defaults(func=cmd_run)
+    sub.add_parser("cycle", help="run a single review cycle and exit").set_defaults(func=cmd_cycle)
+    sub.add_parser("doctor", help="self-diagnostics").set_defaults(func=cmd_doctor)
+
+    vault = sub.add_parser("vault", help="manage the encrypted credential vault")
+    vault_sub = vault.add_subparsers(dest="vault_action", required=True)
+    vault_sub.add_parser("init")
+    vault_sub.add_parser("unlock-check")
+    set_parser = vault_sub.add_parser("set")
+    set_parser.add_argument("name")
+    set_parser.add_argument("value", nargs="?", help="omit to enter interactively (hidden)")
+    rm_parser = vault_sub.add_parser("rm")
+    rm_parser.add_argument("name")
+    vault_sub.add_parser("list")
+    vault.set_defaults(func=cmd_vault)
+
+    config_parser = sub.add_parser("config", help="configuration helpers")
+    config_sub = config_parser.add_subparsers(dest="config_action", required=True)
+    config_sub.add_parser("validate")
+    config_sub.add_parser("example", help="write the starter config")
+    config_parser.set_defaults(func=cmd_config)
+
+    audit = sub.add_parser("audit", help="inspect/verify the audit log")
+    audit_sub = audit.add_subparsers(dest="audit_action", required=True)
+    audit_sub.add_parser("verify")
+    tail = audit_sub.add_parser("tail")
+    tail.add_argument("-n", type=int, default=50)
+    audit.set_defaults(func=cmd_audit)
+
+    update = sub.add_parser("update", help="check for / apply updates")
+    update_sub = update.add_subparsers(dest="update_action", required=True)
+    update_sub.add_parser("check")
+    update_sub.add_parser("apply")
+    update.set_defaults(func=cmd_update)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except PoseidonError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,4 +1,4 @@
-# Aegis Trader
+# Poseidon
 
 Autonomous AI trading platform for private, single-user operation on Linux.
 Claude is the portfolio manager; every market fact it reasons about comes
@@ -26,7 +26,7 @@ from live, authoritative data providers — never from memory, never estimated.
   alternatives).
 - **Live data only, enforced in code** — every datum is timestamped and
   graded; stale data is rejected before it can reach the AI or an order.
-  If data is unavailable, Aegis explains why and does not trade.
+  If data is unavailable, Poseidon explains why and does not trade.
 - **Three operating modes** — research (no orders), approval (human
   confirms each trade on the dashboard), autonomous (execute within risk
   limits).
@@ -46,6 +46,14 @@ from live, authoritative data providers — never from memory, never estimated.
   vol percentile, drawdown → risk-on/neutral/risk-off/stress) feeds every
   review cycle, and a vol-targeted sizing tool gives the AI equal-risk
   share counts instead of round numbers.
+- **You trade too** — a manual trade ticket places your own orders
+  through the identical pipeline (every risk rule, preflight, TCA,
+  audit); Claude sees your fills next cycle and manages around them.
+- **Algorithm workshop** — write custom screeners in the dashboard, have
+  Claude author them during cycles (always saved as drafts for your
+  approval), or paste algorithms from other platforms (Pine Script,
+  thinkScript, ...) for Claude to review and convert. Activate, edit,
+  archive — validated, hot-reloaded, audited.
 - **Professional dashboard** — a sidebar-navigated dark UI (Overview,
   Portfolio, AI Desk, Risk, Performance, System) with live tiles, equity
   curve, approvals with one-click actions, toasts, and the full audit
@@ -80,7 +88,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 154 unit/integration tests, paper trading, historical
+- **Testing** — 174 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 
@@ -91,11 +99,11 @@ git clone https://github.com/St3althWarri0r/Aegis-Trader
 cd Aegis-Trader
 ./install.sh                     # one command: venv, config, service, doctor
 
-aegis vault init                 # create the encrypted credential vault
-aegis vault set anthropic_api_key
-aegis vault set finnhub_api_key  # + any other providers you enable
-aegis config validate
-aegis run                        # dashboard at http://127.0.0.1:8321
+poseidon vault init                 # create the encrypted credential vault
+poseidon vault set anthropic_api_key
+poseidon vault set finnhub_api_key  # + any other providers you enable
+poseidon config validate
+poseidon run                        # dashboard at http://127.0.0.1:8321
 ```
 
 Native package: `cd packaging && makepkg -si`. Docker: `docker compose -f

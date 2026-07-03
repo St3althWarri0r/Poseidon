@@ -9,12 +9,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from aegis_trader.core.clock import FreshnessPolicy, MarketClock, calendar_covers
-from aegis_trader.core.config import AppConfig, load_config
-from aegis_trader.core.enums import DataFreshness, MarketSession, OrderStatus, TradingMode
-from aegis_trader.core.errors import ConfigError
-from aegis_trader.core.events import EventBus
-from aegis_trader.core.models import Order, OrderSide, Quote
+from poseidon.core.clock import FreshnessPolicy, MarketClock, calendar_covers
+from poseidon.core.config import AppConfig, load_config
+from poseidon.core.enums import DataFreshness, MarketSession, OrderStatus, TradingMode
+from poseidon.core.errors import ConfigError
+from poseidon.core.events import EventBus
+from poseidon.core.models import Order, OrderSide, Quote
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -121,14 +121,14 @@ class TestConfig:
         })
 
     def test_load_config_env_override(self, tmp_path, monkeypatch) -> None:
-        cfg_file = tmp_path / "aegis.yaml"
+        cfg_file = tmp_path / "poseidon.yaml"
         cfg_file.write_text("mode: research\n")
-        monkeypatch.setenv("AEGIS_AI__MODEL", "claude-test-model")
+        monkeypatch.setenv("POSEIDON_AI__MODEL", "claude-test-model")
         config = load_config(cfg_file)
         assert config.ai.model == "claude-test-model"
 
     def test_invalid_yaml_raises_config_error(self, tmp_path) -> None:
-        bad = tmp_path / "aegis.yaml"
+        bad = tmp_path / "poseidon.yaml"
         bad.write_text("mode: [unclosed\n")
         with pytest.raises(ConfigError):
             load_config(bad)

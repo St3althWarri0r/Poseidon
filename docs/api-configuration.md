@@ -3,7 +3,7 @@
 ## Anthropic (the decision engine)
 
 1. Create an API key at <https://console.anthropic.com>.
-2. `aegis vault set anthropic_api_key`
+2. `poseidon vault set anthropic_api_key`
 3. `ai.model` defaults to `claude-opus-4-8`. `ai.effort` trades depth for
    cost/latency per review cycle (`high` recommended; `xhigh`/`max` for
    the most careful reasoning).
@@ -23,7 +23,7 @@ Configure several — failover is automatic and free. Priorities decide the
 order; a failing provider is penalized (exponential backoff) and traffic
 shifts to the next one.
 
-| Provider | Capabilities in Aegis | Key from | Vault value |
+| Provider | Capabilities in Poseidon | Key from | Vault value |
 | --- | --- | --- | --- |
 | `public_data` | real-time quotes, bars, option chains + greeks, crypto | public.com (API secret) | secret, or `{"secret": "...", "account_id": "..."}` |
 | `polygon` | quotes (NBBO), bars, option chains + greeks, news | polygon.io | plain API key |
@@ -53,7 +53,7 @@ are optional upgrades, never requirements.
 
 Notes:
 
-- Free tiers are rate-limited; Aegis honors `Retry-After` and backs off,
+- Free tiers are rate-limited; Poseidon honors `Retry-After` and backs off,
   and the failover router shifts traffic automatically when a provider
   is penalized.
 - `public_data` options: `{crypto_symbols: [BTC, ETH]}` marks watchlist
@@ -68,6 +68,6 @@ Notes:
 
 ## Where keys live
 
-All keys go in the encrypted vault (`aegis vault set NAME`), referenced
+All keys go in the encrypted vault (`poseidon vault set NAME`), referenced
 from config by name. Keys are never written to config, logs (a redaction
 processor scrubs anything key/token/secret-shaped), or the database.

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from aegis_trader.core.clock import FreshnessPolicy
-from aegis_trader.core.errors import AllProvidersFailedError, DataUnavailableError, StaleDataError
-from aegis_trader.data.router import DataRouter
+from poseidon.core.clock import FreshnessPolicy
+from poseidon.core.errors import AllProvidersFailedError, DataUnavailableError, StaleDataError
+from poseidon.data.router import DataRouter
 
 from ..conftest import FakeProvider
 

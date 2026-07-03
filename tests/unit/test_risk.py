@@ -7,14 +7,14 @@ from decimal import Decimal
 
 import pytest
 
-from aegis_trader.core.clock import MarketClock
-from aegis_trader.core.config import RiskConfig
-from aegis_trader.core.enums import OrderSide, OrderType
-from aegis_trader.core.errors import RiskViolation
-from aegis_trader.core.models import AccountSnapshot, Bar, EconomicEvent, Order, Position
-from aegis_trader.portfolio.state import PortfolioState
-from aegis_trader.risk.circuit import CircuitBreaker, TradeCooldowns
-from aegis_trader.risk.rules import (
+from poseidon.core.clock import MarketClock
+from poseidon.core.config import RiskConfig
+from poseidon.core.enums import OrderSide, OrderType
+from poseidon.core.errors import RiskViolation
+from poseidon.core.models import AccountSnapshot, Bar, EconomicEvent, Order, Position
+from poseidon.portfolio.state import PortfolioState
+from poseidon.risk.circuit import CircuitBreaker, TradeCooldowns
+from poseidon.risk.rules import (
     BuyingPowerRule,
     CooldownRule,
     DailyLossRule,

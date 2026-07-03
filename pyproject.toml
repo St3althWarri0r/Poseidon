@@ -3,13 +3,13 @@ requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aegis-trader"
-version = "1.1.0"
+name = "poseidon"
+version = "1.2.0"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
-authors = [{ name = "Aegis Trader" }]
+authors = [{ name = "Poseidon" }]
 keywords = ["trading", "claude", "anthropic", "autonomous-agent", "portfolio"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -50,16 +50,16 @@ dev = [
 ]
 
 [project.scripts]
-aegis = "aegis_trader.cli:main"
+poseidon = "poseidon.cli:main"
 
-[project.entry-points."aegis_trader.brokers"]
+[project.entry-points."poseidon.brokers"]
 # Third-party broker plugins register here; built-ins are discovered internally.
 
-[project.entry-points."aegis_trader.data_providers"]
+[project.entry-points."poseidon.data_providers"]
 # Third-party market-data provider plugins register here.
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aegis_trader"]
+packages = ["src/poseidon"]
 
 [tool.ruff]
 line-length = 100
@@ -83,4 +83,4 @@ asyncio_mode = "auto"
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["src/aegis_trader"]
+source = ["src/poseidon"]
