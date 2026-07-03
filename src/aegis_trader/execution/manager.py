@@ -21,6 +21,7 @@ from typing import Any
 
 import structlog
 
+from ..analytics.execution import slippage_bps
 from ..brokers.base import Broker
 from ..core.enums import OrderStatus, TradingMode
 from ..core.errors import (
@@ -153,6 +154,20 @@ class OrderManager:
 
     async def _submit(self, order: Order) -> Order:
         await self._guard_duplicate(order)
+        # Broker-side preflight (where supported): a definitive broker
+        # rejection is cheaper and cleaner caught here than as a failed
+        # submission. A None result (unsupported/unavailable) changes nothing.
+        preflight_reason = await self._broker.preflight(order)
+        if preflight_reason is not None:
+            order.status = OrderStatus.REJECTED_BROKER
+            order.status_reason = preflight_reason
+            await self._persist(order)
+            await self._audit.append("system", "order.preflight_rejected",
+                                     {"order_id": order.id, "reason": preflight_reason})
+            await self._bus.publish(Topics.ORDER_REJECTED,
+                                    {"order": order.model_dump(mode="json"),
+                                     "reason": preflight_reason})
+            return order
         last_error: Exception | None = None
         for attempt in range(1, _SUBMIT_RETRIES + 1):
             try:
@@ -224,6 +239,10 @@ class OrderManager:
             except BrokerError as exc:
                 log.warning("order status poll failed", order_id=order.id, error=str(exc))
                 continue
+            if (order.status is OrderStatus.FILLED and order.slippage_bps is None
+                    and order.arrival_price is not None and order.avg_fill_price is not None):
+                order.slippage_bps = slippage_bps(order.side, order.arrival_price,
+                                                  order.avg_fill_price)
             await self._persist(order)
             if order.status.is_terminal:
                 topic = Topics.ORDER_FILLED if order.status is OrderStatus.FILLED else Topics.ORDER_UPDATED
@@ -231,6 +250,7 @@ class OrderManager:
                     "order_id": order.id,
                     "filled_qty": str(order.filled_quantity),
                     "avg_price": str(order.avg_fill_price) if order.avg_fill_price else None,
+                    "slippage_bps": order.slippage_bps,
                 })
                 await self._bus.publish(topic, {"order": order.model_dump(mode="json")})
                 return

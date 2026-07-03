@@ -14,6 +14,7 @@ import structlog
 
 from ..core.clock import MarketClock
 from ..core.config import RiskConfig
+from ..core.enums import AssetClass
 from ..core.errors import CircuitBreakerOpen, DataError, RiskViolation
 from ..core.events import EventBus, Topics
 from ..core.models import Bar, EconomicEvent, Order, Quote
@@ -83,6 +84,7 @@ class RiskEngine:
         # Live inputs. Any failure here aborts the order — deliberately no
         # fallbacks to cached or assumed values.
         quote = await self._router.quote(order.symbol, allow_delayed=False)
+        order.arrival_price = quote.mid or quote.last  # TCA benchmark price
         bars: list[Bar] = []
         try:
             bars = await self._router.bars(order.symbol, timeframe="1d", limit=30)
@@ -94,6 +96,7 @@ class RiskEngine:
                 econ = await self._router.economic_calendar(days_ahead=1)
             except DataError:
                 log.warning("economic calendar unavailable; blackout rule will pass empty")
+        order_sector, position_sectors = await self._gather_sectors(order)
 
         ctx = RiskContext(
             order=order,
@@ -105,6 +108,8 @@ class RiskEngine:
             upcoming_econ=econ,
             orders_today=self._orders_today,
             cooldown_remaining=self.cooldowns.remaining(order.symbol),
+            order_sector=order_sector,
+            position_sectors=position_sectors,
         )
         for rule in self._rules:
             try:
@@ -119,6 +124,24 @@ class RiskEngine:
                 )
                 raise
         return quote
+
+    async def _gather_sectors(self, order: Order) -> tuple[str | None, dict[str, str]]:
+        """Sector classifications for the concentration rule. Router results
+        are week-cached, so steady-state cost is zero API calls. Only
+        gathered for equity buys — the only orders the rule constrains."""
+        if not order.side.is_buy or order.asset_class is not AssetClass.EQUITY:
+            return None, {}
+        order_sector = await self._router.sector(order.symbol)
+        if order_sector is None:
+            return None, {}
+        position_sectors: dict[str, str] = {}
+        for position in self._portfolio.positions:
+            if position.asset_class is not AssetClass.EQUITY:
+                continue
+            sector = await self._router.sector(position.symbol)
+            if sector is not None:
+                position_sectors[position.symbol.upper()] = sector
+        return order_sector, position_sectors
 
     def status(self) -> dict[str, object]:
         self._roll_daily_counter()

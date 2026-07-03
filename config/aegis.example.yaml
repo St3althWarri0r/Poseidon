@@ -107,6 +107,10 @@ risk:
   news_blackout_minutes_before_econ: 10
   volatility_halt_daily_move_pct: 0.08
   slippage_limit_pct: 0.01
+  # Portfolio VaR halt (0 = off). When set, new risk requires fresh risk
+  # metrics and is blocked while 1-day VaR(95) exceeds this % of equity.
+  max_portfolio_var_pct: 0
+  benchmark_symbol: SPY
 
 # Position guardian: enforces each decision's stop-loss / take-profit against
 # live quotes between review cycles (research: alert only; approval: proposes

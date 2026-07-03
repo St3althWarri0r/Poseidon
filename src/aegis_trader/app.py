@@ -108,6 +108,7 @@ class ApplicationKernel:
         dispatcher = ToolDispatcher(
             self.router, self.portfolio, self.risk,
             allow_delayed_quotes=cfg.data.allow_delayed_for_research,
+            benchmark_symbol=cfg.risk.benchmark_symbol,
         )
         api_key = self.vault.get(cfg.ai.api_key_credential)
         self.agent = ClaudeAgent(cfg.ai, api_key, dispatcher)
@@ -200,6 +201,7 @@ class ApplicationKernel:
         self.scheduler.register_job("audit_verify", self._audit_verify_job)
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
+        self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
 
     def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
@@ -229,6 +231,11 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="daily-summary", job="daily_report",
                                cron=self.config.reports.daily_summary_cron)
+            )
+        if not any(s.job == "risk_metrics" and s.enabled for s in schedules):
+            schedules.append(
+                ScheduleConfig(name="risk-metrics", job="risk_metrics",
+                               every_seconds=900, only_market_hours=True)
             )
         return schedules
 
@@ -338,6 +345,31 @@ class ApplicationKernel:
             log.info("review cycle complete", cycle=decision.cycle_id,
                      action=decision.action.value, trades=len(decision.trades),
                      duration_s=round((datetime.now(UTC) - started).total_seconds(), 1))
+
+    async def _risk_metrics_job(self) -> None:
+        await self.refresh_risk_metrics()
+
+    async def refresh_risk_metrics(self) -> dict[str, object]:
+        """Recompute portfolio VaR/beta/correlation from live bar history
+        and cache it on the portfolio state (scheduled job + API/tool)."""
+        from .analytics.risk_metrics import gather_risk_metrics
+
+        report = await gather_risk_metrics(
+            self.router, self.portfolio, benchmark=self.config.risk.benchmark_symbol
+        )
+        payload = report.as_dict()
+        self.portfolio.risk_metrics = payload
+        self.portfolio.risk_metrics_at = report.as_of
+        return payload
+
+    async def execution_report(self, *, limit: int = 500) -> dict[str, object]:
+        """Transaction cost analysis over the platform's own order records."""
+        from .analytics.execution import execution_quality
+
+        rows = await self.db.fetch_all(
+            "SELECT payload FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return execution_quality([json.loads(r[0]) for r in rows])
 
     # ------------------------------------------------------- analytics & cost
 

@@ -23,7 +23,7 @@ src/aegis_trader/
 ├── data/          provider ABC, 6 providers, failover router (staleness gate)
 ├── brokers/       broker ABC, plugin registry, 6 live plugins + 6 documented stubs
 ├── portfolio/     portfolio state + continuous sync service
-├── risk/          18 pre-trade rules, circuit breaker, cooldowns
+├── risk/          20 pre-trade rules, circuit breaker, cooldowns
 ├── execution/     order manager (the only broker path), approval queue
 ├── ai/            Claude agent (tool loop), tool dispatcher, schemas, reports
 ├── strategy/      strategy ABC + 16 built-in screeners + engine

@@ -27,6 +27,7 @@ class FinnhubProvider(MarketDataProvider):
                 DataCapability.NEWS,
                 DataCapability.EARNINGS,
                 DataCapability.ECONOMIC_CALENDAR,
+                DataCapability.SECTOR,
             }
         )
 
@@ -46,6 +47,17 @@ class FinnhubProvider(MarketDataProvider):
             as_of=as_of,
             source=self.name,
         )
+
+    async def sector(self, symbol: str) -> str:
+        """GICS-style classification from the company profile (free tier).
+        ETFs and unlisted symbols have no profile — that raises, it is not
+        guessed."""
+        payload = await self._get("/stock/profile2", symbol=symbol.upper())
+        industry = (payload or {}).get("finnhubIndustry")
+        if not industry:
+            raise ProviderError(self.name, f"no sector classification for {symbol}",
+                                retryable=False)
+        return str(industry)
 
     async def news(self, symbols: list[str] | None = None, *, limit: int = 25) -> list[NewsArticle]:
         rows: list[dict[str, Any]]

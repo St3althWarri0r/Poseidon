@@ -32,6 +32,7 @@ class DataCapability(StrEnum):
     NEWS = "news"
     EARNINGS = "earnings"
     ECONOMIC_CALENDAR = "economic_calendar"
+    SECTOR = "sector"  # company sector/industry taxonomy
 
 
 class MarketDataProvider(abc.ABC):
@@ -67,6 +68,11 @@ class MarketDataProvider(abc.ABC):
         raise NotImplementedError
 
     async def economic_calendar(self, *, days_ahead: int = 7) -> list[EconomicEvent]:
+        raise NotImplementedError
+
+    async def sector(self, symbol: str) -> str:
+        """Company sector/industry classification. Raise ProviderError when
+        the provider has no classification for the symbol (e.g. ETFs)."""
         raise NotImplementedError
 
     async def close(self) -> None:

@@ -99,6 +99,15 @@ class Broker(abc.ABC):
 
     # -- orders ----------------------------------------------------------------------
 
+    async def preflight(self, order: Order) -> str | None:
+        """Optional broker-side pre-trade validation (buying power, margin
+        impact, locate for shorts). Returns a human-readable rejection
+        reason when the broker DEFINITELY refuses the order, or None when
+        the order looks placeable *or the check could not be performed* —
+        transport problems must not convert into false rejections; the
+        authoritative answer is submit_order's."""
+        return None
+
     @abc.abstractmethod
     async def submit_order(self, order: Order) -> Order:
         """Submit and return the order updated with broker_order_id/status."""

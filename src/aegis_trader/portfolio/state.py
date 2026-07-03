@@ -27,6 +27,15 @@ class PortfolioState:
         self.week_start_equity: Decimal | None = None
         self.day_start_equity: Decimal | None = None
         self.peak_equity: Decimal | None = None
+        # Latest portfolio risk metrics (VaR/beta/correlation), refreshed on
+        # a schedule; timestamped so consumers can enforce freshness.
+        self.risk_metrics: dict[str, object] | None = None
+        self.risk_metrics_at: datetime | None = None
+
+    def risk_metrics_age_seconds(self) -> float | None:
+        if self.risk_metrics_at is None:
+            return None
+        return (datetime.now(UTC) - self.risk_metrics_at).total_seconds()
 
     @property
     def age_seconds(self) -> float | None:

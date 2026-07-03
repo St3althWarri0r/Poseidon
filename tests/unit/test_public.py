@@ -180,6 +180,90 @@ class TestPublicBrokerParsing:
         assert orders[0].status is OrderStatus.ACCEPTED
         assert orders[0].limit_price == Decimal("400.00")
 
+    async def test_preflight_passes_on_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        broker = make_broker()
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            seen["url"], seen["payload"] = url, kwargs.get("json_body")
+            return {"orderValue": "1000"}
+
+        async def fake_headers() -> dict[str, str]:
+            return {}
+
+        monkeypatch.setattr(broker, "_request", fake_request)
+        monkeypatch.setattr(broker, "_auth_headers", fake_headers)
+        order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("10"), limit_price=Decimal("100"))
+        assert await broker.preflight(order) is None
+        assert seen["url"].endswith("/preflight/single-leg")
+        assert "orderId" not in seen["payload"]  # preflight is not an order
+
+    async def test_preflight_returns_definitive_rejection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broker = make_broker()
+
+        async def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            raise BrokerError("public", "HTTP 400: insufficient buying power", retryable=False)
+
+        async def fake_headers() -> dict[str, str]:
+            return {}
+
+        monkeypatch.setattr(broker, "_request", fake_request)
+        monkeypatch.setattr(broker, "_auth_headers", fake_headers)
+        order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("10"), limit_price=Decimal("100"))
+        reason = await broker.preflight(order)
+        assert reason is not None and "buying power" in reason
+
+    async def test_preflight_transport_error_is_not_a_veto(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broker = make_broker()
+
+        async def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            raise BrokerError("public", "HTTP 503: unavailable", retryable=True)
+
+        async def fake_headers() -> dict[str, str]:
+            return {}
+
+        monkeypatch.setattr(broker, "_request", fake_request)
+        monkeypatch.setattr(broker, "_auth_headers", fake_headers)
+        order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("10"), limit_price=Decimal("100"))
+        assert await broker.preflight(order) is None
+
+    async def test_multileg_preflight_payload_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broker = make_broker()
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+            seen["url"], seen["payload"] = url, kwargs.get("json_body")
+            return {}
+
+        async def fake_headers() -> dict[str, str]:
+            return {}
+
+        monkeypatch.setattr(broker, "_request", fake_request)
+        monkeypatch.setattr(broker, "_auth_headers", fake_headers)
+        order = Order(
+            symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+            quantity=Decimal("1"), limit_price=Decimal("1.25"),
+            legs=[
+                OptionLeg(contract_symbol="AAPL240621C00190000",
+                          side=OrderSide.BUY_TO_OPEN, quantity=1),
+                OptionLeg(contract_symbol="AAPL240621C00200000",
+                          side=OrderSide.SELL_TO_OPEN, quantity=1),
+            ],
+        )
+        assert await broker.preflight(order) is None
+        assert seen["url"].endswith("/preflight/multi-leg")
+        assert seen["payload"]["orderType"] == "LIMIT"
+        assert "type" not in seen["payload"] and "orderId" not in seen["payload"]
+
     async def test_submit_order_sets_broker_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
         broker = make_broker()
         seen: dict[str, Any] = {}

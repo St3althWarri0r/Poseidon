@@ -200,6 +200,20 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     async def exit_plans() -> JSONResponse:
         return JSONResponse({"plans": await kernel.guardian.active_plans()})
 
+    @app.get("/api/risk-metrics")
+    async def risk_metrics(refresh: bool = False) -> JSONResponse:
+        cached = kernel.portfolio.risk_metrics
+        if refresh or cached is None:
+            try:
+                cached = await kernel.refresh_risk_metrics()
+            except Exception as exc:  # data unavailable: report, don't fabricate
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse(cached)
+
+    @app.get("/api/execution")
+    async def execution(limit: int = 500) -> JSONResponse:
+        return JSONResponse(await kernel.execution_report(limit=limit))
+
     @app.get("/api/audit")
     async def audit(limit: int = 100) -> JSONResponse:
         records = await kernel.audit.tail(limit)

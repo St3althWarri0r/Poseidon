@@ -64,6 +64,11 @@ class _ProviderSlot:
         self.penalized_until = time.monotonic() + penalty
 
 
+_SECTOR_TTL = 7 * 86400.0  # classifications change on index-rebalance timescales
+_SECTOR_NEGATIVE_TTL = 3600.0  # unknowns retry hourly (may be transient outage)
+_SECTOR_UNKNOWN = ""  # cached negative result (e.g. ETFs have no sector)
+
+
 class DataRouter:
     def __init__(self, providers: list[tuple[MarketDataProvider, int]],
                  freshness: FreshnessPolicy) -> None:
@@ -71,6 +76,7 @@ class DataRouter:
             (_ProviderSlot(p, prio) for p, prio in providers), key=lambda s: s.priority
         )
         self._freshness = freshness
+        self._sector_cache: dict[str, tuple[str, float]] = {}
 
     @property
     def freshness(self) -> FreshnessPolicy:
@@ -134,6 +140,27 @@ class DataRouter:
         return await self._route(
             DataCapability.ECONOMIC_CALENDAR, lambda p: p.economic_calendar(days_ahead=days_ahead)
         )
+
+    async def sector(self, symbol: str) -> str | None:
+        """Sector classification, or None when no provider can classify the
+        symbol. Unlike prices this is slow-moving reference data, so results
+        (including "has no sector", e.g. ETFs) are cached for a week. None
+        means *unknown*, never a guess — callers decide their own policy.
+        """
+        symbol = symbol.upper()
+        cached = self._sector_cache.get(symbol)
+        if cached is not None:
+            ttl = _SECTOR_TTL if cached[0] else _SECTOR_NEGATIVE_TTL
+            if time.monotonic() - cached[1] < ttl:
+                return cached[0] or None
+        try:
+            sector = await self._route(DataCapability.SECTOR, lambda p: p.sector(symbol))
+        except (AllProvidersFailedError, DataUnavailableError) as exc:
+            log.info("sector unavailable", symbol=symbol, error=str(exc))
+            self._sector_cache[symbol] = (_SECTOR_UNKNOWN, time.monotonic())
+            return None
+        self._sector_cache[symbol] = (sector, time.monotonic())
+        return sector
 
     # -- routing core -------------------------------------------------------------
 

@@ -7,7 +7,7 @@ from live, authoritative data providers — never from memory, never estimated.
 ```
 ┌────────────┐   signals   ┌──────────────┐  decisions  ┌─────────────┐  orders  ┌─────────┐
 │ Strategy   │────────────▶│ Claude agent │────────────▶│ Risk engine │─────────▶│ Broker  │
-│ screeners  │             │ (tool loop   │             │ 18 rules +  │          │ plugin  │
+│ screeners  │             │ (tool loop   │             │ 20 rules +  │          │ plugin  │
 └────────────┘             │  live data)  │             │ circuit brk │          └─────────┘
       ▲                    └──────┬───────┘             └─────────────┘               │
       │        live quotes/chains/news/calendars              ▲                       │
@@ -37,11 +37,21 @@ from live, authoritative data providers — never from memory, never estimated.
   factor, expectancy, monthly returns, and per-strategy P&L attribution
   from the platform's own fill history; AI token/cost metering with an
   optional hard monthly budget.
+- **Risk-desk metrics** — 1-day historical VaR and expected shortfall
+  (95/99%), portfolio beta, most-correlated-pair detection, and annualized
+  volatility, recomputed from live bar history every 15 minutes and
+  available to the AI as a tool; optionally enforced as a hard VaR limit
+  on new risk.
+- **Execution quality (TCA)** — arrival price captured at risk validation,
+  signed slippage in bps on every fill, and a standing best-execution
+  report (fill rate, per-side/per-symbol cost, time-to-fill).
 - **Institutional risk engine** — position/exposure/leverage caps, daily/
-  weekly loss limits, drawdown halt, options exposure caps, liquidity and
+  weekly loss limits, drawdown halt, options exposure caps, hard sector
+  concentration (live taxonomy), portfolio VaR halt, liquidity and
   spread filters, slippage bands, event blackouts, per-symbol cooldowns,
-  order-rate limits, duplicate prevention, buying-power verification, and
-  an error-rate circuit breaker. Every order passes every rule.
+  order-rate limits, duplicate prevention, buying-power verification,
+  broker-side preflight (Public.com), and an error-rate circuit breaker.
+  Every order passes every rule.
 - **Broker plugins** — Alpaca, Tradier, tastytrade, Schwab, Interactive
   Brokers (Client Portal), Public.com (stocks/options/crypto, free API),
   and a live-quote paper broker. Brokers without official APIs (Fidelity,
@@ -62,7 +72,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 121 unit/integration tests, paper trading, historical
+- **Testing** — 144 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 

@@ -27,7 +27,7 @@ shifts to the next one.
 | --- | --- | --- | --- |
 | `public_data` | real-time quotes, bars, option chains + greeks, crypto | public.com (API secret) | secret, or `{"secret": "...", "account_id": "..."}` |
 | `polygon` | quotes (NBBO), bars, option chains + greeks, news | polygon.io | plain API key |
-| `finnhub` | quotes, news, earnings calendar, economic calendar | finnhub.io | plain API key |
+| `finnhub` | quotes, news, earnings calendar, economic calendar, sector taxonomy | finnhub.io | plain API key |
 | `twelvedata` | quotes, bars | twelvedata.com | plain API key |
 | `alphavantage` | EOD quotes, daily bars, news+sentiment | alphavantage.co | plain API key |
 | `alpaca` | quotes, bars, option chains, news | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |

@@ -64,7 +64,12 @@ Every limit is enforced pre-trade by the risk engine
 `min_avg_volume`, `max_orders_per_day`, `trade_cooldown_seconds`,
 `news_blackout_minutes_before_econ`, `volatility_halt_daily_move_pct`,
 `circuit_breaker_error_threshold`, `circuit_breaker_window_seconds`,
-`circuit_breaker_cooldown_seconds`, `slippage_limit_pct`.
+`circuit_breaker_cooldown_seconds`, `slippage_limit_pct`,
+`max_portfolio_var_pct` (0 disables the VaR halt; enabling it requires
+fresh risk metrics before new risk), `benchmark_symbol` (beta/correlation
+benchmark, default SPY).
+
+Every rule is documented with its rationale in docs/risk-controls.md.
 
 ## `guardian`
 
@@ -90,14 +95,17 @@ independently; disabled strategies never run.
 ## `schedules[]`
 
 `name`, `job` (`review_cycle`, `portfolio_sync`, `update_check`,
-`audit_verify`, `position_guardian`, `daily_report`), and exactly one of:
+`audit_verify`, `position_guardian`, `daily_report`, `risk_metrics`), and
+exactly one of:
 
 - `every_seconds: N` — fixed interval, 1 s and up;
 - `cron: "m h dom mon dow"` — standard cron, evaluated in America/New_York.
 
 `only_market_hours: true` gates the trigger on the regular session.
 Defaults added automatically when absent: a market-hours `review_cycle`
-every `ai.review_interval_seconds`, and a nightly `audit_verify` at 02:15.
+every `ai.review_interval_seconds`, a nightly `audit_verify` at 02:15,
+and market-hours `position_guardian` (60 s) and `risk_metrics` (15 min)
+refreshes.
 
 ## `notifications[]`
 

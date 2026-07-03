@@ -249,6 +249,10 @@ class Order(AegisModel):
     extended_hours: bool = False
     legs: list[OptionLeg] = Field(default_factory=list)  # multi-leg option orders
     strategy: str = ""  # originating strategy (performance attribution)
+    # Execution quality (TCA): live mid at final risk validation is the
+    # arrival price; slippage is signed so positive = cost to the account.
+    arrival_price: Money | None = None
+    slippage_bps: float | None = None
     status: OrderStatus = OrderStatus.PROPOSED
     status_reason: str | None = None
     filled_quantity: Decimal = Decimal(0)

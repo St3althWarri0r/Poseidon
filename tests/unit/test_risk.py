@@ -21,8 +21,10 @@ from aegis_trader.risk.rules import (
     EconBlackoutRule,
     FreshPortfolioRule,
     OrderNotionalRule,
+    PortfolioVaRRule,
     PositionSizeRule,
     RiskContext,
+    SectorConcentrationRule,
     SlippageProtectionRule,
     SpreadRule,
     VolumeRule,
@@ -44,17 +46,21 @@ def portfolio_with(equity: str = "100000", cash: str = "50000") -> PortfolioStat
 def ctx(order: Order, *, portfolio: PortfolioState | None = None, price: str = "100.00",
         spread: str = "0.10", bars: list[Bar] | None = None,
         econ: list[EconomicEvent] | None = None, orders_today: int = 0,
-        cooldown: float = 0.0) -> RiskContext:
+        cooldown: float = 0.0, config: RiskConfig | None = None,
+        order_sector: str | None = None,
+        position_sectors: dict[str, str] | None = None) -> RiskContext:
     return RiskContext(
         order=order,
         quote=make_quote(order.symbol, price, spread=spread),
         portfolio=portfolio or portfolio_with(),
-        config=RiskConfig(),
+        config=config or RiskConfig(),
         clock=MarketClock(),
         recent_bars=bars if bars is not None else _bars(),
         upcoming_econ=econ or [],
         orders_today=orders_today,
         cooldown_remaining=cooldown,
+        order_sector=order_sector,
+        position_sectors=position_sectors or {},
     )
 
 
@@ -177,6 +183,102 @@ class TestRiskReducingExemptions:
         assert not OrderSide.SELL_TO_OPEN.is_risk_reducing  # opening short risk
         assert OrderSide.SELL.is_risk_reducing
         assert OrderSide.BUY_TO_CLOSE.is_risk_reducing
+
+
+class TestSectorConcentration:
+    def _portfolio_with_tech(self) -> PortfolioState:
+        state = portfolio_with()  # 100k equity; 30% cap -> 30k sector budget
+        state.positions = [
+            Position(symbol="MSFT", quantity=Decimal("100"), avg_entry_price=Decimal("250"),
+                     market_value=Decimal("25000"), broker="t", as_of=datetime.now(UTC)),
+            Position(symbol="XOM", quantity=Decimal("100"), avg_entry_price=Decimal("100"),
+                     market_value=Decimal("10000"), broker="t", as_of=datetime.now(UTC)),
+        ]
+        return state
+
+    def test_blocks_over_concentration(self) -> None:
+        # 25k existing Technology + 10k order > 30k cap.
+        with pytest.raises(RiskViolation, match="max_sector_concentration"):
+            SectorConcentrationRule().check(ctx(
+                buy("100"), portfolio=self._portfolio_with_tech(),
+                order_sector="Technology",
+                position_sectors={"MSFT": "Technology", "XOM": "Energy"},
+            ))
+
+    def test_allows_within_cap_and_other_sectors(self) -> None:
+        SectorConcentrationRule().check(ctx(
+            buy("40"), portfolio=self._portfolio_with_tech(),  # 25k + 4k <= 30k
+            order_sector="Technology",
+            position_sectors={"MSFT": "Technology", "XOM": "Energy"},
+        ))
+        SectorConcentrationRule().check(ctx(
+            buy("100"), portfolio=self._portfolio_with_tech(),  # Energy 10k + 10k
+            order_sector="Energy",
+            position_sectors={"MSFT": "Technology", "XOM": "Energy"},
+        ))
+
+    def test_unknown_sector_passes(self) -> None:
+        # No taxonomy available: the rule defers to qualitative enforcement.
+        SectorConcentrationRule().check(ctx(
+            buy("100"), portfolio=self._portfolio_with_tech(), order_sector=None,
+        ))
+
+    def test_own_position_counts_even_unclassified(self) -> None:
+        state = portfolio_with()
+        state.positions = [
+            Position(symbol="AAPL", quantity=Decimal("250"), avg_entry_price=Decimal("100"),
+                     market_value=Decimal("25000"), broker="t", as_of=datetime.now(UTC)),
+        ]
+        with pytest.raises(RiskViolation):
+            SectorConcentrationRule().check(ctx(
+                buy("100"), portfolio=state, order_sector="Technology",
+                position_sectors={},  # AAPL missing from map; still its own sector
+            ))
+
+    def test_sells_exempt(self) -> None:
+        order = Order(symbol="MSFT", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                      quantity=Decimal("100"), limit_price=Decimal("100.00"))
+        SectorConcentrationRule().check(ctx(
+            order, portfolio=self._portfolio_with_tech(), order_sector="Technology",
+            position_sectors={"MSFT": "Technology"},
+        ))
+
+
+class TestPortfolioVaRRule:
+    def _config(self, cap: float) -> RiskConfig:
+        return RiskConfig(max_portfolio_var_pct=cap)
+
+    def test_disabled_by_default(self) -> None:
+        PortfolioVaRRule().check(ctx(buy()))
+
+    def test_requires_fresh_metrics_when_enabled(self) -> None:
+        state = portfolio_with()
+        with pytest.raises(RiskViolation, match="max_portfolio_var"):
+            PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
+
+    def test_blocks_over_var(self) -> None:
+        state = portfolio_with()
+        state.risk_metrics = {"var_95_pct": 0.08}
+        state.risk_metrics_at = datetime.now(UTC)
+        with pytest.raises(RiskViolation, match="VaR"):
+            PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
+
+    def test_allows_under_var_and_exits_always(self) -> None:
+        state = portfolio_with()
+        state.risk_metrics = {"var_95_pct": 0.02}
+        state.risk_metrics_at = datetime.now(UTC)
+        PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
+        sell = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100.00"))
+        state.risk_metrics = {"var_95_pct": 0.50}
+        PortfolioVaRRule().check(ctx(sell, portfolio=state, config=self._config(0.05)))
+
+    def test_stale_metrics_block(self) -> None:
+        state = portfolio_with()
+        state.risk_metrics = {"var_95_pct": 0.01}
+        state.risk_metrics_at = datetime.now(UTC) - timedelta(hours=3)
+        with pytest.raises(RiskViolation, match="fresh"):
+            PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
 
 
 class TestCircuitBreaker:

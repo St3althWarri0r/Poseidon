@@ -290,6 +290,30 @@ class PublicBroker(Broker):
             "legs": legs,
         }
 
+    async def preflight(self, order: Order) -> str | None:
+        """Public's preflight endpoints validate the order against live
+        account state (buying power, margin, short locate) without placing
+        it. A definitive rejection (HTTP 4xx with a reason) is returned as
+        the reason string; transport/server errors return None so a flaky
+        preflight can never veto an order that submit would accept."""
+        try:
+            if order.legs:
+                payload = self._multileg_payload(order)
+                payload.pop("orderId", None)
+                payload["orderType"] = payload.pop("type", "LIMIT")
+                path = f"{_BASE}/userapigateway/trading/{self._account_id}/preflight/multi-leg"
+            else:
+                payload = self._single_leg_payload(order)
+                payload.pop("orderId", None)
+                path = f"{_BASE}/userapigateway/trading/{self._account_id}/preflight/single-leg"
+            await self._request("POST", path, headers=await self._auth_headers(),
+                                json_body=payload)
+        except BrokerError as exc:
+            if exc.retryable:  # 5xx/timeout: preflight unavailable, not a verdict
+                return None
+            return f"broker preflight rejected the order: {exc}"
+        return None
+
     async def submit_order(self, order: Order) -> Order:
         headers = await self._auth_headers()
         if order.legs:

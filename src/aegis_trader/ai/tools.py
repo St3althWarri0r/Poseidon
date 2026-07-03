@@ -25,11 +25,12 @@ _MAX_RESULT_CHARS = 60_000  # keep tool results bounded for the context window
 
 class ToolDispatcher:
     def __init__(self, router: DataRouter, portfolio: PortfolioState, risk: RiskEngine,
-                 *, allow_delayed_quotes: bool) -> None:
+                 *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY") -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
         self._allow_delayed = allow_delayed_quotes
+        self._benchmark = benchmark_symbol
         self.sources_used: set[str] = set()
 
     async def dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
@@ -116,3 +117,17 @@ class ToolDispatcher:
 
     async def _tool_get_risk_status(self) -> dict[str, Any]:
         return self._risk.status()
+
+    async def _tool_get_risk_metrics(self) -> dict[str, Any]:
+        from ..analytics.risk_metrics import gather_risk_metrics
+
+        cached = self._portfolio.risk_metrics
+        age = self._portfolio.risk_metrics_age_seconds()
+        if cached is not None and age is not None and age < 900:
+            return dict(cached)
+        report = await gather_risk_metrics(self._router, self._portfolio,
+                                           benchmark=self._benchmark)
+        payload = report.as_dict()
+        self._portfolio.risk_metrics = payload
+        self._portfolio.risk_metrics_at = report.as_of
+        return payload

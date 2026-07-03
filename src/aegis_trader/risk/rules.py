@@ -33,6 +33,9 @@ class RiskContext:
     upcoming_econ: list[EconomicEvent] = field(default_factory=list)
     orders_today: int = 0
     cooldown_remaining: float = 0.0
+    # Sector taxonomy (None = unknown/unavailable; ETFs have no sector).
+    order_sector: str | None = None
+    position_sectors: dict[str, str] = field(default_factory=dict)
 
     @property
     def reference_price(self) -> Decimal:
@@ -167,6 +170,77 @@ class OptionsExposureRule(RiskRule):
         limit = equity * Decimal(str(ctx.config.max_options_exposure_pct))
         if exposure > limit:
             raise RiskViolation(self.name, f"options exposure would be {exposure:.2f}, limit {limit:.2f}")
+
+
+class SectorConcentrationRule(RiskRule):
+    """Cap total exposure to any one sector. Enforced whenever a sector
+    classification is available for the order's symbol (a SECTOR-capable
+    provider such as Finnhub); when the symbol cannot be classified (ETFs,
+    provider gap) the rule passes and the AI enforces the cap qualitatively
+    — a taxonomy gap must not halt all trading."""
+
+    name = "max_sector_concentration"
+
+    def check(self, ctx: RiskContext) -> None:
+        if not ctx.order.side.is_buy or ctx.order.asset_class is not AssetClass.EQUITY:
+            return
+        sector = ctx.order_sector
+        if not sector:
+            return  # unknown sector: qualitative enforcement (documented)
+        equity = ctx.portfolio.equity
+        if equity is None or equity <= 0:
+            raise RiskViolation(self.name, "no equity snapshot")
+        exposure = ctx.notional
+        order_symbol = ctx.order.symbol.upper()
+        for position in ctx.portfolio.positions:
+            symbol = position.symbol.upper()
+            # The order's own symbol always counts toward its sector.
+            if symbol != order_symbol and ctx.position_sectors.get(symbol) != sector:
+                continue
+            value = position.market_value
+            if value is None:
+                value = position.quantity * position.avg_entry_price
+            exposure += abs(value)
+        limit = equity * Decimal(str(ctx.config.max_sector_concentration_pct))
+        if exposure > limit:
+            raise RiskViolation(
+                self.name,
+                f"'{sector}' exposure would be {exposure:.2f}, limit {limit:.2f} "
+                f"({ctx.config.max_sector_concentration_pct:.0%} of equity)",
+            )
+
+
+class PortfolioVaRRule(RiskRule):
+    """Optional halt on new risk when the book's 1-day historical VaR(95)
+    exceeds the configured fraction of equity. Metrics are computed on a
+    schedule from live bar history; enabling this rule makes FRESH metrics a
+    requirement for opening new risk (no metrics, no new positions)."""
+
+    name = "max_portfolio_var"
+    max_metrics_age_seconds = 3600.0
+
+    def check(self, ctx: RiskContext) -> None:
+        cap = ctx.config.max_portfolio_var_pct
+        if cap <= 0 or not ctx.order.side.is_buy:
+            return
+        metrics = ctx.portfolio.risk_metrics
+        age = ctx.portfolio.risk_metrics_age_seconds()
+        if metrics is None or age is None or age > self.max_metrics_age_seconds:
+            raise RiskViolation(
+                self.name,
+                "portfolio VaR limit is enabled but fresh risk metrics are unavailable "
+                f"(age: {'never computed' if age is None else f'{age:.0f}s'}) — "
+                "no new risk without a current VaR estimate",
+            )
+        var_pct = metrics.get("var_95_pct")
+        if not isinstance(var_pct, int | float):
+            raise RiskViolation(self.name, "risk metrics present but VaR missing")
+        if var_pct >= cap:
+            raise RiskViolation(
+                self.name,
+                f"portfolio 1-day VaR(95) {var_pct:.2%} >= limit {cap:.2%} — "
+                "reduce risk before adding positions",
+            )
 
 
 class OrderNotionalRule(RiskRule):
@@ -352,6 +426,8 @@ ALL_RULES: list[RiskRule] = [
     PortfolioExposureRule(),
     LeverageRule(),
     OptionsExposureRule(),
+    SectorConcentrationRule(),
+    PortfolioVaRRule(),
     SpreadRule(),
     VolumeRule(),
     SlippageProtectionRule(),

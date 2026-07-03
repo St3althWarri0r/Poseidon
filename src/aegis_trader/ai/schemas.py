@@ -180,6 +180,15 @@ DATA_TOOLS: list[dict[str, Any]] = [
         "orders remaining today, and the hard limits your trades must fit inside.",
         {}, [],
     ),
+    _simple_tool(
+        "get_risk_metrics",
+        "Portfolio risk metrics computed from live bar history: 1-day historical "
+        "VaR and expected shortfall (95/99%), portfolio beta to the benchmark, "
+        "annualized volatility, and the most correlated pair of holdings. Use this "
+        "to judge whether adding a position concentrates risk the individual "
+        "position limits cannot see.",
+        {}, [],
+    ),
 ]
 
 ALL_TOOLS: list[dict[str, Any]] = [*DATA_TOOLS, SUBMIT_DECISION_TOOL]
