@@ -11,6 +11,7 @@ produce a notification for the human instead.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 
 import structlog
@@ -57,11 +58,9 @@ class UpdateService:
                 await self.check_once()
             except Exception:
                 log.exception("update check failed")
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(),
                                        timeout=self._config.check_interval_hours * 3600)
-            except TimeoutError:
-                pass
 
     async def check_once(self) -> str | None:
         """Fetch and compare. Returns the new upstream commit if one exists."""

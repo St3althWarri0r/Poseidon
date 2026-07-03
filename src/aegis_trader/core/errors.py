@@ -103,7 +103,7 @@ class OrderRejectedError(BrokerError):
 # -- Risk / execution --------------------------------------------------------
 
 
-class RiskViolation(AegisError):
+class RiskViolation(AegisError):  # noqa: N818 — domain term
     """An order or decision violated a risk rule. Never retryable."""
 
     def __init__(self, rule: str, message: str) -> None:
@@ -111,7 +111,7 @@ class RiskViolation(AegisError):
         self.rule = rule
 
 
-class CircuitBreakerOpen(AegisError):
+class CircuitBreakerOpen(AegisError):  # noqa: N818 — domain term
     """Trading is halted by a circuit breaker or cooldown."""
 
     def __init__(self, reason: str) -> None:

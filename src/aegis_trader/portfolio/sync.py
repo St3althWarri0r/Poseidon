@@ -13,6 +13,7 @@ backoff — the service itself never dies.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 
 import structlog
@@ -67,10 +68,8 @@ class PortfolioSyncService:
                 self._consecutive_failures += 1
                 delay = min(self._interval * 4, 600)
                 log.exception("unexpected error in portfolio sync")
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
-            except TimeoutError:
-                pass
 
     async def sync_once(self) -> None:
         account = await self._broker.account()

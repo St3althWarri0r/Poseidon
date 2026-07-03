@@ -110,7 +110,7 @@ class ScheduleConfig(StrictModel):
     enabled: bool = True
 
     @model_validator(mode="after")
-    def _one_trigger(self) -> "ScheduleConfig":
+    def _one_trigger(self) -> ScheduleConfig:
         if bool(self.every_seconds) == bool(self.cron):
             raise ValueError(f"schedule '{self.name}': set exactly one of every_seconds or cron")
         return self
@@ -162,7 +162,7 @@ class AppConfig(StrictModel):
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
 
     @model_validator(mode="after")
-    def _validate_brokers(self) -> "AppConfig":
+    def _validate_brokers(self) -> AppConfig:
         enabled = [b for b in self.brokers if b.enabled]
         primaries = [b for b in enabled if b.primary]
         if len(primaries) > 1:

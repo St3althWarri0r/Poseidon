@@ -10,6 +10,7 @@ from the same loop (via sd_notify) so a hung process gets restarted.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import socket
 import time
@@ -67,10 +68,8 @@ class HealthMonitor:
         while not self._stop.is_set():
             await self.run_probes()
             _sd_notify("WATCHDOG=1")
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except TimeoutError:
-                pass
 
     async def run_probes(self) -> dict[str, ComponentHealth]:
         for name, probe in self._probes.items():

@@ -84,7 +84,7 @@ class TradierBroker(Broker):
 
     async def connect(self) -> None:
         profile = await self._get("/user/profile")
-        accounts = _as_list(((profile.get("profile") or {}).get("account")))
+        accounts = _as_list((profile.get("profile") or {}).get("account"))
         if not any(a.get("account_number") == self._account_id for a in accounts):
             raise BrokerAuthError(self.name, f"account {self._account_id} not found on this token")
         self._connected = True
