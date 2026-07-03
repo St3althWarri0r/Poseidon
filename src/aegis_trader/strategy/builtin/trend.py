@@ -31,8 +31,9 @@ class MomentumStrategy(Strategy):
             ma50 = sma(closes, 50)
             if r20 is None or ma50 is None:
                 continue
-            vols = [b.volume for b in bars]
-            vol_ratio = (vols[-1] / (sum(vols[-21:-1]) / 20)) if len(vols) >= 21 and sum(vols[-21:-1]) else None
+            vols: list[int] = [b.volume for b in bars]
+            recent_volume = sum(vols[-21:-1]) if len(vols) >= 21 else 0
+            vol_ratio = (vols[-1] / (recent_volume / 20)) if recent_volume else None
             if r20 >= min_return and closes[-1] > ma50 and (r60 is None or r60 > 0):
                 signals.append(
                     Signal(
@@ -68,8 +69,8 @@ class BreakoutStrategy(Strategy):
             prior_high = max(closes[-lookback - 1:-1])
             avg_vol = sum(b.volume for b in bars[-21:-1]) / 20 if len(bars) >= 21 else None
             breakout = closes[-1] > prior_high
-            volume_ok = avg_vol is not None and avg_vol > 0 and bars[-1].volume >= avg_vol * vol_multiple
-            if breakout and volume_ok:
+            if (breakout and avg_vol is not None and avg_vol > 0
+                    and bars[-1].volume >= avg_vol * vol_multiple):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction="long",

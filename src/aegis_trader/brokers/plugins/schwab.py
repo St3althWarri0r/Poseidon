@@ -108,9 +108,9 @@ class SchwabBroker(Broker):
                 "token refresh failed — the 7-day refresh token has likely expired; "
                 "re-run: aegis broker schwab-setup",
             )
-        self._access_token = token
+        self._access_token = str(token)
         self._token_expiry = time.monotonic() + float(payload.get("expires_in", 1800))
-        return token
+        return self._access_token
 
     async def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self._ensure_token()}", "Accept": "application/json"}

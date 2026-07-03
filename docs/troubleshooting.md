@@ -39,8 +39,8 @@ latency. Trading pauses by design until data returns.
 
 **`quote ... is stale — refusing to use it`** — the provider is serving
 old data (common: Alpha Vantage EOD quotes, or a free-tier delayed feed).
-Add a real-time source (Polygon/Alpaca/Tradier) for anything that must
-trade. Delayed data can still inform research if
+Add a real-time source (Public/Finnhub/Alpaca/Tradier — all free, or
+Polygon paid) for anything that must trade. Delayed data can still inform research if
 `data.allow_delayed_for_research: true`.
 
 **AI decisions list `data_gaps`** — expected behavior when a capability

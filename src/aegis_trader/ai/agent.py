@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
 import anthropic
 import structlog
@@ -159,13 +159,15 @@ class ClaudeAgent:
                 max_tokens=self._config.max_tokens,
                 thinking={"type": "adaptive"},
                 output_config={"effort": self._config.effort},
-                system=[{
+                # The SDK's TypedDict params don't accept dynamically built
+                # dicts; shapes are validated server-side and in our tests.
+                system=cast("Any", [{
                     "type": "text",
                     "text": SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"},
-                }],
-                tools=ALL_TOOLS,
-                messages=messages,
+                }]),
+                tools=cast("Any", ALL_TOOLS),
+                messages=cast("Any", messages),
             )
         except anthropic.AuthenticationError as exc:
             raise AgentError(f"Anthropic authentication failed: {exc}") from exc

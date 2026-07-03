@@ -40,9 +40,11 @@ Secrets never appear in this file: fields named `credential` hold the
 | `allow_delayed_for_research` | true | delayed data may inform research; orders always need fresh quotes |
 | `request_timeout_seconds` | 10 | per HTTP call |
 
-Provider names: `polygon`, `finnhub`, `twelvedata`, `alphavantage`,
-`alpaca` (credential = JSON with `key_id`/`secret_key`), `tradier_data`
-(options: `{sandbox: true}`).
+Provider names: `public_data` (free with a Public account; credential =
+API secret or JSON with `secret`/`account_id`), `polygon`, `finnhub`,
+`twelvedata`, `alphavantage`, `alpaca` (credential = JSON with
+`key_id`/`secret_key`), `tradier_data` (options: `{sandbox: true}`).
+Every provider has a $0 tier — see docs/api-configuration.md.
 
 ## `brokers[]`
 

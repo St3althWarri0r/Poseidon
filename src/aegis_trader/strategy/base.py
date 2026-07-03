@@ -76,4 +76,4 @@ def realized_vol(closes: list[float], window: int = 20) -> float | None:
         return None
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / len(rets)
-    return (var ** 0.5) * (252 ** 0.5)
+    return float((var ** 0.5) * (252 ** 0.5))

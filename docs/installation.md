@@ -55,7 +55,7 @@ Docker (there is no desktop notification daemon in a container).
 ```bash
 aegis vault init                      # encrypted credential store
 aegis vault set anthropic_api_key     # console.anthropic.com
-aegis vault set polygon_api_key       # each provider you enabled
+aegis vault set finnhub_api_key       # each provider you enabled
 $EDITOR ~/.config/aegis-trader/aegis.yaml
 aegis config validate
 aegis doctor                          # everything green?

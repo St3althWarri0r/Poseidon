@@ -43,19 +43,26 @@ from live, authoritative data providers — never from memory, never estimated.
   order-rate limits, duplicate prevention, buying-power verification, and
   an error-rate circuit breaker. Every order passes every rule.
 - **Broker plugins** — Alpaca, Tradier, tastytrade, Schwab, Interactive
-  Brokers (Client Portal), and a live-quote paper broker. Brokers without
-  official APIs (Fidelity, M1, Robinhood equities, …) ship as documented
-  stubs — no terms-violating automation, ever. Add a broker by
-  implementing one class ([docs/plugin-development.md](docs/plugin-development.md)).
-- **Market data failover** — Polygon, Finnhub, Twelve Data, Alpha Vantage,
-  Alpaca, Tradier, tried in priority order with penalty-box backoff.
+  Brokers (Client Portal), Public.com (stocks/options/crypto, free API),
+  and a live-quote paper broker. Brokers without official APIs (Fidelity,
+  M1, Robinhood equities, …) ship as documented stubs — no terms-violating
+  automation, ever. Add a broker by implementing one class
+  ([docs/plugin-development.md](docs/plugin-development.md)).
+- **Market data failover** — Public.com, Finnhub, Twelve Data, Alpha
+  Vantage, Alpaca, Tradier, Polygon, tried in priority order with
+  penalty-box backoff.
+- **Runs on $0 of subscriptions** — every supported data provider has a
+  free tier, and the Public.com API (trading + real-time quotes, bars,
+  option chains with greeks) is free with a brokerage account. The only
+  required spend is your Anthropic API usage
+  ([docs/api-configuration.md](docs/api-configuration.md)).
 - **Security** — scrypt+Fernet encrypted credential vault, hash-chained
   tamper-evident audit log (verified nightly and at startup), secret
   redaction in logs, localhost-only dashboard.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 101 unit/integration tests, paper trading, historical
+- **Testing** — 121 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 
@@ -68,7 +75,7 @@ cd Aegis-Trader
 
 aegis vault init                 # create the encrypted credential vault
 aegis vault set anthropic_api_key
-aegis vault set polygon_api_key  # + any other providers you enable
+aegis vault set finnhub_api_key  # + any other providers you enable
 aegis config validate
 aegis run                        # dashboard at http://127.0.0.1:8321
 ```

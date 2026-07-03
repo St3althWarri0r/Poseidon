@@ -90,7 +90,7 @@ class Scheduler:
         assert schedule.cron is not None
         now = datetime.now(EASTERN)
         next_fire = croniter(schedule.cron, now).get_next(datetime)
-        return max((next_fire - now).total_seconds(), 0.5)
+        return max(float((next_fire - now).total_seconds()), 0.5)
 
     async def _execute(self, job_name: str, schedule_name: str) -> None:
         if job_name in self._running_jobs:

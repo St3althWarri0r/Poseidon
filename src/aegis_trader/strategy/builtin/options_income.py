@@ -38,7 +38,8 @@ def _in_delta_band(contract: OptionContract, low: float, high: float) -> bool:
 
 
 class _OptionsStrategyBase(Strategy):
-    async def _chain_and_spot(self, router: DataRouter, symbol: str):
+    async def _chain_and_spot(self, router: DataRouter,
+                              symbol: str) -> tuple[list[OptionContract], float]:
         quote = await router.quote(symbol, allow_delayed=True)
         spot = float(quote.mid or quote.last or 0)
         if spot <= 0:
@@ -279,7 +280,7 @@ class IronCondorStrategy(_OptionsStrategyBase):
                 lc = next((c for c in calls if float(c.strike) > float(sc.strike)), None)
                 if lp is None or lc is None:
                     continue
-                if any(x.bid is None or x.ask is None for x in (sp, sc, lp, lc)):
+                if sp.bid is None or sc.bid is None or lp.ask is None or lc.ask is None:
                     continue
                 credit = float(sp.bid) + float(sc.bid) - float(lp.ask) - float(lc.ask)
                 if credit <= 0:

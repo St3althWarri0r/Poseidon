@@ -15,7 +15,7 @@ endpoints.
 | tastytrade | yes (Open API, cert env) | ✅ full plugin (`tastytrade`) |
 | Charles Schwab | yes (Trader API — individuals) | ✅ full plugin (`schwab`) |
 | Interactive Brokers | yes (Client Portal Gateway) | ✅ full plugin (`ibkr`) |
-| Public.com | yes (new trading API) | 🧩 documented scaffold (`public`) |
+| Public.com | yes (Trading API, free access) | ✅ full plugin (`public`) |
 | E*TRADE | yes, but OAuth 1.0a with daily re-auth | 🧩 documented scaffold (`etrade`) |
 | Webull | OpenAPI exists, application-gated | 🧩 documented scaffold (`webull`) |
 | Robinhood | crypto only; no equities API | ⛔ stub (`robinhood`) |
@@ -123,3 +123,37 @@ Aegis tickles the gateway session from its health loop to keep it alive;
 gateway logins still expire periodically per IBKR policy (re-login in the
 browser when the broker probe goes red). Paper vs live is a property of
 which account you log the gateway into.
+
+## Public.com
+
+Public's Trading API is free to enable and covers stocks/ETFs
+(fractional), single- and multi-leg options, and crypto — the same
+official API behind Public's own MCP integration, driven here natively so
+trading stays fully autonomous (no chat client in the loop).
+
+1. In the Public app/site: Settings → Security & privacy → API access →
+   generate an API **secret key**.
+2. `aegis vault set public_api_secret` with
+   `{"secret": "...", "account_id": "..."}` (`account_id` optional — the
+   first account on the key is used).
+3. Config:
+
+```yaml
+brokers:
+  - name: public
+    primary: true
+    paper: false           # required — see below
+    credential: public_api_secret
+```
+
+Behavior notes:
+
+- **No paper environment.** Public offers none, so the plugin refuses
+  `paper: true` instead of silently trading live — you must write
+  `paper: false` deliberately. Use the built-in `paper` broker for
+  simulation.
+- GTC orders are mapped to Public's GTD with a 30-day window (Public
+  supports DAY and GTD).
+- Multi-leg option orders must be LIMIT with a net price (Public rule).
+- The same secret powers the free `public_data` market data provider
+  (docs/api-configuration.md) — one credential, trading + data.

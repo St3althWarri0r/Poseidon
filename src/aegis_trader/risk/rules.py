@@ -43,8 +43,11 @@ class RiskContext:
 
     @property
     def notional(self) -> Decimal:
-        multiplier = 100 if self.order.asset_class is AssetClass.OPTION else 1
-        return self.order.estimated_notional(self.reference_price) * multiplier  # type: ignore[operator]
+        multiplier = Decimal(100) if self.order.asset_class is AssetClass.OPTION else Decimal(1)
+        notional = self.order.estimated_notional(self.reference_price)
+        if notional is None:  # unreachable: reference_price already raised if unusable
+            raise RiskViolation("reference_price", f"no usable notional for {self.order.symbol}")
+        return notional * multiplier
 
 
 class RiskRule(abc.ABC):

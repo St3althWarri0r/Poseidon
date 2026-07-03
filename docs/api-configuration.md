@@ -25,6 +25,7 @@ shifts to the next one.
 
 | Provider | Capabilities in Aegis | Key from | Vault value |
 | --- | --- | --- | --- |
+| `public_data` | real-time quotes, bars, option chains + greeks, crypto | public.com (API secret) | secret, or `{"secret": "...", "account_id": "..."}` |
 | `polygon` | quotes (NBBO), bars, option chains + greeks, news | polygon.io | plain API key |
 | `finnhub` | quotes, news, earnings calendar, economic calendar | finnhub.io | plain API key |
 | `twelvedata` | quotes, bars | twelvedata.com | plain API key |
@@ -32,14 +33,31 @@ shifts to the next one.
 | `alpaca` | quotes, bars, option chains, news | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |
 | `tradier_data` | quotes, daily bars, option chains + greeks | tradier.com | access token (options: `{sandbox: true}`) |
 
-Recommended minimum for full functionality: **polygon** (or `alpaca` +
-`tradier_data`) for quotes/options, plus **finnhub** for news and both
-calendars.
+### Running on $0 of API subscriptions
+
+The platform is designed so the only thing you pay for is Claude:
+
+- **`public_data` is free** with a Public brokerage account and serves
+  real-time quotes, bars, and full option chains with greeks — the same
+  API secret as the `public` broker. If you trade through Public, this is
+  your primary source and costs nothing.
+- **`finnhub`**, **`twelvedata`**, and **`alphavantage`** free tiers cover
+  news, both calendars, and backup quotes/bars.
+- **`alpaca`** (IEX feed) and **`tradier_data`** (sandbox) are also free
+  with their respective accounts.
+
+Recommended free stack: `public_data` (priority 10) for quotes/options/
+bars + `finnhub` (priority 20) for news and both calendars, with
+`twelvedata`/`alphavantage` as failover. Paid sources (e.g. `polygon`)
+are optional upgrades, never requirements.
 
 Notes:
 
 - Free tiers are rate-limited; Aegis honors `Retry-After` and backs off,
-  but a busy watchlist wants at least one paid quote source.
+  and the failover router shifts traffic automatically when a provider
+  is penalized.
+- `public_data` options: `{crypto_symbols: [BTC, ETH]}` marks watchlist
+  symbols that should be quoted as crypto instruments.
 - Alpha Vantage quotes are end-of-day: the freshness policy grades them
   DELAYED/STALE, so they can inform research but never orders — that is by
   design, not a bug.

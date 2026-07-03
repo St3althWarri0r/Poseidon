@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 from ..core.models import Bar
 from ..strategy.base import Signal, Strategy
@@ -136,7 +137,7 @@ class _RouterShim:
             raise DataError(f"no history for {symbol} at this point in the replay")
         return bars
 
-    def __getattr__(self, name: str):  # quote / option_chain / news / ...
+    def __getattr__(self, name: str) -> Any:  # quote / option_chain / news / ...
         from ..core.errors import DataError
 
         async def unavailable(*_args: object, **_kwargs: object) -> None:
@@ -191,13 +192,13 @@ class BacktestEngine:
                     still_open.append(trade)
                     continue
                 close = float(bar.close)
-                held = (day - trade.entry_date).days
+                held_days = (day - trade.entry_date).days
                 exit_reason = None
                 if close <= trade.entry_price * (1 - config.stop_loss_pct):
                     exit_reason = "stop_loss"
                 elif close >= trade.entry_price * (1 + config.take_profit_pct):
                     exit_reason = "take_profit"
-                elif held >= config.max_hold_days:
+                elif held_days >= config.max_hold_days:
                     exit_reason = "time_stop"
                 if exit_reason:
                     price = close * (1 - config.slippage_pct)

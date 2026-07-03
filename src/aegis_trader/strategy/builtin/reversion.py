@@ -14,7 +14,7 @@ def _zscore(closes: list[float], window: int = 20) -> float | None:
     sample = closes[-window:]
     mean = sum(sample) / window
     var = sum((c - mean) ** 2 for c in sample) / window
-    std = var ** 0.5
+    std = float(var ** 0.5)
     if std == 0:
         return None
     return (closes[-1] - mean) / std

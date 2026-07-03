@@ -110,9 +110,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     check("holiday calendar covers today", calendar_covers(clock.now_eastern().date()))
     check("data providers configured", bool(config.data.providers),
           ", ".join(p.name for p in config.data.providers if p.enabled) or "none")
+    primary = config.primary_broker()
     check("primary broker configured",
-          config.mode.value == "research" or config.primary_broker() is not None,
-          (config.primary_broker().name if config.primary_broker() else "none"))
+          config.mode.value == "research" or primary is not None,
+          (primary.name if primary is not None else "none"))
 
     vault = _vault_for(config)
     check("vault exists", vault.exists, str(config.data_dir / "vault.bin"))

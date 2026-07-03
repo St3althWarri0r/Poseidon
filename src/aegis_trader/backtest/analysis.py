@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -60,7 +61,8 @@ def monte_carlo(result: BacktestResult, *, runs: int = 1000,
     )
 
 
-async def walk_forward(strategy_factory, history: dict[str, list[Bar]], *,
+async def walk_forward(strategy_factory: Callable[[], Strategy],
+                       history: dict[str, list[Bar]], *,
                        folds: int = 4, config: BacktestConfig | None = None
                        ) -> list[dict[str, object]]:
     """Split the history into sequential folds and evaluate each out-of-sample

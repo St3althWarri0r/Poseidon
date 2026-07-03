@@ -28,26 +28,39 @@ data:
   allow_delayed_for_research: true   # delayed data OK for research; orders always require fresh quotes
   providers:
     # Priority: lower number = tried first. Failover is automatic.
-    - name: polygon
-      credential: polygon_api_key
-      priority: 10
-    - name: finnhub
+    # Every provider below has a $0 tier — see docs/api-configuration.md
+    # for exactly what each free tier includes and its rate limits.
+    #
+    # Public.com (FREE with a Public brokerage account): real-time quotes,
+    # bars, and option chains with greeks — the same API secret as the
+    # `public` broker. The best zero-cost primary source.
+    # - name: public_data
+    #   credential: public_api_secret
+    #   priority: 10
+    - name: finnhub              # free tier: real-time US quotes, news, earnings
       credential: finnhub_api_key
       priority: 20
-    - name: twelvedata
+    - name: twelvedata           # free tier: quotes + bars (8 req/min)
       credential: twelvedata_api_key
       priority: 30
-    - name: alphavantage
+    - name: alphavantage         # free tier: daily bars, econ calendar (25 req/day)
       credential: alphavantage_api_key
       priority: 40
-    # Alpaca market data (credential is JSON: {"key_id": "...", "secret_key": "..."})
+    # Optional extras:
+    # Alpaca market data — free with an Alpaca account (IEX feed).
+    # Credential is JSON: {"key_id": "...", "secret_key": "..."}
     # - name: alpaca
     #   credential: alpaca_keys
     #   priority: 15
+    # Tradier — free sandbox market data with a developer account.
     # - name: tradier_data
     #   credential: tradier_token
     #   priority: 25
     #   options: { sandbox: true }
+    # Polygon — generous paid tiers; free tier is delayed (fine for research).
+    # - name: polygon
+    #   credential: polygon_api_key
+    #   priority: 12
 
 brokers:
   # Built-in paper broker — fills priced from live quotes; ideal first setup.
@@ -66,6 +79,15 @@ brokers:
   # - name: tradier
   #   paper: true
   #   credential: tradier_creds
+  # Public.com — free API access (stocks/ETFs/options/crypto, no commission
+  # on stocks/ETFs). No paper environment: `paper: false` is required and
+  # trades are LIVE. Credential JSON: {"secret": "...", "account_id": "..."}
+  # (account_id optional). Same secret powers the public_data provider.
+  # - name: public
+  #   enabled: true
+  #   primary: true
+  #   paper: false
+  #   credential: public_api_secret
   # tastytrade, schwab, ibkr: see docs/broker-setup.md
 
 risk:

@@ -25,7 +25,7 @@ from .brokers.base import Broker
 from .brokers.plugins.paper import PaperBroker
 from .brokers.registry import create_broker
 from .core.clock import FreshnessPolicy, MarketClock, calendar_covers
-from .core.config import AppConfig
+from .core.config import AppConfig, ScheduleConfig
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
 from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError
@@ -148,9 +148,13 @@ class ApplicationKernel:
             credential = self.vault.get(provider_cfg.credential) if provider_cfg.credential else ""
             api_key = credential
             # Providers with multi-field credentials store JSON in the vault.
+            # The key field may be `key_id` (Alpaca), `api_key`, or `secret`
+            # (Public — lets one vault entry serve broker + data provider).
             if credential.strip().startswith("{"):
                 blob = json.loads(credential)
-                api_key = blob.pop("key_id", blob.pop("api_key", ""))
+                # Pop every key-bearing field so secrets never land in options.
+                key_fields = [blob.pop(f, None) for f in ("key_id", "api_key", "secret")]
+                api_key = next((k for k in key_fields if k), "")
                 options.update(blob)
             providers.append(
                 (cls(api_key=api_key, timeout=self.config.data.request_timeout_seconds,
@@ -197,10 +201,8 @@ class ApplicationKernel:
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
 
-    def _effective_schedules(self):
+    def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
-        from .core.config import ScheduleConfig
-
         schedules = list(self.config.schedules)
         if not any(s.job == "review_cycle" and s.enabled for s in schedules):
             schedules.append(
@@ -344,7 +346,9 @@ class ApplicationKernel:
         if budget <= 0:
             return False
         summary = await self.ai_usage_summary()
-        return float(summary["month_cost_usd"]) >= budget
+        month_cost = summary["month_cost_usd"]
+        assert isinstance(month_cost, float)  # ai_usage_summary computes it as float
+        return month_cost >= budget
 
     async def ai_usage_summary(self) -> dict[str, object]:
         """Token totals and estimated spend for the current calendar month."""
