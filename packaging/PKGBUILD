@@ -1,0 +1,42 @@
+# Maintainer: local build — CachyOS/Arch native package for Aegis Trader
+# Build & install:  cd packaging && makepkg -si
+pkgname=aegis-trader
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Autonomous AI trading platform with Claude as the portfolio manager"
+arch=('any')
+url="https://github.com/St3althWarri0r/Aegis-Trader"
+license=('MIT')
+depends=('python' 'python-anthropic' 'python-httpx' 'python-pydantic'
+         'python-pydantic-settings' 'python-yaml' 'python-structlog'
+         'python-cryptography' 'python-aiosqlite' 'python-fastapi'
+         'uvicorn' 'python-websockets' 'python-croniter' 'python-dateutil'
+         'libnotify')
+makedepends=('python-build' 'python-installer' 'python-hatchling')
+source=()
+sha256sums=()
+
+pkgver() {
+  cd "$startdir/.."
+  git describe --tags --always 2>/dev/null | sed 's/^v//;s/-/./g' || echo "1.0.0"
+}
+
+build() {
+  cd "$startdir/.."
+  python -m build --wheel --no-isolation --outdir "$srcdir/dist"
+}
+
+package() {
+  python -m installer --destdir="$pkgdir" "$srcdir"/dist/*.whl
+  cd "$startdir/.."
+  install -Dm644 packaging/aegis-trader.desktop \
+    "$pkgdir/usr/share/applications/aegis-trader.desktop"
+  install -Dm644 config/aegis.example.yaml \
+    "$pkgdir/usr/share/aegis-trader/aegis.example.yaml"
+  # The stock unit points at the venv install; the system package uses /usr/bin.
+  sed 's|ExecStart=.*|ExecStart=/usr/bin/aegis run|' packaging/aegis-trader.service \
+    > "$srcdir/aegis-trader.service"
+  install -Dm644 "$srcdir/aegis-trader.service" \
+    "$pkgdir/usr/lib/systemd/user/aegis-trader.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

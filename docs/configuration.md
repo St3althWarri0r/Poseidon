@@ -1,0 +1,105 @@
+# Configuration reference
+
+File: `~/.config/aegis-trader/aegis.yaml` (override with `aegis
+--config`). Validated strictly at startup — unknown keys and invalid values
+refuse to boot. Environment variables `AEGIS_SECTION__FIELD=value` override
+file values (e.g. `AEGIS_AI__MODEL=claude-opus-4-8`,
+`AEGIS_DASHBOARD__HOST=0.0.0.0`).
+
+Secrets never appear in this file: fields named `credential` hold the
+*name* of a vault entry (`aegis vault set <name>`).
+
+## Top level
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `mode` | `research` | `research` / `approval` / `autonomous`; switchable live from the dashboard |
+| `data_dir` | `~/.local/share/aegis-trader` | DB, logs, vault, paper state |
+| `log_level` | `INFO` | console + rotating JSON file logs |
+
+## `ai`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `model` | `claude-opus-4-8` | any current Claude model ID |
+| `effort` | `high` | `low`–`max`; higher = deeper reasoning per cycle |
+| `max_tokens` | 16000 | per API call |
+| `api_key_credential` | `anthropic_api_key` | vault entry name |
+| `max_tool_iterations` | 24 | hard cap on tool round-trips per cycle |
+| `review_interval_seconds` | 300 | default market-hours cycle cadence |
+
+## `data`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `providers[]` | — | `name`, `credential`, `priority` (lower = first), `enabled`, `options` |
+| `real_time_max_age_seconds` | 5 | freshness gate for REAL_TIME |
+| `delayed_max_age_seconds` | 900 | gate for DELAYED |
+| `allow_delayed_for_research` | true | delayed data may inform research; orders always need fresh quotes |
+| `request_timeout_seconds` | 10 | per HTTP call |
+
+Provider names: `polygon`, `finnhub`, `twelvedata`, `alphavantage`,
+`alpaca` (credential = JSON with `key_id`/`secret_key`), `tradier_data`
+(options: `{sandbox: true}`).
+
+## `brokers[]`
+
+`name` (plugin), `enabled`, `primary` (exactly one outside research mode),
+`paper` (sandbox where supported), `credential` (vault JSON), `options`
+(plugin-specific). See docs/broker-setup.md.
+
+## `risk`
+
+Every limit is enforced pre-trade by the risk engine
+(docs/risk-controls.md explains each rule):
+
+`max_position_pct`, `max_portfolio_exposure_pct`, `max_daily_loss_pct`,
+`max_weekly_loss_pct`, `max_drawdown_pct`, `max_leverage`,
+`max_options_exposure_pct`, `max_sector_concentration_pct`,
+`max_order_notional`, `min_order_notional`, `max_spread_pct`,
+`min_avg_volume`, `max_orders_per_day`, `trade_cooldown_seconds`,
+`news_blackout_minutes_before_econ`, `volatility_halt_daily_move_pct`,
+`circuit_breaker_error_threshold`, `circuit_breaker_window_seconds`,
+`circuit_breaker_cooldown_seconds`, `slippage_limit_pct`.
+
+## `strategies[]`
+
+`name` (one of the 16 built-ins or a plugin), `enabled`, `symbols`
+(defaults to all watchlist symbols), `options` (strategy-specific, e.g.
+`min_20d_return`, `pairs`, `min_open_interest`). Each strategy toggles
+independently; disabled strategies never run.
+
+## `schedules[]`
+
+`name`, `job` (`review_cycle`, `portfolio_sync`, `update_check`,
+`audit_verify`), and exactly one of:
+
+- `every_seconds: N` — fixed interval, 1 s and up;
+- `cron: "m h dom mon dow"` — standard cron, evaluated in America/New_York.
+
+`only_market_hours: true` gates the trigger on the regular session.
+Defaults added automatically when absent: a market-hours `review_cycle`
+every `ai.review_interval_seconds`, and a nightly `audit_verify` at 02:15.
+
+## `notifications[]`
+
+`kind` (`desktop`, `email`, `discord`, `telegram`, `webhook`),
+`min_level` (`info`/`warning`/`critical`), `credential` (vault JSON),
+`options`. See the example config for the exact credential shapes.
+
+Events routed automatically: fills, rejections, risk violations, circuit
+breaker, broker disconnect/reconnect, approval requests, component errors,
+update availability. Repeats are deduplicated for 5 minutes.
+
+## `watchlists[]`, `dashboard`, `updates`
+
+- `watchlists[]`: named symbol lists; the union feeds the AI and default
+  strategy universes.
+- `dashboard`: `host` (default `127.0.0.1` — keep it), `port` (8321).
+- `updates`: `enabled`, `check_interval_hours`, `auto_apply`.
+
+## Validation
+
+`aegis config validate` checks the file without starting anything;
+`aegis doctor` additionally checks the vault, credentials, calendar
+coverage, and database.
