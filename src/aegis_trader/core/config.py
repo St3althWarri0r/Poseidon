@@ -1,0 +1,230 @@
+"""Configuration model and loader.
+
+Configuration lives in a single YAML file (default:
+``~/.config/aegis-trader/aegis.yaml``); every field is validated by pydantic
+at startup and the process refuses to boot on invalid config rather than
+running with surprises. Secrets are *never* stored here — the config holds
+credential *names* which resolve through the encrypted vault
+(:mod:`aegis_trader.security.vault`).
+
+Environment variables prefixed with ``AEGIS_`` override file values using
+``__`` as the nesting delimiter, e.g. ``AEGIS_AI__MODEL=claude-opus-4-8``.
+"""
+
+from __future__ import annotations
+
+import os
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .enums import TradingMode
+from .errors import ConfigError
+
+
+def default_config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "aegis-trader"
+
+
+def default_data_dir() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "aegis-trader"
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class AIConfig(StrictModel):
+    model: str = "claude-opus-4-8"
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    max_tokens: int = Field(default=16000, ge=1024, le=128000)
+    api_key_credential: str = "anthropic_api_key"  # vault entry name
+    max_tool_iterations: int = Field(default=24, ge=1, le=100)
+    review_interval_seconds: int = Field(default=300, ge=30)
+
+
+class ProviderConfig(StrictModel):
+    name: str  # e.g. "polygon", "finnhub", "twelvedata", "alphavantage", "alpaca", "tradier"
+    enabled: bool = True
+    credential: str = ""  # vault entry name holding the API key/token
+    priority: int = Field(default=100, ge=0)  # lower = preferred
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrokerConfig(StrictModel):
+    name: str  # plugin name, e.g. "alpaca", "tradier", "paper"
+    enabled: bool = True
+    primary: bool = False  # orders route to the primary broker
+    credential: str = ""  # vault entry name (JSON blob of the plugin's fields)
+    paper: bool = True  # sandbox/paper endpoints where the broker offers them
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class DataConfig(StrictModel):
+    providers: list[ProviderConfig] = Field(default_factory=list)
+    real_time_max_age_seconds: float = Field(default=5.0, gt=0)
+    delayed_max_age_seconds: float = Field(default=900.0, gt=0)
+    allow_delayed_for_research: bool = True  # delayed data OK for research, never for orders
+    request_timeout_seconds: float = Field(default=10.0, gt=0)
+
+
+class RiskConfig(StrictModel):
+    max_position_pct: float = Field(default=0.10, gt=0, le=1)  # of equity per position
+    max_portfolio_exposure_pct: float = Field(default=1.0, gt=0, le=2)
+    max_daily_loss_pct: float = Field(default=0.03, gt=0, le=1)
+    max_weekly_loss_pct: float = Field(default=0.07, gt=0, le=1)
+    max_drawdown_pct: float = Field(default=0.15, gt=0, le=1)
+    max_leverage: float = Field(default=1.0, ge=1.0)
+    max_options_exposure_pct: float = Field(default=0.20, ge=0, le=1)
+    max_sector_concentration_pct: float = Field(default=0.30, gt=0, le=1)
+    max_order_notional: Decimal = Field(default=Decimal("25000"))
+    min_order_notional: Decimal = Field(default=Decimal("1"))
+    max_spread_pct: float = Field(default=0.02, gt=0)  # liquidity/spread filter
+    min_avg_volume: int = Field(default=100_000, ge=0)
+    max_orders_per_day: int = Field(default=40, ge=1)
+    trade_cooldown_seconds: int = Field(default=300, ge=0)  # per-symbol cooldown
+    news_blackout_minutes_before_econ: int = Field(default=10, ge=0)
+    volatility_halt_daily_move_pct: float = Field(default=0.08, gt=0)  # index circuit proxy
+    circuit_breaker_error_threshold: int = Field(default=5, ge=1)
+    circuit_breaker_window_seconds: int = Field(default=300, ge=10)
+    circuit_breaker_cooldown_seconds: int = Field(default=1800, ge=60)
+    slippage_limit_pct: float = Field(default=0.01, gt=0)  # market-order protection band
+
+
+class StrategyConfig(StrictModel):
+    name: str
+    enabled: bool = True
+    symbols: list[str] = Field(default_factory=list)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScheduleConfig(StrictModel):
+    name: str
+    job: str  # registered job name
+    every_seconds: int | None = Field(default=None, ge=1)
+    cron: str | None = None  # standard 5-field cron, evaluated in America/New_York
+    only_market_hours: bool = False
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _one_trigger(self) -> "ScheduleConfig":
+        if bool(self.every_seconds) == bool(self.cron):
+            raise ValueError(f"schedule '{self.name}': set exactly one of every_seconds or cron")
+        return self
+
+
+class NotificationChannelConfig(StrictModel):
+    kind: Literal["desktop", "email", "discord", "telegram", "webhook"]
+    enabled: bool = True
+    credential: str = ""  # vault entry for tokens/SMTP password
+    min_level: Literal["info", "warning", "critical"] = "info"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class DashboardConfig(StrictModel):
+    host: str = "127.0.0.1"  # local-only by default; never expose without a reverse proxy
+    port: int = Field(default=8321, ge=1, le=65535)
+
+
+class UpdateConfig(StrictModel):
+    enabled: bool = True
+    check_interval_hours: int = Field(default=24, ge=1)
+    channel: Literal["git"] = "git"  # self-update via the installed git checkout
+    auto_apply: bool = False  # download+notify by default; apply only when told to
+
+
+class WatchlistConfig(StrictModel):
+    name: str = "default"
+    symbols: list[str] = Field(default_factory=list)
+
+    @field_validator("symbols")
+    @classmethod
+    def _upper(cls, v: list[str]) -> list[str]:
+        return [s.strip().upper() for s in v if s.strip()]
+
+
+class AppConfig(StrictModel):
+    mode: TradingMode = TradingMode.RESEARCH  # safest default
+    data_dir: Path = Field(default_factory=default_data_dir)
+    log_level: str = "INFO"
+    ai: AIConfig = Field(default_factory=AIConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
+    brokers: list[BrokerConfig] = Field(default_factory=list)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    strategies: list[StrategyConfig] = Field(default_factory=list)
+    schedules: list[ScheduleConfig] = Field(default_factory=list)
+    notifications: list[NotificationChannelConfig] = Field(default_factory=list)
+    watchlists: list[WatchlistConfig] = Field(default_factory=list)
+    dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    updates: UpdateConfig = Field(default_factory=UpdateConfig)
+
+    @model_validator(mode="after")
+    def _validate_brokers(self) -> "AppConfig":
+        enabled = [b for b in self.brokers if b.enabled]
+        primaries = [b for b in enabled if b.primary]
+        if len(primaries) > 1:
+            raise ValueError("only one broker may be marked primary")
+        if self.mode is not TradingMode.RESEARCH and enabled and not primaries:
+            raise ValueError("a primary broker is required outside research mode")
+        names = [b.name for b in enabled]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate enabled broker names")
+        return self
+
+    def primary_broker(self) -> BrokerConfig | None:
+        for b in self.brokers:
+            if b.enabled and b.primary:
+                return b
+        return None
+
+    def all_watchlist_symbols(self) -> list[str]:
+        seen: dict[str, None] = {}
+        for wl in self.watchlists:
+            for s in wl.symbols:
+                seen.setdefault(s)
+        return list(seen)
+
+
+def _deep_env_overrides() -> dict[str, Any]:
+    """Build a nested override dict from AEGIS_* environment variables."""
+    result: dict[str, Any] = {}
+    for key, value in os.environ.items():
+        if not key.startswith("AEGIS_"):
+            continue
+        path = key[len("AEGIS_"):].lower().split("__")
+        node = result
+        for part in path[:-1]:
+            node = node.setdefault(part, {})
+        node[path[-1]] = value
+    return result
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def load_config(path: Path | None = None) -> AppConfig:
+    path = path or default_config_dir() / "aegis.yaml"
+    raw: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"cannot parse {path}: {exc}") from exc
+        if loaded is not None and not isinstance(loaded, dict):
+            raise ConfigError(f"{path} must contain a YAML mapping")
+        raw = loaded or {}
+    raw = _deep_merge(raw, _deep_env_overrides())
+    try:
+        return AppConfig.model_validate(raw)
+    except Exception as exc:  # pydantic.ValidationError formats nicely via str()
+        raise ConfigError(f"invalid configuration ({path}):\n{exc}") from exc

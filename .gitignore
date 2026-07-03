@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state (never commit)
+*.db
+*.db-journal
+*.sqlite3
+data/
+logs/
+*.log
+
+# Secrets (never commit)
+.env
+*.key
+vault.bin
+credentials*.json
+config/aegis.yaml
+
+# Editors
+.idea/
+.vscode/
+*.swp
