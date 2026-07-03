@@ -324,9 +324,8 @@ td small { color: var(--ink-muted); }
 /* ---------- brand mark (trident) ---------- */
 
 .brand-mark {
-  width: 22px; height: 22px; fill: none; stroke: var(--series-1);
-  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
-  filter: drop-shadow(0 0 6px rgba(57, 135, 229, 0.45));
+  width: 24px; height: 24px; fill: var(--series-1); stroke: none;
+  filter: drop-shadow(0 0 7px rgba(57, 135, 229, 0.5));
 }
 
 /* ---------- forms (trade ticket / algorithm editor) ---------- */
