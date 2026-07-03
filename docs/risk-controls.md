@@ -13,11 +13,11 @@ audited.
 | --- | --- | --- |
 | `fresh_portfolio_state` | fixed 120 s | trading against a portfolio snapshot older than 2 minutes (e.g. broker sync down) |
 | `market_session` | — | orders outside the regular session (unless the order requests extended hours during pre/after) — also covers holidays, half-days, unknown calendar years, and treats exchange-closed states as CLOSED |
-| `max_daily_loss` | `max_daily_loss_pct` | any new order once the day's loss from the day-start baseline reaches the limit; effectively a daily halt |
+| `max_daily_loss` | `max_daily_loss_pct` | new risk once the day's loss from the day-start baseline reaches the limit (exits stay allowed — see exemptions below) |
 | `max_weekly_loss` | `max_weekly_loss_pct` | weekly analogue (ISO-week baseline) |
 | `max_drawdown` | `max_drawdown_pct` | trading once equity has fallen this far from its all-time peak (peak persists across restarts) |
 | `max_orders_per_day` | `max_orders_per_day` | runaway order loops; the counter resets at midnight ET |
-| `trade_cooldown` | `trade_cooldown_seconds` | re-trading the same symbol within the cooldown |
+| `trade_cooldown` | `trade_cooldown_seconds` | re-entering the same symbol within the cooldown (exits exempt) |
 | `order_notional_bounds` | `max_order_notional`, `min_order_notional` | fat-finger sizes and dust orders |
 | `buying_power` | — | buys exceeding live buying power (options buying power for options) |
 | `max_position_size` | `max_position_pct` | a single position (existing value + this order) above a % of equity |
@@ -34,6 +34,37 @@ audited.
 the config value in `get_risk_status` and portfolio composition in
 `get_portfolio`) — a data provider for sector taxonomies can make it a
 hard rule via a custom `RiskRule` (docs/plugin-development.md).
+
+### Risk-reducing order exemptions
+
+Halts and entry filters exist to stop *new* risk — they must never trap
+the operator in a position. Orders whose side reduces risk (`sell`,
+`sell_to_close`, `buy_to_close`) are therefore exempt from the loss-limit
+halts (daily/weekly/drawdown), the liquidity entry filters
+(spread/volume), and the per-symbol cooldown. They still pass everything
+else: session checks, notional bounds, slippage protection, duplicate
+prevention, and the circuit breaker. `sell_to_open` (opening short option
+risk) is deliberately **not** exempt.
+
+## Position guardian
+
+Every AI entry carries an exit plan; the guardian makes it binding. When
+an entry order fills, the decision's numeric stop-loss / take-profit is
+persisted ("armed") for that symbol. On a short interval during market
+hours (default 60 s), each armed plan is checked against a live,
+freshness-graded quote:
+
+- **breach in research mode** → warning notification, no order;
+- **approval mode** → an exit order is proposed into the normal approval
+  queue with a rationale explaining which level was hit;
+- **autonomous mode** → the exit executes through the order manager
+  (still passing the risk engine), as a limit order at the live bid.
+
+Triggered plans latch (no re-fire loops); plans deactivate automatically
+when the position is closed by any path. Free-text ``time_stop`` entries
+("exit before earnings") are not machine-enforced — the AI handles those
+during review cycles, and the dashboard shows them so you can too. Every
+trigger is audited and notified.
 
 ## Circuit breaker & cooldowns
 

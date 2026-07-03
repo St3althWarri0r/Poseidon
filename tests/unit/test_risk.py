@@ -150,6 +150,35 @@ class TestRules:
             CooldownRule().check(ctx(buy(), cooldown=120.0))
 
 
+class TestRiskReducingExemptions:
+    """Halts and entry filters must never trap the operator in a position."""
+
+    def _sell(self, qty: str = "10") -> Order:
+        return Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal(qty), limit_price=Decimal("100.00"))
+
+    def test_daily_loss_halt_allows_exits(self) -> None:
+        state = portfolio_with(equity="90000")
+        state.day_start_equity = Decimal("100000")  # -10%: buys blocked
+        with pytest.raises(RiskViolation):
+            DailyLossRule().check(ctx(buy(), portfolio=state))
+        DailyLossRule().check(ctx(self._sell(), portfolio=state))  # sell passes
+
+    def test_spread_filter_allows_exits(self) -> None:
+        SpreadRule().check(ctx(self._sell(), spread="5.00"))  # wide book, exit OK
+
+    def test_volume_filter_allows_exits(self) -> None:
+        VolumeRule().check(ctx(self._sell(), bars=[]))
+
+    def test_cooldown_allows_exits(self) -> None:
+        CooldownRule().check(ctx(self._sell(), cooldown=120.0))
+
+    def test_sell_to_open_is_not_exempt(self) -> None:
+        assert not OrderSide.SELL_TO_OPEN.is_risk_reducing  # opening short risk
+        assert OrderSide.SELL.is_risk_reducing
+        assert OrderSide.BUY_TO_CLOSE.is_risk_reducing
+
+
 class TestCircuitBreaker:
     def test_opens_after_threshold(self) -> None:
         breaker = CircuitBreaker(error_threshold=3, window_seconds=60, cooldown_seconds=300)

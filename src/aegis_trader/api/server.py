@@ -67,6 +67,36 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     app = FastAPI(title="Aegis Trader", docs_url=None, redoc_url=None, openapi_url=None)
     hub = WebsocketHub(kernel.bus)
 
+    # Optional bearer-token auth (required by config validation whenever the
+    # host is non-loopback). Static assets are exempt — they contain nothing
+    # sensitive and <link>/<script> tags cannot carry headers.
+    auth_token: str | None = None
+    if kernel.config.dashboard.auth_token_credential:
+        auth_token = kernel.vault.get(kernel.config.dashboard.auth_token_credential)
+
+    def _token_ok(supplied: str | None) -> bool:
+        import hmac
+
+        return auth_token is not None and supplied is not None and hmac.compare_digest(
+            supplied, auth_token
+        )
+
+    if auth_token:
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse as StarletteJSON
+
+        @app.middleware("http")
+        async def _require_token(request: Request, call_next):  # type: ignore[no-untyped-def]
+            if request.url.path.startswith("/static"):
+                return await call_next(request)
+            supplied = request.query_params.get("token")
+            header = request.headers.get("Authorization", "")
+            if header.startswith("Bearer "):
+                supplied = header.removeprefix("Bearer ")
+            if not _token_ok(supplied):
+                return StarletteJSON({"detail": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
@@ -162,6 +192,14 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         asyncio.create_task(kernel.run_review_cycle())
         return JSONResponse({"ok": True, "detail": "review cycle started"})
 
+    @app.get("/api/performance")
+    async def performance() -> JSONResponse:
+        return JSONResponse(await kernel.performance_report())
+
+    @app.get("/api/exit-plans")
+    async def exit_plans() -> JSONResponse:
+        return JSONResponse({"plans": await kernel.guardian.active_plans()})
+
     @app.get("/api/audit")
     async def audit(limit: int = 100) -> JSONResponse:
         records = await kernel.audit.tail(limit)
@@ -169,6 +207,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket(ws: WebSocket) -> None:
+        if auth_token and not _token_ok(ws.query_params.get("token")):
+            await ws.close(code=4401)
+            return
         await hub.handle(ws)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

@@ -25,6 +25,8 @@ Secrets never appear in this file: fields named `credential` hold the
 | `effort` | `high` | `low`–`max`; higher = deeper reasoning per cycle |
 | `max_tokens` | 16000 | per API call |
 | `api_key_credential` | `anthropic_api_key` | vault entry name |
+| `input_price_per_mtok` / `output_price_per_mtok` | 5.0 / 25.0 | USD per Mtok for spend estimation |
+| `monthly_budget_usd` | 0 | hard ceiling; review cycles pause when the month's estimated spend reaches it (0 = off) |
 | `max_tool_iterations` | 24 | hard cap on tool round-trips per cycle |
 | `review_interval_seconds` | 300 | default market-hours cycle cadence |
 
@@ -62,6 +64,20 @@ Every limit is enforced pre-trade by the risk engine
 `circuit_breaker_error_threshold`, `circuit_breaker_window_seconds`,
 `circuit_breaker_cooldown_seconds`, `slippage_limit_pct`.
 
+## `guardian`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `enabled` | true | position guardian (exit-plan enforcement, docs/risk-controls.md#position-guardian) |
+| `interval_seconds` | 60 | watch cadence during market hours |
+
+## `reports`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `daily_summary` | true | end-of-day digest through the notification channels |
+| `daily_summary_cron` | `15 16 * * 1-5` | when to send it (America/New_York) |
+
 ## `strategies[]`
 
 `name` (one of the 16 built-ins or a plugin), `enabled`, `symbols`
@@ -72,7 +88,7 @@ independently; disabled strategies never run.
 ## `schedules[]`
 
 `name`, `job` (`review_cycle`, `portfolio_sync`, `update_check`,
-`audit_verify`), and exactly one of:
+`audit_verify`, `position_guardian`, `daily_report`), and exactly one of:
 
 - `every_seconds: N` — fixed interval, 1 s and up;
 - `cron: "m h dom mon dow"` — standard cron, evaluated in America/New_York.
@@ -95,7 +111,10 @@ update availability. Repeats are deduplicated for 5 minutes.
 
 - `watchlists[]`: named symbol lists; the union feeds the AI and default
   strategy universes.
-- `dashboard`: `host` (default `127.0.0.1` — keep it), `port` (8321).
+- `dashboard`: `host` (default `127.0.0.1`), `port` (8321),
+  `auth_token_credential` — a vault entry holding a bearer token, **required
+  by validation whenever `host` is non-loopback**; clients send
+  `Authorization: Bearer <token>` or open `/?token=<token>`.
 - `updates`: `enabled`, `check_interval_hours`, `auto_apply`.
 
 ## Validation

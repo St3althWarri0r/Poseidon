@@ -30,6 +30,13 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Three operating modes** — research (no orders), approval (human
   confirms each trade on the dashboard), autonomous (execute within risk
   limits).
+- **Position guardian** — every entry's stop-loss/take-profit is armed and
+  enforced against live quotes between review cycles (alert / propose /
+  execute, by mode). Exit plans are binding, not prose.
+- **Performance analytics** — Sharpe, Sortino, drawdown, win rate, profit
+  factor, expectancy, monthly returns, and per-strategy P&L attribution
+  from the platform's own fill history; AI token/cost metering with an
+  optional hard monthly budget.
 - **Institutional risk engine** — position/exposure/leverage caps, daily/
   weekly loss limits, drawdown halt, options exposure caps, liquidity and
   spread filters, slippage bands, event blackouts, per-symbol cooldowns,
@@ -48,7 +55,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 81 unit/integration tests, paper trading, historical
+- **Testing** — 101 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 

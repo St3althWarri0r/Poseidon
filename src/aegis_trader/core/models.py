@@ -248,6 +248,7 @@ class Order(AegisModel):
     time_in_force: TimeInForce = TimeInForce.DAY
     extended_hours: bool = False
     legs: list[OptionLeg] = Field(default_factory=list)  # multi-leg option orders
+    strategy: str = ""  # originating strategy (performance attribution)
     status: OrderStatus = OrderStatus.PROPOSED
     status_reason: str | None = None
     filled_quantity: Decimal = Decimal(0)
@@ -324,6 +325,7 @@ class Decision(AegisModel):
     data_sources: list[str] = Field(default_factory=list)  # provenance of inputs used
     model: str = ""
     cycle_id: str = ""
+    usage: dict[str, int] = Field(default_factory=dict)  # tokens used this cycle
     created_at: datetime | None = None
 
 

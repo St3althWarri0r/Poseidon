@@ -66,6 +66,30 @@ CREATE TABLE IF NOT EXISTS equity_marks (
     day_pnl TEXT
 );
 
+CREATE TABLE IF NOT EXISTS exit_plans (
+    symbol TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL,
+    stop_loss TEXT,
+    take_profit TEXT,
+    time_stop TEXT,
+    quantity TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    triggered_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_usage (
+    cycle_id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    api_calls INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_at ON ai_usage(at);
+
 CREATE TABLE IF NOT EXISTS audit (
     seq INTEGER PRIMARY KEY,
     at TEXT NOT NULL,

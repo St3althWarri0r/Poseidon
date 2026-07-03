@@ -158,3 +158,9 @@ td .sym { color: var(--ink); font-weight: 600; }
 .feed .evt .topic { color: var(--series-1); margin-right: 8px; }
 
 .empty { color: var(--ink-muted); font-size: 13px; font-style: italic; }
+
+.card h2 .hint { text-transform: none; letter-spacing: 0; color: var(--ink-muted); font-weight: 400; }
+.strategy-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; font-size: 12px;
+  padding: 3px 0; border-bottom: 1px solid var(--grid); }
+.strategy-row .name { color: var(--ink); }
+.strategy-row .num { font-variant-numeric: tabular-nums; text-align: right; }

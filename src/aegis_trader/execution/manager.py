@@ -85,6 +85,7 @@ class OrderManager:
             stop_price=trade.stop_price,
             time_in_force=trade.time_in_force,
             legs=trade.legs,
+            strategy=trade.strategy,
             decision_id=decision.id,
             created_at=datetime.now(UTC),
         )

@@ -44,6 +44,12 @@ class AIConfig(StrictModel):
     api_key_credential: str = "anthropic_api_key"  # vault entry name
     max_tool_iterations: int = Field(default=24, ge=1, le=100)
     review_interval_seconds: int = Field(default=300, ge=30)
+    # Metering (USD per million tokens; defaults match claude-opus-4-8).
+    input_price_per_mtok: float = Field(default=5.0, ge=0)
+    output_price_per_mtok: float = Field(default=25.0, ge=0)
+    # Hard monthly spend ceiling; review cycles pause when the estimate hits
+    # it (0 disables the ceiling).
+    monthly_budget_usd: float = Field(default=0.0, ge=0)
 
 
 class ProviderConfig(StrictModel):
@@ -94,6 +100,19 @@ class RiskConfig(StrictModel):
     slippage_limit_pct: float = Field(default=0.01, gt=0)  # market-order protection band
 
 
+class GuardianConfig(StrictModel):
+    """Position guardian: enforces each decision's stop-loss / take-profit
+    between review cycles (see docs/risk-controls.md#position-guardian)."""
+
+    enabled: bool = True
+    interval_seconds: int = Field(default=60, ge=5)
+
+
+class ReportsConfig(StrictModel):
+    daily_summary: bool = True
+    daily_summary_cron: str = "15 16 * * 1-5"  # 16:15 ET weekdays
+
+
 class StrategyConfig(StrictModel):
     name: str
     enabled: bool = True
@@ -125,8 +144,14 @@ class NotificationChannelConfig(StrictModel):
 
 
 class DashboardConfig(StrictModel):
-    host: str = "127.0.0.1"  # local-only by default; never expose without a reverse proxy
+    host: str = "127.0.0.1"  # local-only by default
     port: int = Field(default=8321, ge=1, le=65535)
+    # Vault entry holding a bearer token. Optional on loopback; REQUIRED when
+    # host is anything else (validated at startup).
+    auth_token_credential: str = ""
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class UpdateConfig(StrictModel):
@@ -154,6 +179,8 @@ class AppConfig(StrictModel):
     data: DataConfig = Field(default_factory=DataConfig)
     brokers: list[BrokerConfig] = Field(default_factory=list)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    guardian: GuardianConfig = Field(default_factory=GuardianConfig)
+    reports: ReportsConfig = Field(default_factory=ReportsConfig)
     strategies: list[StrategyConfig] = Field(default_factory=list)
     schedules: list[ScheduleConfig] = Field(default_factory=list)
     notifications: list[NotificationChannelConfig] = Field(default_factory=list)
@@ -172,6 +199,15 @@ class AppConfig(StrictModel):
         names = [b.name for b in enabled]
         if len(names) != len(set(names)):
             raise ValueError("duplicate enabled broker names")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_dashboard_exposure(self) -> AppConfig:
+        if self.dashboard.host not in _LOOPBACK_HOSTS and not self.dashboard.auth_token_credential:
+            raise ValueError(
+                "dashboard.host is not loopback — set dashboard.auth_token_credential "
+                "(a vault entry with a bearer token) before exposing the dashboard"
+            )
         return self
 
     def primary_broker(self) -> BrokerConfig | None:

@@ -5,6 +5,8 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
+const AUTH_TOKEN = new URLSearchParams(location.search).get("token");
+const authHeaders = () => (AUTH_TOKEN ? { Authorization: "Bearer " + AUTH_TOKEN } : {});
 const fmtUsd = (v) =>
   v == null ? "—" : Number(v).toLocaleString("en-US", { style: "currency", currency: "USD" });
 const fmtPct = (v) => (v == null ? "—" : (Number(v) * 100).toFixed(2) + "%");
@@ -13,14 +15,14 @@ const esc = (s) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 async function getJSON(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: authHeaders() });
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
   return res.json();
 }
 async function postJSON(url, body) {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body || {}),
   });
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
@@ -284,11 +286,60 @@ async function refreshApprovals() {
     b.addEventListener("click", () => postJSON(`/api/approvals/${b.dataset.reject}`, { approve: false }).then(refreshApprovals)));
 }
 
+/* ---------- performance / guardian / AI usage ---------- */
+
+async function refreshPerformance() {
+  const perf = await getJSON("/api/performance");
+  const kv = (k, v, cls) => `<div class="kv"><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></div>`;
+  let html =
+    kv("Total return", fmtPct(perf.total_return), perf.total_return > 0 ? "ok" : perf.total_return < 0 ? "bad" : "") +
+    kv("CAGR", fmtPct(perf.cagr)) +
+    kv("Sharpe / Sortino", `${perf.sharpe} / ${perf.sortino}`) +
+    kv("Max drawdown", fmtPct(perf.max_drawdown)) +
+    kv("Volatility (ann.)", fmtPct(perf.annualized_volatility)) +
+    kv("Closed trades", perf.trades) +
+    kv("Win rate", fmtPct(perf.win_rate)) +
+    kv("Profit factor", perf.profit_factor) +
+    kv("Expectancy / trade", fmtUsd(perf.expectancy)) +
+    kv("Realized P&L", fmtUsd(perf.realized_pnl), perf.realized_pnl > 0 ? "ok" : perf.realized_pnl < 0 ? "bad" : "");
+  const strategies = Object.entries(perf.by_strategy || {});
+  if (strategies.length) {
+    html += `<div class="strategy-row"><span class="name">strategy</span><span class="num">trades</span><span class="num">P&amp;L</span></div>`;
+    html += strategies.map(([name, s]) =>
+      `<div class="strategy-row"><span class="name">${esc(name)}</span>
+       <span class="num">${s.trades} (${fmtPct(s.win_rate)})</span>
+       <span class="num ${s.realized_pnl > 0 ? "pos" : s.realized_pnl < 0 ? "neg" : ""}">${fmtUsd(s.realized_pnl)}</span></div>`
+    ).join("");
+  }
+  $("#performance").innerHTML = html;
+
+  const plans = perf.open_exit_plans || [];
+  $("#exit-plans").innerHTML = plans.length
+    ? plans.map((pl) =>
+        `<div class="kv"><span class="k"><strong>${esc(pl.symbol)}</strong> × ${esc(pl.quantity)}</span>
+         <span class="v">stop ${pl.stop_loss ? fmtUsd(pl.stop_loss) : "—"} · target ${pl.take_profit ? fmtUsd(pl.take_profit) : "—"}</span></div>`
+      ).join("")
+    : '<div class="empty">no armed exit plans</div>';
+}
+
+async function refreshAiUsage() {
+  const s = await getJSON("/api/status");
+  const u = s.ai_usage || {};
+  const budget = u.monthly_budget_usd;
+  const kv = (k, v) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+  $("#ai-usage").innerHTML =
+    kv("Review cycles", u.cycles ?? 0) +
+    kv("API calls", u.api_calls ?? 0) +
+    kv("Input / output tokens", `${(u.input_tokens ?? 0).toLocaleString()} / ${(u.output_tokens ?? 0).toLocaleString()}`) +
+    kv("Cache read / write", `${(u.cache_read_tokens ?? 0).toLocaleString()} / ${(u.cache_write_tokens ?? 0).toLocaleString()}`) +
+    kv("Estimated spend", `$${u.month_cost_usd ?? 0}` + (budget ? ` / $${budget} budget` : ""));
+}
+
 /* ---------- live event feed ---------- */
 
 function connectWebsocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws` + (AUTH_TOKEN ? `?token=${encodeURIComponent(AUTH_TOKEN)}` : ""));
   const feed = $("#events");
   ws.onmessage = (msg) => {
     let evt;
@@ -324,6 +375,7 @@ async function refreshAll() {
   await Promise.allSettled([
     refreshStatus(), refreshPortfolio(), refreshEquity(),
     refreshOrders(), refreshDecisions(), refreshApprovals(),
+    refreshPerformance(), refreshAiUsage(),
   ]);
 }
 window.addEventListener("resize", drawEquity);

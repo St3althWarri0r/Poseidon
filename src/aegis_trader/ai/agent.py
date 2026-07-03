@@ -66,6 +66,11 @@ in autonomous mode they execute directly after risk checks — be exactly as car
 
 Write the rationale for a skeptical human reviewer: concrete, quantified, citing the \
 tool data you actually retrieved (timestamps included where relevant).
+
+The stop_loss and take_profit you set in an entry's exit plan are ARMED: the position \
+guardian watches them against live quotes between your review cycles and exits when they \
+are hit. Choose them as real, executable levels — not aspirational prose. time_stop \
+remains yours to enforce during reviews.
 """
 
 
@@ -74,6 +79,7 @@ class ClaudeAgent:
         self._config = config
         self._dispatcher = dispatcher
         self._client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=3)
+        self._cycle_usage: dict[str, int] = {}
 
     async def run_cycle(self, *, mode: TradingMode, watchlist: list[str],
                         enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
@@ -81,6 +87,8 @@ class ClaudeAgent:
         """Run one full review cycle and return the validated Decision."""
         cycle_id = uuid.uuid4().hex[:12]
         self._dispatcher.sources_used.clear()
+        self._cycle_usage = {"input_tokens": 0, "output_tokens": 0,
+                             "cache_read_tokens": 0, "cache_write_tokens": 0, "api_calls": 0}
         user_prompt = self._cycle_prompt(
             cycle_id=cycle_id, mode=mode, watchlist=watchlist,
             enabled_strategies=enabled_strategies, strategy_signals=strategy_signals,
@@ -91,6 +99,7 @@ class ClaudeAgent:
 
         for iteration in range(self._config.max_tool_iterations):
             response = await self._create_message(messages)
+            self._record_usage(response)
 
             if response.stop_reason == "refusal":
                 raise AgentRefusedError("model declined the review request; cycle skipped")
@@ -131,6 +140,17 @@ class ClaudeAgent:
         log.warning("cycle hit tool-iteration limit", cycle=cycle_id,
                     limit=self._config.max_tool_iterations)
         return self._no_action_decision(cycle_id, "tool iteration limit reached without a decision")
+
+    def _record_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        u = self._cycle_usage
+        u["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+        u["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
+        u["cache_read_tokens"] += getattr(usage, "cache_read_input_tokens", 0) or 0
+        u["cache_write_tokens"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+        u["api_calls"] += 1
 
     async def _create_message(self, messages: list[dict[str, Any]]) -> Any:
         try:
@@ -181,7 +201,8 @@ class ClaudeAgent:
         return Decision(
             action=DecisionAction.NO_ACTION, trades=[], rationale=None,
             data_sources=sorted(self._dispatcher.sources_used),
-            model=self._config.model, cycle_id=cycle_id, created_at=datetime.now(UTC),
+            model=self._config.model, cycle_id=cycle_id,
+            usage=dict(self._cycle_usage), created_at=datetime.now(UTC),
         )
 
     def _parse_decision(self, payload: dict[str, Any], cycle_id: str, model: str) -> Decision:
@@ -237,5 +258,6 @@ class ClaudeAgent:
             data_sources=sorted(self._dispatcher.sources_used),
             model=model,
             cycle_id=cycle_id,
+            usage=dict(self._cycle_usage),
             created_at=datetime.now(UTC),
         )

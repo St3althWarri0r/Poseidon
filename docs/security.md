@@ -73,10 +73,13 @@ that alters a record breaks every subsequent hash.
 
 ## Network posture
 
-- The dashboard binds to `127.0.0.1` by default and has no authentication
-  of its own — do not change `dashboard.host` on a machine others can
-  reach. For remote access use an SSH tunnel
-  (`ssh -L 8321:127.0.0.1:8321 host`) or an authenticated reverse proxy.
+- The dashboard binds to `127.0.0.1` by default. Exposing it on any other
+  host **requires** `dashboard.auth_token_credential` (startup refuses
+  otherwise): a vault-stored bearer token checked (constant-time) on every
+  API request and websocket connect; static assets only are exempt. Prefer
+  an SSH tunnel (`ssh -L 8321:127.0.0.1:8321 host`) or an authenticated
+  reverse proxy with TLS even so — the token is sent in clear over plain
+  HTTP.
 - Outbound connections: Anthropic API, configured data providers,
   configured broker endpoints, notification services — all TLS.
 - The IBKR plugin accepts the local gateway's self-signed certificate only

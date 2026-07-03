@@ -32,6 +32,26 @@ Outside market hours the default review schedule pauses (cron schedules
 you define run whenever you set them); the sync, health monitor, and
 dashboard run 24/7.
 
+## The position guardian
+
+Exit plans are not suggestions. When an entry fills, its stop-loss /
+take-profit is armed; the guardian checks armed levels against live quotes
+every minute during market hours and acts by mode — alert (research),
+propose (approval), execute (autonomous). Armed plans are visible on the
+dashboard's *Exit plans* card, and every trigger notifies you. See
+docs/risk-controls.md#position-guardian.
+
+## Performance & cost
+
+The *Performance* card (and `GET /api/performance`) reports total return,
+CAGR, Sharpe/Sortino, max drawdown, volatility, win rate, profit factor,
+expectancy, and realized P&L attributed per strategy — all computed from
+the platform's own recorded fills and equity marks. The *AI usage* card
+meters review cycles, tokens, and estimated monthly spend; set
+`ai.monthly_budget_usd` for a hard ceiling (cycles pause at the cap and
+you're notified). A daily digest lands on your notification channels at
+16:15 ET (configurable under `reports`).
+
 ## The dashboard (http://127.0.0.1:8321)
 
 - **Header**: mode selector, market session, overall health, circuit

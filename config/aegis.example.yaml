@@ -16,6 +16,11 @@ ai:
   effort: high                # low | medium | high | xhigh | max
   review_interval_seconds: 300
   api_key_credential: anthropic_api_key
+  # Cost metering (USD per million tokens; defaults match claude-opus-4-8)
+  # and an optional hard monthly ceiling — review cycles pause at the cap.
+  input_price_per_mtok: 5.0
+  output_price_per_mtok: 25.0
+  monthly_budget_usd: 0       # 0 = no ceiling
 
 data:
   real_time_max_age_seconds: 5
@@ -81,6 +86,18 @@ risk:
   volatility_halt_daily_move_pct: 0.08
   slippage_limit_pct: 0.01
 
+# Position guardian: enforces each decision's stop-loss / take-profit against
+# live quotes between review cycles (research: alert only; approval: proposes
+# the exit for you to confirm; autonomous: executes it).
+guardian:
+  enabled: true
+  interval_seconds: 60
+
+# Scheduled reporting.
+reports:
+  daily_summary: true
+  daily_summary_cron: "15 16 * * 1-5"   # 16:15 ET weekdays
+
 watchlists:
   - name: core
     symbols: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOGL, META]
@@ -143,6 +160,9 @@ notifications:
 dashboard:
   host: 127.0.0.1
   port: 8321
+  # Required if host is ever non-loopback: vault entry holding a bearer token
+  # (open the dashboard as http://host:8321/?token=... ).
+  # auth_token_credential: dashboard_token
 
 updates:
   enabled: true

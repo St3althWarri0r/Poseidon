@@ -19,6 +19,7 @@ from . import __version__
 from .ai.agent import ClaudeAgent
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
+from .analytics.performance import FillRecord, build_round_trips, compute_performance
 from .api.server import DashboardServer
 from .brokers.base import Broker
 from .brokers.plugins.paper import PaperBroker
@@ -32,6 +33,7 @@ from .core.events import EventBus, Topics
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
 from .execution.approvals import ApprovalQueue
+from .execution.guardian import PositionGuardian
 from .execution.manager import OrderManager
 from .health.monitor import HealthMonitor
 from .notifications.service import NotificationService
@@ -65,6 +67,7 @@ class ApplicationKernel:
         self.risk: RiskEngine
         self.approvals: ApprovalQueue
         self.order_manager: OrderManager
+        self.guardian: PositionGuardian
         self.agent: ClaudeAgent | None = None
         self.strategies: StrategyEngine
         self.scheduler: Scheduler
@@ -100,6 +103,8 @@ class ApplicationKernel:
         self.order_manager = OrderManager(
             self.broker, self.risk, self.approvals, self.db, self.audit, self.bus, mode=cfg.mode
         )
+        self.guardian = PositionGuardian(cfg.guardian, self.db, self)
+        self.bus.subscribe(Topics.ORDER_FILLED, self.guardian.on_order_filled)
         dispatcher = ToolDispatcher(
             self.router, self.portfolio, self.risk,
             allow_delayed_quotes=cfg.data.allow_delayed_for_research,
@@ -189,6 +194,8 @@ class ApplicationKernel:
         self.scheduler.register_job("portfolio_sync", self.sync.sync_once)
         self.scheduler.register_job("update_check", self._update_check_job)
         self.scheduler.register_job("audit_verify", self._audit_verify_job)
+        self.scheduler.register_job("position_guardian", self.guardian.check_all)
+        self.scheduler.register_job("daily_report", self.send_daily_report)
 
     def _effective_schedules(self):
         """Config schedules plus a default review cadence if none is defined."""
@@ -205,6 +212,21 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="nightly-audit-verify", job="audit_verify",
                                cron="15 2 * * *")
+            )
+        if self.config.guardian.enabled and not any(
+            s.job == "position_guardian" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                ScheduleConfig(name="position-guardian", job="position_guardian",
+                               every_seconds=self.config.guardian.interval_seconds,
+                               only_market_hours=True)
+            )
+        if self.config.reports.daily_summary and not any(
+            s.job == "daily_report" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                ScheduleConfig(name="daily-summary", job="daily_report",
+                               cron=self.config.reports.daily_summary_cron)
             )
         return schedules
 
@@ -252,6 +274,15 @@ class ApplicationKernel:
             log.info("review cycle already running; skipping")
             return
         async with self._cycle_lock:
+            if await self._over_ai_budget():
+                log.warning("monthly AI budget reached; skipping review cycle")
+                await self.bus.publish(Topics.NOTIFY, {
+                    "level": "warning", "title": "AI budget reached",
+                    "body": f"Estimated spend hit ai.monthly_budget_usd "
+                            f"(${self.config.ai.monthly_budget_usd:.2f}); review cycles are "
+                            "paused until next month or a higher budget.",
+                })
+                return
             started = datetime.now(UTC)
             try:
                 signals = await self.strategies.scan_all(self.router, self.portfolio)
@@ -278,6 +309,16 @@ class ApplicationKernel:
                  json.dumps(decision.model_dump(mode="json")),
                  (decision.created_at or started).isoformat()),
             )
+            if decision.usage:
+                u = decision.usage
+                await self.db.execute(
+                    "INSERT OR REPLACE INTO ai_usage (cycle_id, at, input_tokens, output_tokens, "
+                    "cache_read_tokens, cache_write_tokens, api_calls) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (decision.cycle_id, (decision.created_at or started).isoformat(),
+                     u.get("input_tokens", 0), u.get("output_tokens", 0),
+                     u.get("cache_read_tokens", 0), u.get("cache_write_tokens", 0),
+                     u.get("api_calls", 0)),
+                )
             await self.audit.append("ai", "decision", {
                 "decision_id": decision.id, "action": decision.action.value,
                 "trades": len(decision.trades), "sources": decision.data_sources,
@@ -295,6 +336,113 @@ class ApplicationKernel:
             log.info("review cycle complete", cycle=decision.cycle_id,
                      action=decision.action.value, trades=len(decision.trades),
                      duration_s=round((datetime.now(UTC) - started).total_seconds(), 1))
+
+    # ------------------------------------------------------- analytics & cost
+
+    async def _over_ai_budget(self) -> bool:
+        budget = self.config.ai.monthly_budget_usd
+        if budget <= 0:
+            return False
+        summary = await self.ai_usage_summary()
+        return float(summary["month_cost_usd"]) >= budget
+
+    async def ai_usage_summary(self) -> dict[str, object]:
+        """Token totals and estimated spend for the current calendar month."""
+        month_prefix = datetime.now(UTC).strftime("%Y-%m")
+        row = await self.db.fetch_one(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            "COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), "
+            "COALESCE(SUM(api_calls),0), COUNT(*) FROM ai_usage WHERE at LIKE ?",
+            (f"{month_prefix}%",),
+        )
+        input_tokens, output_tokens, cache_read, cache_write, api_calls, cycles = row or (0,) * 6
+        cfg = self.config.ai
+        # Cache reads bill ~0.1x input; cache writes ~1.25x — close enough for
+        # budget gating (the exact bill is on the provider's console).
+        cost = (
+            input_tokens * cfg.input_price_per_mtok
+            + cache_read * cfg.input_price_per_mtok * 0.1
+            + cache_write * cfg.input_price_per_mtok * 1.25
+            + output_tokens * cfg.output_price_per_mtok
+        ) / 1_000_000
+        return {
+            "month": month_prefix,
+            "cycles": cycles,
+            "api_calls": api_calls,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "month_cost_usd": round(cost, 2),
+            "monthly_budget_usd": cfg.monthly_budget_usd or None,
+        }
+
+    async def performance_report(self) -> dict[str, object]:
+        """Portfolio metrics from stored equity marks + realized round trips
+        from the platform's own filled orders, attributed per strategy."""
+        from decimal import Decimal
+
+        from .core.enums import OrderSide, OrderStatus
+        from .core.models import Order
+
+        marks = await self.db.fetch_all("SELECT at, equity FROM equity_marks ORDER BY at ASC")
+        equity_points = [(datetime.fromisoformat(r[0]), float(r[1])) for r in marks]
+        rows = await self.db.fetch_all(
+            "SELECT payload FROM orders WHERE status = ? ORDER BY updated_at ASC",
+            (OrderStatus.FILLED.value,),
+        )
+        fills: list[FillRecord] = []
+        for (payload,) in rows:
+            order = Order.model_validate(json.loads(payload))
+            if order.filled_quantity <= 0 or order.avg_fill_price is None:
+                continue
+            fills.append(FillRecord(
+                symbol=order.symbol, side=OrderSide(order.side),
+                quantity=Decimal(str(order.filled_quantity)),
+                price=Decimal(str(order.avg_fill_price)),
+                at=order.updated_at or datetime.now(UTC),
+                strategy=order.strategy,
+            ))
+        trips = build_round_trips(fills)
+        report = compute_performance(equity_points, trips).as_dict()
+        report["open_exit_plans"] = await self.guardian.active_plans()
+        return report
+
+    async def send_daily_report(self) -> None:
+        """End-of-day digest through the notification channels."""
+        performance = await self.performance_report()
+        usage = await self.ai_usage_summary()
+        today = self.clock.now_eastern().date().isoformat()
+        orders_today = [
+            o for o in await self.order_manager.recent_orders(200)
+            if (o.get("created_at") or "").startswith(today)
+        ]
+        filled = [o for o in orders_today if o.get("status") == "filled"]
+        rejected = [o for o in orders_today if str(o.get("status", "")).startswith("rejected")]
+        account = self.portfolio.account
+        lines = [
+            f"Aegis daily summary — {today}",
+            "",
+            f"Equity: {account.equity if account else 'n/a'}  "
+            f"(day P&L: {account.day_pnl if account else 'n/a'})",
+            f"Day loss used: {self.portfolio.day_loss_pct():.2%} · "
+            f"Drawdown: {self.portfolio.drawdown_pct():.2%}",
+            f"Orders today: {len(orders_today)} ({len(filled)} filled, {len(rejected)} rejected)",
+            f"Total return: {performance['total_return']:.2%} · Sharpe: {performance['sharpe']} · "
+            f"Win rate: {performance['win_rate']:.0%} over {performance['trades']} closed trades",
+            f"AI spend this month: ~${usage['month_cost_usd']} "
+            f"({usage['cycles']} cycles, {usage['api_calls']} API calls)",
+        ]
+        if filled:
+            lines.append("")
+            lines.append("Fills:")
+            lines += [
+                f"  {o.get('side')} {o.get('filled_quantity')} {o.get('symbol')} "
+                f"@ {o.get('avg_fill_price')}" for o in filled[:10]
+            ]
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "info", "title": f"Daily summary {today}", "body": "\n".join(lines),
+        })
 
     async def _update_check_job(self) -> None:
         await self.updates.check_once()
@@ -329,6 +477,11 @@ class ApplicationKernel:
             "health": self.health.report(),
             "scheduler": dict(self.scheduler.last_runs),
             "update_available": self.updates.available,
+            "ai_usage": await self.ai_usage_summary(),
+            "guardian": {
+                "enabled": self.config.guardian.enabled,
+                "active_plans": await self.guardian.active_plans(),
+            },
         }
 
     # -------------------------------------------------------------- lifecycle

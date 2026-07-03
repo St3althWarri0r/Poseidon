@@ -36,6 +36,15 @@ class OrderSide(StrEnum):
     def is_buy(self) -> bool:
         return self in (OrderSide.BUY, OrderSide.BUY_TO_OPEN, OrderSide.BUY_TO_CLOSE)
 
+    @property
+    def is_risk_reducing(self) -> bool:
+        """Sides that close or reduce exposure. Loss-limit halts, liquidity
+        entry filters, and cooldowns exempt these: a halt must never trap the
+        operator in a position. (SELL_TO_OPEN — opening short risk — is
+        deliberately NOT in this set; plain SELL counts as reducing because
+        the platform does not open short equity positions.)"""
+        return self in (OrderSide.SELL, OrderSide.SELL_TO_CLOSE, OrderSide.BUY_TO_CLOSE)
+
 
 class OrderType(StrEnum):
     MARKET = "market"

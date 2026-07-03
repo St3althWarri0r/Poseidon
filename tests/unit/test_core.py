@@ -112,6 +112,14 @@ class TestConfig:
                 "schedules": [{"name": "x", "job": "review_cycle"}]
             })
 
+    def test_non_loopback_dashboard_requires_token(self) -> None:
+        with pytest.raises(ValueError, match="auth_token_credential"):
+            AppConfig.model_validate({"dashboard": {"host": "0.0.0.0"}})
+        # With a token credential configured it validates.
+        AppConfig.model_validate({
+            "dashboard": {"host": "0.0.0.0", "auth_token_credential": "dash_token"}
+        })
+
     def test_load_config_env_override(self, tmp_path, monkeypatch) -> None:
         cfg_file = tmp_path / "aegis.yaml"
         cfg_file.write_text("mode: research\n")

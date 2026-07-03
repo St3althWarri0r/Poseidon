@@ -182,6 +182,8 @@ class SpreadRule(RiskRule):
     name = "max_spread"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return  # entry filter: never trap an exit in a widened book
         spread = ctx.quote.spread_pct
         if spread is None:
             # One-sided book: fine for research quotes, not for orders.
@@ -198,6 +200,8 @@ class VolumeRule(RiskRule):
     name = "min_volume"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return  # entry filter only
         if ctx.order.asset_class is AssetClass.OPTION:
             return  # option liquidity is screened via the chain's OI upstream
         if not ctx.recent_bars:
@@ -232,9 +236,15 @@ class SlippageProtectionRule(RiskRule):
 
 
 class DailyLossRule(RiskRule):
+    """Halts NEW risk for the day. Risk-reducing orders (exits, hedges
+    closing) are exempt — a loss halt must never trap the operator in a
+    losing position."""
+
     name = "max_daily_loss"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return
         loss = ctx.portfolio.day_loss_pct()
         if loss >= ctx.config.max_daily_loss_pct:
             raise RiskViolation(self.name, f"daily loss {loss:.2%} >= limit {ctx.config.max_daily_loss_pct:.2%} — trading halted for the day")
@@ -244,6 +254,8 @@ class WeeklyLossRule(RiskRule):
     name = "max_weekly_loss"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return
         loss = ctx.portfolio.week_loss_pct()
         if loss >= ctx.config.max_weekly_loss_pct:
             raise RiskViolation(self.name, f"weekly loss {loss:.2%} >= limit {ctx.config.max_weekly_loss_pct:.2%} — trading halted for the week")
@@ -253,6 +265,8 @@ class DrawdownRule(RiskRule):
     name = "max_drawdown"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return
         dd = ctx.portfolio.drawdown_pct()
         if dd >= ctx.config.max_drawdown_pct:
             raise RiskViolation(self.name, f"drawdown {dd:.2%} >= limit {ctx.config.max_drawdown_pct:.2%} — trading halted")
@@ -313,6 +327,8 @@ class CooldownRule(RiskRule):
     name = "trade_cooldown"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return  # cooldowns prevent re-entry churn, never delay exits
         if ctx.cooldown_remaining > 0:
             raise RiskViolation(
                 self.name, f"{ctx.order.symbol} in cooldown for {ctx.cooldown_remaining:.0f}s more"
