@@ -8,7 +8,7 @@ pass it via ``options`` when constructing (see registry wiring).
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
