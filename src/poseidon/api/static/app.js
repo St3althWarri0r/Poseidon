@@ -688,6 +688,8 @@ function selectAlgo(id) {
   notes.hidden = !a.review_notes;
   notes.textContent = a.review_notes || "";
   $("#al-save").hidden = true;
+  $("#al-test").hidden = false;
+  $("#al-testout").hidden = true;
   $("#al-update").hidden = false;
   $("#al-activate").hidden = a.status === "active";
   $("#al-deactivate").hidden = a.status !== "active";
@@ -702,7 +704,8 @@ function clearAlgoEditor() {
   $("#al-desc").value = ""; $("#al-symbols").value = ""; $("#al-source").value = "";
   $("#al-notes").hidden = true;
   $("#al-save").hidden = false;
-  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new"]
+  $("#al-testout").hidden = true;
+  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test"]
     .forEach((s) => ($(s).hidden = true));
   refreshAlgorithms();
 }
@@ -750,6 +753,26 @@ $("#al-delete").addEventListener("click", () =>
     clearAlgoEditor();
   }, "Deleted"));
 $("#al-new").addEventListener("click", clearAlgoEditor);
+$("#al-test").addEventListener("click", async () => {
+  const btn = $("#al-test");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  try {
+    const res = await postJSON(`/api/algorithms/${selectedAlgo}/test`);
+    const out = $("#al-testout");
+    out.hidden = false;
+    out.innerHTML = `<div class="rv-block"><h3>Dry run — ${res.count} signal${res.count === 1 ? "" : "s"} (live data, nothing traded)</h3>` +
+      ((res.signals || []).length
+        ? `<pre>${esc(JSON.stringify(res.signals, null, 2))}</pre>`
+        : "<p>No signals under current market conditions — that can be correct behavior.</p>") +
+      "</div>";
+  } catch (e) {
+    toast("Test run failed: " + String(e.message).slice(0, 160), "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test run";
+  }
+});
 
 async function putJSON(url, body) {
   const res = await fetch(url, {

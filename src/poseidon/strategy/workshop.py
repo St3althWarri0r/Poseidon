@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ..core.errors import ConfigError
+from ..data.router import DataRouter
+from ..portfolio.state import PortfolioState
 from ..security.audit import AuditLog
 from ..storage.db import Database
 from .custom import CustomAlgorithm, validate_algorithm
@@ -152,6 +154,25 @@ class AlgorithmWorkshop:
         await self._db.execute("DELETE FROM algorithms WHERE id = ?", (algo_id,))
         await self._audit.append("human", "algorithm.deleted",
                                  {"id": algo_id, "name": record["name"]})
+
+    async def test_run(self, algo_id: str, router: DataRouter,
+                       portfolio: PortfolioState) -> dict[str, Any]:
+        """Dry run: compile the CURRENT saved source and scan once against
+        live data. Nothing is saved, activated, or traded — the returned
+        signals are exactly what a review cycle would receive."""
+        record = await self.get(algo_id)
+        strategy = CustomAlgorithm(
+            algo_name=record["name"], source=record["source"],
+            symbols=record["symbols"] or self._default_symbols,
+            options=record["params"],
+        )
+        signals = await strategy.scan(router, portfolio)
+        return {
+            "algorithm": record["name"],
+            "signals": [s.as_dict() for s in signals],
+            "count": len(signals),
+            "note": "dry run against live data — nothing was traded or saved",
+        }
 
     async def load_active(self) -> int:
         """Startup: compile and register every active algorithm. One broken

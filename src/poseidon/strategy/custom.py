@@ -127,7 +127,15 @@ class AlgoContext:
     def log(self, message: str) -> None:
         log.info("algo log", algo=self.algo_name, message=str(message)[:400])
 
-    # Indicator primitives (Composer-compatible; see strategy/indicators.py).
+    @property
+    def ta(self) -> Any:  # module namespace; functions typed in indicators.py
+        """The full indicator suite (strategy/indicators.py): sma, ema, rsi,
+        macd, bollinger, stochastic, atr, adx, obv, cumulative_return,
+        moving_average_return, stdev_price, stdev_return, max_drawdown,
+        rate_of_change, highest, lowest."""
+        return indicators
+
+    # Shorthand for the most common primitives (Composer-compatible).
     @staticmethod
     def rsi(closes: list[float], window: int = 14) -> float | None:
         return indicators.rsi(closes, window)

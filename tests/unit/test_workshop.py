@@ -215,3 +215,118 @@ class TestFTLTExample:
         for s in signals:
             assert s.direction in ("long", "exit")
             assert 0.0 <= s.strength <= 1.0
+
+
+class TestFullIndicatorSuite:
+    def test_ema_converges_toward_recent_prices(self) -> None:
+        from poseidon.strategy.indicators import ema, sma
+
+        closes = [100.0] * 40 + [110.0] * 10
+        e, s = ema(closes, 20), sma(closes, 20)
+        assert e is not None and s is not None
+        assert e > 100 and abs(e - s) < 10
+
+    def test_macd_positive_in_uptrend(self) -> None:
+        from poseidon.strategy.indicators import macd
+
+        up = [100 * 1.005 ** i for i in range(80)]
+        result = macd(up)
+        assert result is not None
+        line, signal, hist = result
+        assert line > 0 and abs(hist - (line - signal)) < 1e-12
+        assert macd(up[:20]) is None
+
+    def test_bollinger_percent_b(self) -> None:
+        from poseidon.strategy.indicators import bollinger
+
+        closes = [100.0, 101.0] * 15
+        result = bollinger(closes, 20)
+        assert result is not None
+        upper, mid, lower, pct_b = result
+        assert lower < mid < upper and 0.0 <= pct_b <= 1.0
+
+    def test_stochastic_extremes(self) -> None:
+        from poseidon.strategy.indicators import stochastic
+
+        n = 30
+        highs = [float(i + 2) for i in range(n)]
+        lows = [float(i) for i in range(n)]
+        closes = [float(i + 2) for i in range(n)]  # closes at the high
+        result = stochastic(highs, lows, closes)
+        assert result is not None and result[0] > 85
+
+    def test_atr_matches_constant_range(self) -> None:
+        from poseidon.strategy.indicators import atr
+
+        n = 40
+        highs, lows, closes = [102.0] * n, [100.0] * n, [101.0] * n
+        value = atr(highs, lows, closes, 14)
+        assert value is not None and abs(value - 2.0) < 1e-9
+
+    def test_adx_high_in_strong_trend(self) -> None:
+        from poseidon.strategy.indicators import adx
+
+        n = 60
+        highs = [101.0 + i for i in range(n)]
+        lows = [99.0 + i for i in range(n)]
+        closes = [100.5 + i for i in range(n)]
+        value = adx(highs, lows, closes, 14)
+        assert value is not None and value > 60
+
+    def test_stdev_and_drawdown_and_extremes(self) -> None:
+        from poseidon.strategy.indicators import highest, lowest, max_drawdown, stdev_price
+
+        closes = [100.0, 120.0, 90.0, 110.0]
+        assert max_drawdown(closes, 4) == 25.0  # 120 -> 90
+        assert highest(closes, 4) == 120.0 and lowest(closes, 4) == 90.0
+        assert stdev_price([100.0] * 20, 20) == 0.0
+
+    def test_obv_direction(self) -> None:
+        from poseidon.strategy.indicators import obv
+
+        assert obv([1.0, 2.0, 3.0], [0, 10, 10]) == 20.0
+        assert obv([3.0, 2.0, 1.0], [0, 10, 10]) == -20.0
+
+    async def test_ctx_ta_namespace_available_to_algorithms(self) -> None:
+        source = '''
+async def scan(ctx):
+    signals = []
+    for symbol in ctx.symbols:
+        bars = await ctx.bars(symbol, timeframe="1d", limit=80)
+        closes = [float(b.close) for b in bars]
+        m = ctx.ta.macd(closes)
+        band = ctx.ta.bollinger(closes)
+        if m is not None and band is not None:
+            signals.append({"symbol": symbol, "direction": "long", "strength": 0.5,
+                            "evidence": {"macd": round(m[0], 4), "pct_b": round(band[3], 3)}})
+    return signals
+'''
+        assert validate_algorithm(source) == []
+        router = DataRouter([(FakeProvider(name="feed", bars_count=120), 10)], FreshnessPolicy())
+        algo = CustomAlgorithm(algo_name="ta_check", source=source, symbols=["AAPL"])
+        signals = await algo.scan(router, PortfolioState())
+        assert signals and "macd" in signals[0].evidence
+
+
+class TestSecondExampleAndDryRun:
+    def test_lts_v1_validates_and_compiles(self) -> None:
+        import pathlib
+
+        source = pathlib.Path("examples/algorithms/tqqq_lts_v1.py").read_text()
+        assert validate_algorithm(source) == []
+        CustomAlgorithm(algo_name="tqqq_lts_v1", source=source, symbols=[])
+
+    async def test_workshop_dry_run(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "t.db")
+        await db.open()
+        try:
+            engine = StrategyEngine([], ["AAPL"])
+            shop = AlgorithmWorkshop(db, engine, AuditLog(db), default_symbols=["AAPL"])
+            record = await shop.create(name="dry", source=GOOD_SOURCE)
+            router = DataRouter([(FakeProvider(name="feed"), 10)], FreshnessPolicy())
+            result = await shop.test_run(record["id"], router, PortfolioState())
+            assert result["count"] == len(result["signals"])
+            assert "nothing was traded" in result["note"]
+            assert engine.enabled_names == []  # dry run never registers
+        finally:
+            await db.close()

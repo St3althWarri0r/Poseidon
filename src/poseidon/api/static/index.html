@@ -243,9 +243,11 @@
         <textarea id="al-source" class="code" spellcheck="false" rows="16"
           placeholder="async def scan(ctx):&#10;    signals = []&#10;    for symbol in ctx.symbols:&#10;        bars = await ctx.bars(symbol, timeframe=&quot;1d&quot;, limit=50)&#10;        ...&#10;    return signals"></textarea>
         <div id="al-notes" class="review-notes" hidden></div>
+        <div id="al-testout" hidden></div>
         <div class="ticket-actions">
           <button class="btn" id="al-save">Save as new draft</button>
           <button class="btn" id="al-update" hidden>Save changes</button>
+          <button class="btn" id="al-test" hidden>Test run</button>
           <button class="btn" id="al-activate" hidden>Activate</button>
           <button class="btn btn-ghost" id="al-deactivate" hidden>Deactivate</button>
           <button class="btn btn-reject" id="al-delete" hidden>Delete</button>

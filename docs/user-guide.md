@@ -125,11 +125,17 @@ Rotation models (Composer symphonies, tactical allocation trees) port
 naturally: compute the target book and emit one `long` signal per holding
 with `target_weight` in the evidence, plus `exit` signals for holdings
 that fell out — in autonomous mode the AI executes the rebalance through
-the risk engine with no human input. Indicator primitives matching
-Composer's (`ctx.rsi`, `ctx.sma`, `ctx.cumulative_return`,
-`ctx.moving_average_return`, Wilder RSI, percent units) are built in, and
-`examples/algorithms/tqqq_ftlt.py` ships a complete faithful port of a
-real symphony as the template.
+the risk engine with no human input. A full indicator suite is
+built in via `ctx.ta` — every Composer function (`rsi` (Wilder), `sma`,
+`ema`, `cumulative_return`, `moving_average_return`, `stdev_price`,
+`stdev_return`, `max_drawdown`, percent units throughout) plus the
+standard desk set (`macd`, `bollinger`, `stochastic`, `atr`, `adx`,
+`obv`, `rate_of_change`, `highest`/`lowest`), with the four most common
+also directly on ctx (`ctx.rsi`, `ctx.sma`, ...). Every function returns
+None on insufficient history — never a guess. Use **Test run** in the
+editor to dry-run any saved algorithm against live data (nothing is
+traded or saved) before activating. `examples/algorithms/` ships two
+complete faithful symphony ports as templates.
 
 A word on trust: algorithms run in-process, like installed plugins. The
 static screen is a guardrail against accidents, not a sandbox — read

@@ -321,6 +321,16 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return JSONResponse({"ok": True})
 
+    @app.post("/api/algorithms/{algo_id}/test")
+    async def test_algorithm(algo_id: str) -> JSONResponse:
+        try:
+            result = await kernel.workshop.test_run(algo_id, kernel.router, kernel.portfolio)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(result)
+
     @app.post("/api/algorithms/review")
     async def review_algorithm(body: dict[str, Any]) -> JSONResponse:
         source = str(body.get("source", "")).strip()
