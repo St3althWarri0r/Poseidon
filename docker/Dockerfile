@@ -1,0 +1,33 @@
+# Aegis Trader — production image.
+# Build:  docker build -f docker/Dockerfile -t aegis-trader .
+# Run:    see docker/docker-compose.yml
+
+FROM python:3.12-slim AS build
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install --no-cache-dir --prefix=/install .
+
+FROM python:3.12-slim
+LABEL org.opencontainers.image.title="Aegis Trader" \
+      org.opencontainers.image.description="Autonomous AI trading platform"
+
+# libnotify is intentionally absent in containers; use discord/telegram/email
+# notification channels instead of `desktop`.
+RUN useradd --create-home --shell /usr/sbin/nologin aegis
+COPY --from=build /install /usr/local
+COPY config/aegis.example.yaml /usr/share/aegis-trader/aegis.example.yaml
+
+USER aegis
+ENV XDG_CONFIG_HOME=/data/config \
+    XDG_DATA_HOME=/data/share \
+    AEGIS_DASHBOARD__HOST=0.0.0.0
+VOLUME ["/data"]
+EXPOSE 8321
+
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
+  CMD python -c "import urllib.request,sys; \
+  sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8321/api/status', timeout=5).status==200 else 1)"
+
+ENTRYPOINT ["aegis"]
+CMD ["run"]

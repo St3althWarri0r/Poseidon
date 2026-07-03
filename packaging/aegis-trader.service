@@ -1,0 +1,35 @@
+# Aegis Trader — systemd user service (24/7 operation with watchdog).
+# Installed by install.sh to ~/.config/systemd/user/aegis-trader.service
+#
+# The vault passphrase is provided through systemd credentials:
+#   systemd-ask-password stores nothing; instead we load an encrypted
+#   credential created once with:
+#     systemd-creds encrypt --name=aegis-vault-passphrase <(printf '%s' 'PASSPHRASE') \
+#         ~/.config/aegis-trader/vault-passphrase.cred
+# (see docs/security.md for the full walkthrough)
+
+[Unit]
+Description=Aegis Trader — autonomous AI trading platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/share/aegis-trader/venv/bin/aegis run
+Restart=always
+RestartSec=10
+WatchdogSec=180
+TimeoutStopSec=45
+LoadCredentialEncrypted=aegis-vault-passphrase:%h/.config/aegis-trader/vault-passphrase.cred
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/aegis-trader
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target

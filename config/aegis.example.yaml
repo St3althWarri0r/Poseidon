@@ -1,0 +1,170 @@
+# Aegis Trader configuration.
+# Copy to ~/.config/aegis-trader/aegis.yaml (or run: aegis config example).
+# SECRETS NEVER GO IN THIS FILE — fields named `credential` are the *names*
+# of entries in the encrypted vault (aegis vault set <name>).
+
+# Operating mode:
+#   research    Mode 1 — analysis only, no orders ever
+#   approval    Mode 2 — Claude proposes, you approve on the dashboard
+#   autonomous  Mode 3 — Claude executes within risk limits
+mode: research
+
+log_level: INFO
+
+ai:
+  model: claude-opus-4-8
+  effort: high                # low | medium | high | xhigh | max
+  review_interval_seconds: 300
+  api_key_credential: anthropic_api_key
+  # Cost metering (USD per million tokens; defaults match claude-opus-4-8)
+  # and an optional hard monthly ceiling — review cycles pause at the cap.
+  input_price_per_mtok: 5.0
+  output_price_per_mtok: 25.0
+  monthly_budget_usd: 0       # 0 = no ceiling
+
+data:
+  real_time_max_age_seconds: 5
+  delayed_max_age_seconds: 900
+  allow_delayed_for_research: true   # delayed data OK for research; orders always require fresh quotes
+  providers:
+    # Priority: lower number = tried first. Failover is automatic.
+    - name: polygon
+      credential: polygon_api_key
+      priority: 10
+    - name: finnhub
+      credential: finnhub_api_key
+      priority: 20
+    - name: twelvedata
+      credential: twelvedata_api_key
+      priority: 30
+    - name: alphavantage
+      credential: alphavantage_api_key
+      priority: 40
+    # Alpaca market data (credential is JSON: {"key_id": "...", "secret_key": "..."})
+    # - name: alpaca
+    #   credential: alpaca_keys
+    #   priority: 15
+    # - name: tradier_data
+    #   credential: tradier_token
+    #   priority: 25
+    #   options: { sandbox: true }
+
+brokers:
+  # Built-in paper broker — fills priced from live quotes; ideal first setup.
+  - name: paper
+    enabled: true
+    primary: true
+    options:
+      starting_cash: 100000
+  # Alpaca (credential JSON: {"key_id": "...", "secret_key": "..."})
+  # - name: alpaca
+  #   enabled: true
+  #   primary: true
+  #   paper: true
+  #   credential: alpaca_keys
+  # Tradier (credential JSON: {"access_token": "...", "account_id": "..."})
+  # - name: tradier
+  #   paper: true
+  #   credential: tradier_creds
+  # tastytrade, schwab, ibkr: see docs/broker-setup.md
+
+risk:
+  max_position_pct: 0.10
+  max_portfolio_exposure_pct: 1.0
+  max_daily_loss_pct: 0.03
+  max_weekly_loss_pct: 0.07
+  max_drawdown_pct: 0.15
+  max_leverage: 1.0
+  max_options_exposure_pct: 0.20
+  max_sector_concentration_pct: 0.30
+  max_order_notional: 25000
+  max_spread_pct: 0.02
+  min_avg_volume: 100000
+  max_orders_per_day: 40
+  trade_cooldown_seconds: 300
+  news_blackout_minutes_before_econ: 10
+  volatility_halt_daily_move_pct: 0.08
+  slippage_limit_pct: 0.01
+
+# Position guardian: enforces each decision's stop-loss / take-profit against
+# live quotes between review cycles (research: alert only; approval: proposes
+# the exit for you to confirm; autonomous: executes it).
+guardian:
+  enabled: true
+  interval_seconds: 60
+
+# Scheduled reporting.
+reports:
+  daily_summary: true
+  daily_summary_cron: "15 16 * * 1-5"   # 16:15 ET weekdays
+
+watchlists:
+  - name: core
+    symbols: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOGL, META]
+
+strategies:
+  - name: momentum
+    enabled: true
+  - name: mean_reversion
+    enabled: true
+  - name: etf_rotation
+    enabled: false
+    symbols: [XLK, XLF, XLV, XLE, XLI, XLY, XLP, XLU, XLB, XLRE, XLC]
+  - name: covered_calls
+    enabled: false
+  - name: cash_secured_puts
+    enabled: false
+    symbols: [AAPL, MSFT]
+  - name: wheel
+    enabled: false
+  - name: protective_puts
+    enabled: true
+  - name: volatility
+    enabled: true
+    symbols: [SPY]
+  # also available: breakouts, swing, pairs, vertical_spreads, iron_condors,
+  # long_term, dividend, growth
+
+schedules:
+  # A default review_cycle schedule (every ai.review_interval_seconds during
+  # market hours) and a nightly audit verification are added automatically.
+  - name: after-hours-review
+    job: review_cycle
+    cron: "30 17 * * 1-5"     # 17:30 ET weekdays — post-close review
+  - name: morning-sync
+    job: portfolio_sync
+    cron: "0 9 * * 1-5"
+
+notifications:
+  - kind: desktop
+    min_level: info
+  # - kind: email
+  #   min_level: warning
+  #   credential: smtp_password        # vault JSON: {"password": "..."}
+  #   options:
+  #     host: smtp.example.com
+  #     port: 587
+  #     username: you@example.com
+  #     from_addr: aegis@example.com
+  #     to_addr: you@example.com
+  # - kind: discord
+  #   min_level: info
+  #   credential: discord_webhook      # vault JSON: {"webhook_url": "https://discord.com/api/webhooks/..."}
+  # - kind: telegram
+  #   min_level: warning
+  #   credential: telegram_bot         # vault JSON: {"bot_token": "...", "chat_id": "..."}
+  # - kind: webhook
+  #   min_level: critical
+  #   credential: ops_webhook          # vault JSON: {"url": "https://...", "token": "..."}
+
+dashboard:
+  host: 127.0.0.1
+  port: 8321
+  # Required if host is ever non-loopback: vault entry holding a bearer token
+  # (open the dashboard as http://host:8321/?token=... ).
+  # auth_token_credential: dashboard_token
+
+updates:
+  enabled: true
+  check_interval_hours: 24
+  auto_apply: false

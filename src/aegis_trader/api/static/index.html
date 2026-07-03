@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis Trader</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">AEGIS<span>TRADER</span></div>
+  <div class="topbar-status">
+    <span class="pill" id="pill-mode" title="Operating mode">mode: —</span>
+    <span class="pill" id="pill-session" title="Market session">session: —</span>
+    <span class="pill" id="pill-health" title="System health">health: —</span>
+    <span class="pill" id="pill-circuit" title="Circuit breaker">circuit: —</span>
+  </div>
+  <div class="topbar-actions">
+    <select id="mode-select" aria-label="Operating mode">
+      <option value="research">Mode 1 · Research</option>
+      <option value="approval">Mode 2 · Approval</option>
+      <option value="autonomous">Mode 3 · Autonomous</option>
+    </select>
+    <button id="btn-cycle" class="btn">Run cycle</button>
+    <button id="btn-halt" class="btn btn-danger">HALT</button>
+    <button id="btn-resume" class="btn btn-ghost">Resume</button>
+  </div>
+</header>
+
+<main>
+  <section class="tiles" id="tiles">
+    <div class="tile"><div class="tile-label">Equity</div><div class="tile-value" id="t-equity">—</div><div class="tile-sub" id="t-equity-sub"></div></div>
+    <div class="tile"><div class="tile-label">Day P&amp;L</div><div class="tile-value" id="t-daypnl">—</div><div class="tile-sub" id="t-daypnl-sub"></div></div>
+    <div class="tile"><div class="tile-label">Cash</div><div class="tile-value" id="t-cash">—</div><div class="tile-sub" id="t-cash-sub">buying power</div></div>
+    <div class="tile"><div class="tile-label">Drawdown</div><div class="tile-value" id="t-dd">—</div><div class="tile-sub">from peak equity</div></div>
+    <div class="tile"><div class="tile-label">Exposure</div><div class="tile-value" id="t-exposure">—</div><div class="tile-sub" id="t-exposure-sub">gross / options</div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card card-wide">
+      <h2>Equity</h2>
+      <div class="chart-wrap"><svg id="equity-chart" role="img" aria-label="Equity over time"></svg>
+        <div id="equity-tip" class="tooltip" hidden></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Risk limits</h2>
+      <div id="risk-meters"></div>
+    </div>
+
+    <div class="card">
+      <h2>Allocation</h2>
+      <div id="allocation"></div>
+    </div>
+
+    <div class="card">
+      <h2>Performance</h2>
+      <div id="performance"></div>
+    </div>
+
+    <div class="card">
+      <h2>Exit plans <span class="hint">(guardian)</span></h2>
+      <div id="exit-plans" class="stack"></div>
+    </div>
+
+    <div class="card">
+      <h2>AI usage <span class="hint">(this month)</span></h2>
+      <div id="ai-usage"></div>
+    </div>
+
+    <div class="card">
+      <h2>Pending approvals</h2>
+      <div id="approvals" class="stack"></div>
+    </div>
+
+    <div class="card card-wide">
+      <h2>Positions</h2>
+      <div class="table-wrap"><table id="positions-table">
+        <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Avg</th><th class="num">Value</th><th class="num">Unrealized</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
+    <div class="card card-wide">
+      <h2>Orders</h2>
+      <div class="table-wrap"><table id="orders-table">
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Limit</th><th>Status</th><th>Reason</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
+    <div class="card card-wide">
+      <h2>AI reasoning log</h2>
+      <div id="decisions" class="stack"></div>
+    </div>
+
+    <div class="card">
+      <h2>System</h2>
+      <div id="system-health" class="stack"></div>
+    </div>
+
+    <div class="card">
+      <h2>Data providers</h2>
+      <div id="providers" class="stack"></div>
+    </div>
+
+    <div class="card card-wide">
+      <h2>Event feed</h2>
+      <div id="events" class="feed" aria-live="polite"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

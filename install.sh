@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Aegis Trader — one-command installer for CachyOS / Arch (and other Linux).
+#
+#   git clone https://github.com/St3althWarri0r/Aegis-Trader && cd Aegis-Trader && ./install.sh
+#
+# What it does:
+#   1. verifies python >= 3.11 (offers pacman hints on Arch/CachyOS)
+#   2. creates a dedicated venv at ~/.local/share/aegis-trader/venv
+#   3. installs aegis-trader (editable, so `aegis update apply` works)
+#   4. writes the starter config and installs the systemd user service
+#   5. runs `aegis doctor`
+#
+# Native package alternative: cd packaging && makepkg -si
+
+set -euo pipefail
+
+BOLD=$(tput bold 2>/dev/null || true); RESET=$(tput sgr0 2>/dev/null || true)
+say()  { printf '%s==>%s %s\n' "$BOLD" "$RESET" "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aegis-trader"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aegis-trader"
+VENV="$DATA_DIR/venv"
+BIN_DIR="$HOME/.local/bin"
+
+# 1. Python check ------------------------------------------------------------
+PY=python3
+command -v "$PY" >/dev/null || die "python3 not found. On CachyOS/Arch: sudo pacman -S python"
+"$PY" - <<'EOF' || die "Python 3.11+ required. On CachyOS/Arch: sudo pacman -S python"
+import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)
+EOF
+say "Python OK: $($PY --version)"
+
+if ! command -v notify-send >/dev/null; then
+  say "note: libnotify (notify-send) not found — desktop notifications need it:"
+  say "      sudo pacman -S libnotify"
+fi
+
+# 2. venv ---------------------------------------------------------------------
+say "Creating virtualenv at $VENV"
+mkdir -p "$DATA_DIR" "$CONFIG_DIR" "$BIN_DIR"
+"$PY" -m venv "$VENV"
+"$VENV/bin/pip" install --quiet --upgrade pip
+
+# 3. install ------------------------------------------------------------------
+say "Installing aegis-trader (editable) from $REPO_DIR"
+"$VENV/bin/pip" install --quiet -e "$REPO_DIR"
+ln -sf "$VENV/bin/aegis" "$BIN_DIR/aegis"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) say "note: add $BIN_DIR to your PATH to use the 'aegis' command directly" ;;
+esac
+
+# 4. config + service -----------------------------------------------------------
+if [[ ! -f "$CONFIG_DIR/aegis.yaml" ]]; then
+  cp "$REPO_DIR/config/aegis.example.yaml" "$CONFIG_DIR/aegis.yaml"
+  say "Wrote starter configuration to $CONFIG_DIR/aegis.yaml"
+else
+  say "Keeping existing configuration at $CONFIG_DIR/aegis.yaml"
+fi
+
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+mkdir -p "$SYSTEMD_DIR"
+sed "s|ExecStart=.*|ExecStart=$VENV/bin/aegis run|" \
+  "$REPO_DIR/packaging/aegis-trader.service" > "$SYSTEMD_DIR/aegis-trader.service"
+systemctl --user daemon-reload 2>/dev/null || true
+say "Installed systemd user service (not yet enabled)"
+
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$APPS_DIR"
+cp "$REPO_DIR/packaging/aegis-trader.desktop" "$APPS_DIR/"
+
+# 5. doctor ----------------------------------------------------------------------
+say "Running self-diagnostics"
+"$VENV/bin/aegis" doctor || true
+
+cat <<EOF
+
+${BOLD}Aegis Trader installed.${RESET} Next steps:
+
+  1. Create the credential vault and add your keys:
+       aegis vault init
+       aegis vault set anthropic_api_key
+       aegis vault set polygon_api_key          # and other providers you enabled
+  2. Review the configuration:
+       \$EDITOR $CONFIG_DIR/aegis.yaml
+       aegis config validate
+  3. First run (foreground):
+       aegis run
+     Dashboard: http://127.0.0.1:8321
+  4. 24/7 operation (after storing the vault passphrase as a systemd credential —
+     see docs/security.md):
+       systemctl --user enable --now aegis-trader
+       loginctl enable-linger \$USER     # keep it running after logout
+
+Start in 'research' mode with the paper broker (the default) and read
+docs/user-guide.md before enabling autonomous trading.
+EOF
