@@ -620,6 +620,7 @@ async function ticketQuote() {
     const q = await getJSON(`/api/quote/${encodeURIComponent(symbol)}`);
     if (q.reference) {
       // Market not in regular session: this is the last real print, labeled.
+      // Display only — it must not seed the order form.
       const at = q.as_of ? new Date(q.as_of).toLocaleString() : "unknown time";
       box.innerHTML = `<strong>${esc(symbol)}</strong> · last ${fmtUsd(q.last)}` +
         (q.bid || q.ask ? ` · bid ${fmtUsd(q.bid)} / ask ${fmtUsd(q.ask)}` : "") +
@@ -628,8 +629,8 @@ async function ticketQuote() {
     } else {
       box.innerHTML = `<strong>${esc(symbol)}</strong> · bid ${fmtUsd(q.bid)} / ask ${fmtUsd(q.ask)}` +
         ` · last ${fmtUsd(q.last)} <small>(${esc(q.source)}, ${esc(q.freshness)})</small>`;
+      if (!$("#tk-limit").value && q.last) $("#tk-limit").value = Number(q.last).toFixed(2);
     }
-    if (!$("#tk-limit").value && q.last) $("#tk-limit").value = Number(q.last).toFixed(2);
   } catch (e) {
     box.textContent = "no quote available — " + String(e.message).slice(0, 160);
   }
@@ -939,14 +940,22 @@ function chatBubble(role, content, meta) {
 async function refreshChat() {
   if (chatPending) return; // don't clobber the optimistic bubbles mid-send
   const data = await getJSON("/api/chat?limit=200");
+  if (chatPending) return; // a send started while the GET was in flight
   const logEl = $("#chat-log");
   const msgs = data.messages || [];
+  // Skip the rebuild when nothing changed — the 30s auto-refresh must not
+  // destroy the reader's scroll position or text selection.
+  const sig = msgs.length + ":" + (msgs.length ? msgs[msgs.length - 1].at : "");
+  if (logEl.dataset.sig === sig) return;
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 8;
+  logEl.dataset.sig = sig;
   logEl.innerHTML = msgs.length ? "" :
     '<div class="empty">Ask about your portfolio, a symbol, risk, strategy ideas, or how Poseidon itself works.</div>';
   for (const m of msgs) {
     logEl.appendChild(chatBubble(m.role, m.content, m.at ? new Date(m.at).toLocaleTimeString() : ""));
   }
-  logEl.scrollTop = logEl.scrollHeight;
+  if (atBottom || !logEl.dataset.hadContent) logEl.scrollTop = logEl.scrollHeight;
+  logEl.dataset.hadContent = "1";
 }
 
 async function sendChat(evt) {
@@ -978,8 +987,11 @@ async function sendChat(evt) {
   } finally {
     chatPending = false;
     $("#chat-send").disabled = false;
+    logEl.dataset.sig = ""; // bubbles were added optimistically; resync next refresh
     logEl.scrollTop = logEl.scrollHeight;
-    refreshAiUsage().catch(() => {});
+    // refreshAiUsage reads the cached status — refetch it first so the
+    // usage card shows the tokens this chat turn just spent.
+    refreshStatus().then(refreshAiUsage).catch(() => {});
   }
 }
 
@@ -1032,7 +1044,7 @@ async function refreshAccount() {
   $("#broker-stubs").innerHTML = stubs.length
     ? stubs.map((b) =>
         `<div class="stub-row"><span class="name">${esc(b.display_name)}</span>
-         <span class="why">${esc(b.stub_reason || "no official API")}</span></div>`).join("")
+         <span class="why">${esc(b.stub_reason || b.notes || "no dashboard setup available")}</span></div>`).join("")
     : '<div class="empty">every installed broker plugin is connectable</div>';
 }
 
@@ -1060,7 +1072,7 @@ function selectBroker(name) {
   const paperBox = $("#bf-paper");
   if (b.paper_choice === "toggle") { paperRow.hidden = false; paperBox.checked = true; paperBox.disabled = false; }
   else if (b.paper_choice === "always") { paperRow.hidden = false; paperBox.checked = true; paperBox.disabled = true; }
-  else { paperRow.hidden = true; paperBox.checked = false; }
+  else { paperRow.hidden = true; paperBox.checked = false; paperBox.disabled = true; }
   updateLiveWarning();
 }
 
@@ -1091,7 +1103,11 @@ function brokerPayload() {
   }
   const paper = b.paper_choice === "live_only" ? false
     : b.paper_choice === "always" ? true : $("#bf-paper").checked;
-  return { name: b.name, paper, ...(any ? { credentials: creds } : {}) };
+  // A broker whose fields are all optional (IBKR) with nothing saved yet:
+  // send an explicit empty credentials object so the server doesn't try a
+  // vault lookup that cannot succeed.
+  const sendCreds = any || (!required.length && !b.credential_saved);
+  return { name: b.name, paper, ...(sendCreds ? { credentials: creds } : {}) };
 }
 
 $("#bf-test").addEventListener("click", async () => {

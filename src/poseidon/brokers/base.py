@@ -82,6 +82,14 @@ class Broker(abc.ABC):
     def is_paper(self) -> bool:
         return self._paper
 
+    @property
+    def account_scope(self) -> str:
+        """Persistence key for account-scoped history (equity marks, loss
+        baselines, peaks). Includes the paper/live flag because a broker's
+        sandbox and real account are different accounts — their histories
+        must never mix (alpaca paper vs alpaca live)."""
+        return f"{self.name}:{'paper' if self._paper else 'live'}"
+
     # -- account -------------------------------------------------------------------
 
     @abc.abstractmethod

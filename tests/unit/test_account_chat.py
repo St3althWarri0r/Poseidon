@@ -148,6 +148,49 @@ async def test_open_order_count_and_set_broker(manager) -> None:
     assert mgr.broker_name == "paper"
 
 
+async def test_switching_refuses_new_orders_and_drains(manager) -> None:
+    # While a broker switch is in progress every new order pipeline must be
+    # refused — an order decided against one account must never reach another.
+    mgr, db, broker = manager
+    await mgr.begin_broker_switch(timeout=1)
+    order = Order(symbol="AAPL", side=OrderSide.BUY, quantity=Decimal("1"),
+                  limit_price=Decimal("100"))
+    result = await mgr.submit_manual(order)
+    assert result.status is OrderStatus.REJECTED_RISK
+    assert "switch in progress" in (result.status_reason or "")
+    mgr.end_broker_switch()
+
+
+async def test_switch_drain_times_out_with_inflight_pipeline(manager) -> None:
+    mgr, db, broker = manager
+    mgr._pipeline_enter()  # simulate an order mid-pipeline
+    with pytest.raises(Exception, match="in flight"):
+        await mgr.begin_broker_switch(timeout=0.05)
+    assert mgr._switching is False  # refusal lifted after the failed switch
+    mgr._pipeline_exit()
+
+
+def test_broker_account_scope_separates_paper_and_live(tmp_path) -> None:
+    # alpaca-paper and alpaca-live are different accounts: their equity
+    # histories must never share a persistence key.
+    paper = PaperBroker(credentials={}, options={"state_file": str(tmp_path / "p.json")})
+    assert paper.account_scope == "paper:paper"
+    assert ":" in paper.account_scope
+
+
+def test_merge_preserves_base_only_keys() -> None:
+    # An overlay row must deep-merge over the base row: yaml-configured
+    # options (e.g. ibkr gateway_url) survive a dashboard-written overlay.
+    base = {"brokers": [{"name": "ibkr", "enabled": True, "primary": True,
+                         "options": {"gateway_url": "https://localhost:5000"}}]}
+    overlay = {"brokers": [{"name": "ibkr", "enabled": True, "primary": True, "paper": False,
+                            "credential": "ibkr_creds"}]}
+    merged = apply_local_overlay(base, overlay)
+    entry = merged["brokers"][0]
+    assert entry["options"] == {"gateway_url": "https://localhost:5000"}
+    assert entry["paper"] is False and entry["credential"] == "ibkr_creds"
+
+
 async def test_resume_orphans_orders_from_another_broker(manager) -> None:
     # An order left open at broker A must NOT be polled against broker B —
     # its ids mean nothing there. It is marked ERROR with an explanation.

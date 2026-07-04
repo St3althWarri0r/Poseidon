@@ -34,6 +34,7 @@ class KernelStub:
         self.audit_entries: list[tuple[str, str]] = []
 
         self.clock = SimpleNamespace(session=lambda: MarketSession.REGULAR)
+        self.broker = SimpleNamespace(name="paper")  # plans are broker-scoped
         self.order_manager = SimpleNamespace(
             mode=mode, execute_decision=self._execute_decision
         )
@@ -224,6 +225,22 @@ async def test_single_buy_decision_falls_back_to_decision_level_plan(tmp_path) -
     await guardian.on_order_filled("order.filled", filled_buy(symbol="AAPL"))
     plans = await guardian.active_plans()
     assert len(plans) == 1 and plans[0]["stop_loss"] == "95"
+    await db.close()
+
+
+async def test_plans_are_broker_scoped(tmp_path) -> None:
+    # A stop armed while on the paper broker must not fire (or even be
+    # visible) after switching to a real brokerage — paper and live state
+    # never mix on an order path.
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="90", position_qty="10")
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    assert len(await guardian.active_plans()) == 1
+    kernel.broker.name = "alpaca"  # broker switched
+    assert await guardian.active_plans() == []
+    await guardian.check_all()  # price breaches the old stop — must NOT fire
+    assert kernel.executed_decisions == []
     await db.close()
 
 

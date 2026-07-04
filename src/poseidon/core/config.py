@@ -262,19 +262,25 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _merge_named_list(base: list[Any], overlay: list[Any]) -> list[Any]:
-    """Merge two lists of {name: ...} entries: an overlay entry REPLACES the
-    same-name base entry wholesale, unknown names are appended. Order: base
-    order first, new overlay names after."""
-    by_name: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for entry in [*base, *overlay]:
-        if not isinstance(entry, dict) or "name" not in entry:
-            continue  # malformed rows surface later as pydantic errors on base
-        name = str(entry["name"])
-        if name not in by_name:
-            order.append(name)
-        by_name[name] = dict(entry)
-    return [by_name[n] for n in order]
+    """Merge two lists of {name: ...} entries. An overlay entry deep-merges
+    over the same-name base entry — overlay keys win, base-only keys (e.g. a
+    broker's ``options``) survive; unknown overlay names are appended. Base
+    rows pass through verbatim (including malformed or duplicate ones) so
+    pydantic still reports the same errors with or without an overlay."""
+    overlay_by_name: dict[str, dict[str, Any]] = {}
+    for entry in overlay:
+        if isinstance(entry, dict) and "name" in entry:
+            overlay_by_name[str(entry["name"])] = dict(entry)
+    merged: list[Any] = []
+    for entry in base:
+        if isinstance(entry, dict) and "name" in entry:
+            name = str(entry["name"])
+            if name in overlay_by_name:
+                merged.append(_deep_merge(entry, overlay_by_name.pop(name)))
+                continue
+        merged.append(entry)
+    merged.extend(overlay_by_name.values())
+    return merged
 
 
 def apply_local_overlay(raw: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -336,7 +342,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         if overlay is not None and not isinstance(overlay, dict):
             raise ConfigError(f"{overlay_file} must contain a YAML mapping")
         if overlay:
-            raw = apply_local_overlay(raw, overlay)
+            try:
+                raw = apply_local_overlay(raw, overlay)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ConfigError(
+                    f"invalid overlay structure in {overlay_file}: {exc} — fix or delete the file"
+                ) from exc
     raw = _deep_merge(raw, _deep_env_overrides())
     try:
         config = AppConfig.model_validate(raw)

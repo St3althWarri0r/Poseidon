@@ -97,19 +97,20 @@ class PositionGuardian:
             return  # nothing enforceable
         exit_plan = decision_exit  # time_stop (free text) is decision-level
         now = datetime.now(UTC).isoformat()
+        broker = self._kernel.broker.name  # type: ignore[attr-defined]
         await self._db.execute(
             "INSERT INTO exit_plans (symbol, decision_id, stop_loss, take_profit, time_stop, "
-            "quantity, active, triggered_reason, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?, ?) "
+            "quantity, active, triggered_reason, created_at, updated_at, broker) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?) "
             "ON CONFLICT(symbol) DO UPDATE SET decision_id=excluded.decision_id, "
             "stop_loss=excluded.stop_loss, take_profit=excluded.take_profit, "
             "time_stop=excluded.time_stop, quantity=excluded.quantity, active=1, "
-            "triggered_reason=NULL, updated_at=excluded.updated_at",
+            "triggered_reason=NULL, updated_at=excluded.updated_at, broker=excluded.broker",
             (order.symbol.upper(), order.decision_id, stop, target,
              exit_plan.get("time_stop"), str(order.filled_quantity or order.quantity),
-             now, now),
+             now, now, broker),
         )
-        log.info("exit plan armed", symbol=order.symbol, stop=stop, target=target)
+        log.info("exit plan armed", symbol=order.symbol, stop=stop, target=target, broker=broker)
 
     async def _maybe_deactivate(self, symbol: str, reason: str) -> None:
         portfolio = self._kernel.portfolio  # type: ignore[attr-defined]
@@ -128,8 +129,13 @@ class PositionGuardian:
         kernel = self._kernel
         if kernel.clock.session() is not MarketSession.REGULAR:  # type: ignore[attr-defined]
             return
+        # Broker-scoped: a plan armed for another brokerage's position must
+        # never fire here. Legacy rows (broker='') still match the active
+        # broker so pre-upgrade plans keep protecting their positions.
         rows = await self._db.fetch_all(
-            "SELECT symbol, decision_id, stop_loss, take_profit FROM exit_plans WHERE active = 1"
+            "SELECT symbol, decision_id, stop_loss, take_profit FROM exit_plans "
+            "WHERE active = 1 AND broker IN (?, '')",
+            (kernel.broker.name,),  # type: ignore[attr-defined]
         )
         for symbol, decision_id, stop_raw, target_raw in rows:
             position = kernel.portfolio.position_for(symbol)  # type: ignore[attr-defined]
@@ -211,7 +217,8 @@ class PositionGuardian:
     async def active_plans(self) -> list[dict[str, object]]:
         rows = await self._db.fetch_all(
             "SELECT symbol, stop_loss, take_profit, time_stop, quantity, created_at "
-            "FROM exit_plans WHERE active = 1 ORDER BY symbol"
+            "FROM exit_plans WHERE active = 1 AND broker IN (?, '') ORDER BY symbol",
+            (self._kernel.broker.name,),  # type: ignore[attr-defined]
         )
         return [
             {"symbol": r[0], "stop_loss": r[1], "take_profit": r[2],

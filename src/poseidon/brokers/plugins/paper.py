@@ -43,6 +43,10 @@ class PaperBroker(Broker):
         self._quote_fn: QuoteFn | None = self._options.get("quote_fn")
         state_file = self._options.get("state_file")
         self._state_file: Path | None = Path(state_file) if state_file else None
+        # A read-only instance (the Account view's connection test) may load
+        # the shared state file but must never write it back — its stale
+        # snapshot would clobber the ACTIVE paper broker's saved state.
+        self._read_only = bool(self._options.get("read_only", False))
         self._cash = Decimal(str(self._options.get("starting_cash", _DEFAULT_CASH)))
         self._positions: dict[str, dict[str, Any]] = {}  # symbol -> {qty, avg_price}
         self._lots: list[dict[str, Any]] = []
@@ -253,7 +257,7 @@ class PaperBroker(Broker):
     # -- persistence -----------------------------------------------------------------
 
     def _save_state(self) -> None:
-        if self._state_file is None:
+        if self._state_file is None or self._read_only:
             return
         state = {
             "cash": str(self._cash),

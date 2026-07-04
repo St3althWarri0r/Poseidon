@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from ..ai.chat import ChatBusyError
 from ..brokers.registry import broker_catalog
 from ..core.enums import TradingMode
-from ..core.errors import AgentError, BrokerError, ConfigError, VaultError
+from ..core.errors import AgentError, BrokerError, ConfigError, DataError, VaultError
 from ..core.events import EventBus
 
 if TYPE_CHECKING:
@@ -71,6 +71,18 @@ class WebsocketHub:
 def build_app(kernel: ApplicationKernel) -> FastAPI:
     app = FastAPI(title="Poseidon", docs_url=None, redoc_url=None, openapi_url=None)
     hub = WebsocketHub(kernel.bus)
+
+    # DNS-rebinding protection: a malicious website resolving to 127.0.0.1
+    # sends its own domain in the Host header; reject anything that is not a
+    # genuine loopback/configured host. On a non-loopback bind the operator
+    # may reach it by any address, so the (mandatory) bearer token is the
+    # guard instead.
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    configured_host = kernel.config.dashboard.host
+    if configured_host in ("127.0.0.1", "localhost", "::1"):
+        app.add_middleware(TrustedHostMiddleware,
+                           allowed_hosts=["127.0.0.1", "localhost", "::1"])
 
     # Optional bearer-token auth (required by config validation whenever the
     # host is non-loopback). Static assets are exempt — they contain nothing
@@ -123,7 +135,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         # must never be spliced into one line.
         rows = await kernel.db.fetch_all(
             "SELECT at, equity FROM equity_marks WHERE broker = ? ORDER BY at DESC LIMIT ?",
-            (kernel.broker.name, limit),
+            (kernel.broker.account_scope, limit),
         )
         points = [{"at": r[0], "equity": float(r[1])} for r in reversed(rows)]
         return JSONResponse({"points": points})
@@ -171,6 +183,8 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             order = await kernel.order_manager.cancel(order_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConfigError as exc:  # broker switch in progress / wrong broker
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "status": order.status.value})
 
     @app.post("/api/mode")
@@ -442,7 +456,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         try:
             account = await kernel.broker_connection_test(
                 name, paper=paper, credentials=credentials)
-        except (BrokerError, ConfigError, VaultError) as exc:
+        except (BrokerError, ConfigError, VaultError, DataError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)})
         return JSONResponse({"ok": True, "account": account})
 
@@ -454,7 +468,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         name, paper, credentials = _broker_request(body)
         try:
             result = await kernel.switch_broker(name, paper=paper, credentials=credentials)
-        except (BrokerError, ConfigError, VaultError) as exc:
+        except (BrokerError, ConfigError, VaultError, DataError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "broker": result})
 

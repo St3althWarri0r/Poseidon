@@ -92,6 +92,10 @@ class ChatService:
             raise ValueError("empty message")
         if self._lock.locked():
             raise ChatBusyError("Claude is still answering the previous message")
+        # The context block is the platform's word, not the operator's — a
+        # message must not be able to forge or close one.
+        message = (message.replace("<session_context>", "[session_context]")
+                          .replace("</session_context>", "[/session_context]"))
         async with self._lock:
             history = await self._history_as_messages(_HISTORY_TURNS)
             await self._persist("user", message)
@@ -102,34 +106,41 @@ class ChatService:
                      "cache_read_tokens": 0, "cache_write_tokens": 0, "api_calls": 0}
             tool_calls: list[str] = []
             reply = ""
-            for _ in range(self._config.max_tool_iterations):
-                response = await self._create_message(messages)
-                self._record_usage(response, usage)
-                if response.stop_reason == "refusal":
-                    reply = "I can't help with that request."
-                    break
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason == "pause_turn":
-                    continue
-                tool_uses = [b for b in response.content if b.type == "tool_use"]
-                if not tool_uses:
-                    reply = "\n".join(b.text for b in response.content if b.type == "text").strip()
-                    break
-                results: list[dict[str, Any]] = []
-                for block in tool_uses:
-                    result, is_error = await self._dispatcher.dispatch(block.name, dict(block.input))
-                    log.info("chat tool call", tool=block.name, error=is_error)
-                    tool_calls.append(block.name)
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": result, "is_error": is_error})
-                messages.append({"role": "user", "content": results})
-            else:
-                reply = "I hit the tool-call limit before finishing — ask me to continue."
-
+            try:
+                reply = await self._run_tool_loop(messages, usage, tool_calls)
+            except AgentError as exc:
+                # Keep the history PAIRED: without an assistant turn the
+                # dangling user message would silently merge into the next
+                # send. The marker also tells the operator what happened.
+                await self._persist("assistant", f"(request failed: {exc})")
+                raise
             if not reply:
                 reply = "(no response)"
             await self._persist("assistant", reply)
             return {"reply": reply, "tool_calls": tool_calls, "usage": usage}
+
+    async def _run_tool_loop(self, messages: list[dict[str, Any]],
+                             usage: dict[str, int], tool_calls: list[str]) -> str:
+        for _ in range(self._config.max_tool_iterations):
+            response = await self._create_message(messages)
+            self._record_usage(response, usage)
+            if response.stop_reason == "refusal":
+                return "I can't help with that request."
+            messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason == "pause_turn":
+                continue
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            if not tool_uses:
+                return "\n".join(b.text for b in response.content if b.type == "text").strip()
+            results: list[dict[str, Any]] = []
+            for block in tool_uses:
+                result, is_error = await self._dispatcher.dispatch(block.name, dict(block.input))
+                log.info("chat tool call", tool=block.name, error=is_error)
+                tool_calls.append(block.name)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": result, "is_error": is_error})
+            messages.append({"role": "user", "content": results})
+        return "I hit the tool-call limit before finishing — ask me to continue."
 
     async def history(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = await self._db.fetch_all(

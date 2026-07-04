@@ -452,3 +452,6 @@ label input, label select { width: 100%; min-width: 0; }
 }
 .acct-badge.live { border-color: var(--warning); color: var(--warning); background: var(--warning-soft); }
 .acct-badge.paper { border-color: var(--good); color: var(--good); background: var(--good-soft); }
+
+/* [hidden] must win over display rules like .form-row { display: grid } */
+[hidden] { display: none !important; }

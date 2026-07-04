@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS exit_plans (
     active INTEGER NOT NULL DEFAULT 1,
     triggered_reason TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    broker TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS ai_usage (
@@ -146,6 +147,13 @@ class Database:
             # broker switch. Legacy rows keep broker='' and are excluded.
             await self._conn.execute(
                 "ALTER TABLE equity_marks ADD COLUMN broker TEXT NOT NULL DEFAULT ''"
+            )
+        with contextlib.suppress(aiosqlite.OperationalError):
+            # Guardian exit plans are broker-scoped for the same reason: a
+            # paper-era stop must never fire against a real account. Legacy
+            # rows ('') still match the active broker until re-armed.
+            await self._conn.execute(
+                "ALTER TABLE exit_plans ADD COLUMN broker TEXT NOT NULL DEFAULT ''"
             )
         await self._conn.commit()
         # New databases must not be world readable.

@@ -38,7 +38,7 @@ from .core.config import (
 )
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
-from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError
+from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError, VaultError
 from .core.events import EventBus, Topics
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
@@ -152,7 +152,18 @@ class ApplicationKernel:
         )
         api_key = self.vault.get(cfg.ai.api_key_credential)
         self.agent = ClaudeAgent(cfg.ai, api_key, dispatcher)
-        self.chat = ChatService(cfg.ai, self.agent.client, dispatcher, self.db)
+        # Chat gets its OWN dispatcher: the review cycle clears and snapshots
+        # dispatcher.sources_used into each decision's data_sources, and a
+        # concurrent chat tool call must not inject provenance into that
+        # audited record.
+        chat_dispatcher = ToolDispatcher(
+            self.router, self.portfolio, self.risk,
+            allow_delayed_quotes=cfg.data.allow_delayed_for_research,
+            benchmark_symbol=cfg.risk.benchmark_symbol,
+            risk_config=cfg.risk,
+            workshop=self.workshop,
+        )
+        self.chat = ChatService(cfg.ai, self.agent.client, chat_dispatcher, self.db)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
         self.sync = PortfolioSyncService(self.broker, self.portfolio, self.bus, self.db, self.clock)
         self.scheduler = Scheduler(self.clock, self.bus)
@@ -256,8 +267,15 @@ class ApplicationKernel:
             raise ConfigError(
                 f"'{name}' cannot be connected: {reason or 'no dashboard setup available'}"
             )
+        # Inherit what the operator already configured in poseidon.yaml for
+        # this broker (options like ibkr's gateway_url, or a custom credential
+        # name) — the dashboard switch must not silently discard them.
+        existing = next((b for b in self.config.brokers if b.name == name), None)
+        credential = (existing.credential if existing and existing.credential
+                      else str(entry.get("credential", "")))
+        options = dict(existing.options) if existing else {}
         return BrokerConfig(name=name, enabled=True, primary=True,
-                            credential=str(entry.get("credential", "")), paper=paper)
+                            credential=credential, paper=paper, options=options)
 
     async def broker_connection_test(self, name: str, *, paper: bool,
                                      credentials: dict[str, str] | None) -> dict[str, object]:
@@ -265,6 +283,10 @@ class ApplicationKernel:
         touching the active broker, the vault, or any config. ``credentials``
         None means use the credential already stored in the vault."""
         cfg = self._broker_config_for(name, paper=paper)
+        if name == "paper":
+            # The test instance shares the active paper broker's state file;
+            # it may read the simulated account but must never write it back.
+            cfg.options["read_only"] = True
         broker = await self._build_broker(cfg, credentials_override=credentials)
         try:
             snapshot = await broker.account()
@@ -283,45 +305,75 @@ class ApplicationKernel:
     async def switch_broker(self, name: str, *, paper: bool,
                             credentials: dict[str, str] | None) -> dict[str, object]:
         """Connect a brokerage from the Account view and make it the active
-        broker, live — no restart. Order of operations is deliberate: the new
-        connection is PROVEN first; only then are credentials committed to the
-        vault and the choice persisted (poseidon.local.yaml) so a restart
-        comes back to the same broker."""
-        open_count = await self.order_manager.open_order_count()
-        if open_count:
-            raise ConfigError(
-                f"{open_count} order(s) are still open at "
-                f"{self.broker.display_name or self.broker.name} — cancel them or let them "
-                "finish before switching brokers"
+        broker, live — no restart.
+
+        Ordering is deliberate and race-guarded: (1) new order pipelines are
+        refused and in-flight ones drained (an order decided against one
+        account must never reach another); (2) with the world quiet, the
+        open-order guard is re-checked; (3) the new connection is PROVEN;
+        (4) only then are credentials committed to the vault and the choice
+        persisted; (5) the swap itself, state resets, and a fresh sync."""
+        await self.order_manager.begin_broker_switch()
+        try:
+            open_count = await self.order_manager.open_order_count()
+            if open_count:
+                raise ConfigError(
+                    f"{open_count} order(s) are still open at "
+                    f"{self.broker.display_name or self.broker.name} — cancel them or let "
+                    "them finish before switching brokers"
+                )
+            cfg = self._broker_config_for(name, paper=paper)
+            new_broker = await self._build_broker(cfg, credentials_override=credentials)
+            try:
+                if credentials is not None and cfg.credential:
+                    await asyncio.to_thread(self.vault.set, cfg.credential,
+                                            json.dumps(credentials))
+                await asyncio.to_thread(self._write_broker_overlay, cfg)
+            except Exception as exc:
+                # Persisting failed: nothing was swapped — drop the proven
+                # connection and surface a clean, actionable error.
+                with contextlib.suppress(Exception):
+                    await new_broker.disconnect()
+                if isinstance(exc, ConfigError | VaultError):
+                    raise
+                raise ConfigError(f"could not persist the broker switch: {exc}") from exc
+
+            old = self.broker
+            self.broker = new_broker
+            self.order_manager.set_broker(new_broker)
+            await self.sync.set_broker(new_broker)
+            self._apply_broker_to_config(cfg)
+            # Everything account-scoped belongs to the OLD account. Clear the
+            # snapshot (synced_at=None makes the risk engine refuse to trade
+            # until the new account's first successful sync), drop cached risk
+            # metrics, disarm guardian plans, and reload this account's OWN
+            # baselines/peak from its scoped history.
+            self.portfolio.account = None
+            self.portfolio.positions = []
+            self.portfolio.open_orders = []
+            self.portfolio.recent_fills = []
+            self.portfolio.tax_lots = []
+            self.portfolio.dividends = []
+            self.portfolio.synced_at = None
+            self.portfolio.equity_history = []
+            self.portfolio.day_start_equity = None
+            self.portfolio.week_start_equity = None
+            self.portfolio.peak_equity = None
+            self.portfolio.risk_metrics = None
+            self.portfolio.risk_metrics_at = None
+            await self.db.execute(
+                "UPDATE exit_plans SET active = 0, triggered_reason = 'broker switched', "
+                "updated_at = ? WHERE active = 1",
+                (datetime.now(UTC).isoformat(),),
             )
-        cfg = self._broker_config_for(name, paper=paper)
-        new_broker = await self._build_broker(cfg, credentials_override=credentials)
-
-        if credentials is not None and cfg.credential:
-            await asyncio.to_thread(self.vault.set, cfg.credential, json.dumps(credentials))
-        await asyncio.to_thread(self._write_broker_overlay, cfg)
-
-        old = self.broker
-        self.broker = new_broker
-        self.order_manager.set_broker(new_broker)
-        self.sync.set_broker(new_broker)
-        self._apply_broker_to_config(cfg)
-        # Baselines, peaks, and cached risk metrics belong to the OLD account;
-        # carrying them over would fabricate drawdowns/losses on the new one.
-        self.portfolio.peak_equity = None
-        self.portfolio.day_start_equity = None
-        self.portfolio.week_start_equity = None
-        self.portfolio.equity_history = []
-        self.portfolio.risk_metrics = None
-        self.portfolio.risk_metrics_at = None
-        await self.db.kv_set("baseline.day.date", "")
-        await self.db.kv_set("baseline.week.key", "")
-        await self.db.kv_set("baseline.broker", new_broker.name)
-        await self.audit.append("human", "broker.switched", {
-            "from": old.name, "to": new_broker.name, "paper": new_broker.is_paper,
-        })
-        with contextlib.suppress(Exception):
-            await old.disconnect()
+            await self.sync.restore_baselines()
+            await self.audit.append("human", "broker.switched", {
+                "from": old.name, "to": new_broker.name, "paper": new_broker.is_paper,
+            })
+            with contextlib.suppress(Exception):
+                await old.disconnect()
+        finally:
+            self.order_manager.end_broker_switch()
         try:
             await self.sync.sync_once()
         except Exception as exc:
@@ -359,18 +411,30 @@ class ApplicationKernel:
         overlay_file = local_overlay_path(path)
         existing: dict[str, object] = {}
         if overlay_file.exists():
-            loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
             if isinstance(loaded, dict):
                 existing = loaded
         brokers_raw = existing.get("brokers")
         brokers = [dict(b) for b in brokers_raw if isinstance(b, dict)] \
             if isinstance(brokers_raw, list) else []
         brokers = [{**b, "primary": False} for b in brokers if b.get("name") != cfg.name]
-        brokers.append({"name": cfg.name, "enabled": True, "primary": True,
-                        "paper": cfg.paper, "credential": cfg.credential})
+        entry: dict[str, object] = {"name": cfg.name, "enabled": True, "primary": True,
+                                    "paper": cfg.paper, "credential": cfg.credential}
+        if cfg.options:
+            entry["options"] = dict(cfg.options)
+        brokers.append(entry)
         existing["brokers"] = brokers
-        if cfg.name == "public":
-            # The same secret powers Public's free real-time data — enable it.
+        if cfg.name == "public" and not any(
+            p.name == "public_data" for p in self.config.data.providers
+        ):
+            # The same secret powers Public's free real-time data — enable it,
+            # but never override a public_data entry the operator already
+            # tuned in poseidon.yaml (priority/options stay theirs).
             data_raw = existing.get("data")
             data = dict(data_raw) if isinstance(data_raw, dict) else {}
             providers_raw = data.get("providers")
@@ -388,8 +452,11 @@ class ApplicationKernel:
             "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
         )
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
-        overlay_file.write_text(header + yaml.safe_dump(existing, sort_keys=False),
-                                encoding="utf-8")
+        # Atomic: a crash mid-write must not leave a truncated overlay that
+        # bricks the next startup.
+        tmp = overlay_file.with_name(overlay_file.name + ".tmp")
+        tmp.write_text(header + yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+        tmp.replace(overlay_file)
 
     # ------------------------------------------------------------------- chat
 
@@ -714,12 +781,14 @@ class ApplicationKernel:
 
         marks = await self.db.fetch_all(
             "SELECT at, equity FROM equity_marks WHERE broker = ? ORDER BY at ASC",
-            (self.broker.name,),
+            (self.broker.account_scope,),
         )
         equity_points = [(datetime.fromisoformat(r[0]), float(r[1])) for r in marks]
+        # Fills are broker-scoped too: paper round trips must not inflate a
+        # real account's win rate or per-strategy P&L (and vice versa).
         rows = await self.db.fetch_all(
-            "SELECT payload FROM orders WHERE status = ? ORDER BY updated_at ASC",
-            (OrderStatus.FILLED.value,),
+            "SELECT payload FROM orders WHERE status = ? AND broker = ? ORDER BY updated_at ASC",
+            (OrderStatus.FILLED.value, self.broker.name),
         )
         fills: list[FillRecord] = []
         for (payload,) in rows:
