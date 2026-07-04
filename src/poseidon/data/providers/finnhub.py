@@ -40,7 +40,9 @@ class FinnhubProvider(MarketDataProvider):
         current = payload.get("c")
         if current in (None, 0):
             raise ProviderError(self.name, f"no quote for {symbol}")
-        as_of = self._ts_from_epoch(payload.get("t")) or self._now()
+        as_of = self._ts_from_epoch(payload.get("t"))
+        if as_of is None:
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
         return Quote(
             symbol=symbol,
             last=Decimal(str(current)),

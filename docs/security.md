@@ -74,9 +74,13 @@ that alters a record breaks every subsequent hash.
 ## Network posture
 
 - The dashboard binds to `127.0.0.1` by default. Exposing it on any other
-  host **requires** `dashboard.auth_token_credential` (startup refuses
-  otherwise): a vault-stored bearer token checked (constant-time) on every
-  API request and websocket connect; static assets only are exempt. Prefer
+  host **requires** a bearer token (startup refuses otherwise): either
+  `dashboard.auth_token_credential` (a vault entry) or, for deployments
+  that cannot pre-seed the vault, `POSEIDON_DASHBOARD_TOKEN` /
+  `POSEIDON_DASHBOARD_TOKEN_FILE` — this is how the Docker image
+  authenticates; prefer the `_FILE` form so the token is not exposed in the
+  process environment. The token is checked (constant-time) on every API
+  request and websocket connect; static assets only are exempt. Prefer
   an SSH tunnel (`ssh -L 8321:127.0.0.1:8321 host`) or an authenticated
   reverse proxy with TLS even so — the token is sent in clear over plain
   HTTP.

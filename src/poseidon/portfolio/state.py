@@ -22,11 +22,16 @@ class PortfolioState:
         self.dividends: list[Dividend] = []
         self.recent_fills: list[Fill] = []
         self.synced_at: datetime | None = None
-        # Rolling equity history for drawdown / loss-limit checks.
-        self.equity_history: list[tuple[datetime, Decimal]] = []
         self.week_start_equity: Decimal | None = None
         self.day_start_equity: Decimal | None = None
         self.peak_equity: Decimal | None = None
+        # Session troughs (worst equity seen since the day/week baseline).
+        # Loss and drawdown halts measure against these so an intraday
+        # recovery cannot un-latch a halt within the session — the halt only
+        # clears when the sync service rolls the baseline at the day/week
+        # boundary (see portfolio/sync.py _roll_baselines).
+        self.day_min_equity: Decimal | None = None
+        self.week_min_equity: Decimal | None = None
         # Latest portfolio risk metrics (VaR/beta/correlation), refreshed on
         # a schedule; timestamped so consumers can enforce freshness.
         self.risk_metrics: dict[str, object] | None = None
@@ -54,45 +59,52 @@ class PortfolioState:
                 return p
         return None
 
+    @staticmethod
+    def _position_notional(p: Position) -> Decimal:
+        """Absolute notional of a position, applying the x100 option contract
+        multiplier when the broker snapshot has no market_value. Shared by
+        gross_exposure/options_exposure so every exposure gate agrees with
+        RiskContext.notional (risk/rules.py)."""
+        if p.market_value is not None:
+            return abs(p.market_value)
+        mult = Decimal(100) if p.asset_class.value == "option" else Decimal(1)
+        return abs(p.quantity * p.avg_entry_price * mult)
+
     def gross_exposure(self) -> Decimal:
-        total = Decimal(0)
-        for p in self.positions:
-            if p.market_value is not None:
-                total += abs(p.market_value)
-            else:
-                total += abs(p.quantity * p.avg_entry_price)
-        return total
+        return sum((self._position_notional(p) for p in self.positions), Decimal(0))
 
     def options_exposure(self) -> Decimal:
-        total = Decimal(0)
-        for p in self.positions:
-            if p.asset_class.value == "option":
-                total += abs(p.market_value if p.market_value is not None
-                             else p.quantity * p.avg_entry_price * 100)
-        return total
+        return sum((self._position_notional(p) for p in self.positions
+                    if p.asset_class.value == "option"), Decimal(0))
 
     def record_equity(self, equity: Decimal, at: datetime) -> None:
-        self.equity_history.append((at, equity))
-        # Keep a bounded window (about a month of 1-minute marks).
-        if len(self.equity_history) > 45_000:
-            self.equity_history = self.equity_history[-40_000:]
         if self.peak_equity is None or equity > self.peak_equity:
             self.peak_equity = equity
+        # Ratchet the session troughs down; never up (that is the latch).
+        if self.day_min_equity is None or equity < self.day_min_equity:
+            self.day_min_equity = equity
+        if self.week_min_equity is None or equity < self.week_min_equity:
+            self.week_min_equity = equity
 
     def drawdown_pct(self) -> float:
-        if not self.peak_equity or self.equity is None or self.peak_equity <= 0:
+        # Measured against the day's trough so a mid-session recovery cannot
+        # clear a drawdown halt; the latch resets when the day baseline rolls.
+        trough = self.day_min_equity if self.day_min_equity is not None else self.equity
+        if not self.peak_equity or trough is None or self.peak_equity <= 0:
             return 0.0
-        return float((self.peak_equity - self.equity) / self.peak_equity)
+        return max(0.0, float((self.peak_equity - trough) / self.peak_equity))
 
     def day_loss_pct(self) -> float:
-        if not self.day_start_equity or self.equity is None or self.day_start_equity <= 0:
+        trough = self.day_min_equity if self.day_min_equity is not None else self.equity
+        if not self.day_start_equity or trough is None or self.day_start_equity <= 0:
             return 0.0
-        return max(0.0, float((self.day_start_equity - self.equity) / self.day_start_equity))
+        return max(0.0, float((self.day_start_equity - trough) / self.day_start_equity))
 
     def week_loss_pct(self) -> float:
-        if not self.week_start_equity or self.equity is None or self.week_start_equity <= 0:
+        trough = self.week_min_equity if self.week_min_equity is not None else self.equity
+        if not self.week_start_equity or trough is None or self.week_start_equity <= 0:
             return 0.0
-        return max(0.0, float((self.week_start_equity - self.equity) / self.week_start_equity))
+        return max(0.0, float((self.week_start_equity - trough) / self.week_start_equity))
 
     def snapshot_dict(self) -> dict[str, object]:
         """JSON-safe summary for the dashboard and the AI context."""

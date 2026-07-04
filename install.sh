@@ -62,14 +62,16 @@ fi
 
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYSTEMD_DIR"
-sed "s|ExecStart=.*|ExecStart=$VENV/bin/poseidon run|" \
+sed -e "s|ExecStart=.*|ExecStart=$VENV/bin/poseidon run|" \
+    -e "s|^ReadWritePaths=%h/.local/share/poseidon\$|&\nReadWritePaths=$REPO_DIR|" \
   "$REPO_DIR/packaging/poseidon.service" > "$SYSTEMD_DIR/poseidon.service"
 systemctl --user daemon-reload 2>/dev/null || true
 say "Installed systemd user service (not yet enabled)"
 
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 mkdir -p "$APPS_DIR"
-cp "$REPO_DIR/packaging/poseidon.desktop" "$APPS_DIR/"
+sed "s|^Exec=.*|Exec=$VENV/bin/poseidon app|" \
+  "$REPO_DIR/packaging/poseidon.desktop" > "$APPS_DIR/poseidon.desktop"
 
 # 5. doctor ----------------------------------------------------------------------
 say "Running self-diagnostics"

@@ -14,19 +14,31 @@ Algorithms are *screeners with the same standing as built-in strategies*:
 their signals feed the AI review cycle as candidates — they can never
 place an order directly, so an algorithm bug cannot trade by itself.
 
-Trust model: this executes operator-approved code in-process, exactly
-like an installed plugin. Validation includes a lint-level screen that
-rejects imports/builtins with no business in a screener (os, subprocess,
-open, exec, ...) to catch accidents and force review of pasted code —
-it is a guardrail, not a sandbox. Activation is the trust decision, and
-only the operator can activate (AI-authored algorithms are saved as
-drafts).
+Trust model: two layers. (1) A static lint-level screen (validate_algorithm)
+rejects imports/builtins/indirect-call tricks with no business in a screener
+(os, subprocess, open, exec, __builtins__, subscript-calls, dunder attribute
+access, and format-string field traversal, ...) — friendly, early feedback.
+(2) A *restricted* ``__builtins__`` (curated safe builtins + a guarded
+``__import__`` that admits only pure-computation stdlib modules) blocks the
+obvious filesystem/network/exec primitives at runtime.
+
+These layers stop imports and forbidden-builtin calls, but the in-process
+restricted-builtins sandbox is NOT a complete boundary: attribute/object-graph
+traversal (e.g. via a ``str.format`` template like ``"{0.__class__}"``) can
+still read reachable module globals without importing or calling anything —
+the static screen exists specifically to catch those read/exfil escapes, and
+true isolation would require out-of-process execution. This matters because
+AI-authored drafts can be test-run/backtested by the operator *before*
+activation, so untrusted code runs even before approval. Activation is the
+trust decision for letting an algorithm's signals feed live review cycles,
+and only the operator can activate.
 """
 
 from __future__ import annotations
 
 import ast
 import asyncio
+import string
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -49,10 +61,69 @@ _FORBIDDEN_IMPORTS = {
     "code", "codeop", "runpy",
 }
 _FORBIDDEN_CALLS = {"open", "exec", "eval", "compile", "__import__", "input",
-                    "breakpoint", "exit", "quit", "getattr", "setattr", "globals",
-                    "vars", "memoryview"}
+                    "breakpoint", "exit", "quit", "getattr", "setattr", "delattr",
+                    "globals", "vars", "locals", "memoryview"}
 _ALLOWED_DIRECTIONS = {"long", "short", "exit", "hedge", "income"}
 MAX_SOURCE_BYTES = 64_000
+
+# Runtime sandbox. The static validator is a guardrail; this is the actual
+# security boundary. Algorithm code is exec'd with a curated ``__builtins__``
+# so that even a validator bypass (indirect call, ``__builtins__`` lookup,
+# etc.) cannot reach a filesystem/network/exec primitive. Builtins that can
+# escape the sandbox are removed; imports are routed through a guarded
+# ``__import__`` that only admits pure-computation stdlib modules.
+_UNSAFE_BUILTINS = {
+    "open", "exec", "eval", "compile", "input", "breakpoint", "exit", "quit",
+    "help", "getattr", "setattr", "delattr", "globals", "vars", "locals",
+    "memoryview", "copyright", "credits", "license",
+}
+_SAFE_IMPORT_MODULES = {
+    "math", "statistics", "cmath", "decimal", "fractions", "numbers", "random",
+    "datetime", "itertools", "functools", "collections", "json", "re", "string",
+    "typing", "dataclasses", "enum", "bisect", "heapq", "operator", "textwrap",
+}
+
+
+def _guarded_import(name: str, globals: Any = None, locals: Any = None,  # noqa: A002
+                    fromlist: tuple[str, ...] = (), level: int = 0) -> Any:
+    """The only importer an algorithm sees. Admits pure-computation stdlib
+    modules by an allowlist; everything else (os, socket, importlib, relative
+    imports, ...) raises, so an import can never reach the host."""
+    root = name.split(".")[0]
+    if level != 0 or root not in _SAFE_IMPORT_MODULES:
+        raise ImportError(f"import of '{name}' is not allowed in an algorithm")
+    return __import__(name, globals, locals, fromlist, level)
+
+
+def _safe_builtins() -> dict[str, Any]:
+    import builtins as _builtins
+
+    safe = {
+        name: getattr(_builtins, name)
+        for name in dir(_builtins)
+        if not name.startswith("_") and name not in _UNSAFE_BUILTINS
+    }
+    # ``__build_class__`` is needed for `class` statements; ``__import__`` is
+    # the guarded importer. No other dunders are exposed.
+    safe["__build_class__"] = _builtins.__build_class__
+    safe["__import__"] = _guarded_import
+    return safe
+
+
+def _has_format_traversal(s: str) -> bool:
+    """True if a str.format/format_map template does attribute or index
+    traversal ('{0.__class__}' / '{0[key]}'), reaching an object graph the
+    AST screen cannot see. Benign fields ('{}', '{0}', '{name}', '{x:.2f}')
+    are allowed — only the field_name is inspected, so a dot in a format spec
+    ('{px:.2f}') does not trip it. Malformed templates are ignored (a real
+    str.format on them would raise)."""
+    try:
+        return any(
+            fn is not None and ("." in fn or "[" in fn)
+            for _, fn, _, _ in string.Formatter().parse(s)
+        )
+    except ValueError:
+        return False
 
 
 def validate_algorithm(source: str) -> list[str]:
@@ -99,8 +170,23 @@ def validate_algorithm(source: str) -> list[str]:
             # attribute name itself must not be a forbidden builtin.
             elif isinstance(fn, ast.Attribute) and fn.attr in _FORBIDDEN_CALLS:
                 problems.append(f"call to '.{fn.attr}()' is not allowed in an algorithm")
+            # Indirect call through subscription: ([open][0])(...),
+            # __builtins__['__import__'](...) — a classic validator bypass.
+            elif isinstance(fn, ast.Subscript):
+                problems.append("indirect calls through subscription are not allowed in an algorithm")
         elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
             problems.append(f"dunder attribute access ('{node.attr}') is not allowed")
+        elif isinstance(node, ast.Name) and node.id == "__builtins__":
+            problems.append("access to '__builtins__' is not allowed in an algorithm")
+        # A str.format/format_map template does attribute/index traversal in a
+        # plain string ('{0.__class__.__globals__}'), which the AST screen for
+        # ast.Attribute cannot see — a known validator bypass to module globals.
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and _has_format_traversal(node.value):
+            problems.append(
+                "format-string field access ('{...}.attr' / '{...}[key]') is not "
+                "allowed — it bypasses the sandbox"
+            )
     return sorted(set(problems))
 
 
@@ -174,9 +260,19 @@ class CustomAlgorithm(Strategy):
         problems = validate_algorithm(source)
         if problems:
             raise ValueError("; ".join(problems))
-        namespace: dict[str, Any] = {"__name__": f"poseidon_algo_{algo_name}"}
-        exec(compile(source, f"<algo:{algo_name}>", "exec"), namespace)  # noqa: S102 — operator-approved code, see module docstring
-        self._scan_fn = namespace["scan"]
+        # Restricted builtins are the security boundary: even if the static
+        # validator is bypassed, the exec'd code cannot reach open/exec/eval/
+        # __import__(unsafe) because they are simply absent from this namespace
+        # (see _safe_builtins / _guarded_import).
+        namespace: dict[str, Any] = {
+            "__name__": f"poseidon_algo_{algo_name}",
+            "__builtins__": _safe_builtins(),
+        }
+        exec(compile(source, f"<algo:{algo_name}>", "exec"), namespace)  # noqa: S102 — sandboxed builtins, see module docstring
+        scan_fn = namespace.get("scan")
+        if not callable(scan_fn):
+            raise ValueError("algorithm defines no callable `scan`")
+        self._scan_fn = scan_fn
 
     async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
         ctx = AlgoContext(router=router, portfolio=portfolio, symbols=list(self.symbols),

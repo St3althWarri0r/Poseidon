@@ -6,7 +6,7 @@
 git clone https://github.com/St3althWarri0r/Poseidon && cd Poseidon
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest            # 237 tests, a few seconds
+pytest            # 262 tests, a few seconds
 ruff check src tests
 mypy src          # strict mode
 ```
@@ -77,7 +77,8 @@ grid, tabular numerals in tables/axes.
 
 ## Release / CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs ruff + pytest on 3.11 and
-3.12 and builds the Docker image on every push. Version lives in
+GitHub Actions (`.github/workflows/ci.yml`) runs ruff, mypy (strict), and
+pytest on 3.11 and 3.12 and builds the Docker image on every push. Version
+lives in
 `poseidon/__init__.py` + `pyproject.toml`; the PKGBUILD derives
-`pkgver` from git tags.
+`pkgver` from `pyproject.toml`.

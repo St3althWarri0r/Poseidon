@@ -1,9 +1,13 @@
 """Order manager: the only path from a decision to a broker.
 
 Responsibilities:
-  * translate AI decisions into orders and persist them before submission
-    (crash between persist and submit is reconciled at startup via the
-    broker's client-order-id lookup — never a double submit);
+  * translate AI decisions into orders and persist them before submission;
+    a crash between persist and the broker acknowledging the submit leaves
+    the order in an ambiguous state (APPROVED or ERROR), which
+    resume_open_orders() reconciles at startup against the broker's live
+    open orders (best-effort match on client_order_id/broker_order_id):
+    a match is adopted and polled, a non-match is flagged for operator
+    verification rather than silently dropped or blindly resubmitted;
   * enforce operating mode (research: never submit; approval: human gate;
     autonomous: submit within risk limits);
   * run the risk engine on every order, no exceptions;
@@ -20,10 +24,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from pydantic import ValidationError
 
 from ..analytics.execution import slippage_bps
 from ..brokers.base import Broker
-from ..core.enums import OrderStatus, TimeInForce, TradingMode
+from ..core.enums import AssetClass, BrokerCapability, OrderStatus, TimeInForce, TradingMode
 from ..core.errors import (
     BrokerError,
     CircuitBreakerOpen,
@@ -72,6 +77,11 @@ class OrderManager:
         self._switching = False
         self._drained = asyncio.Event()
         self._drained.set()
+        # Serializes the duplicate-guard → submit critical section. Without it
+        # two pipelines (guardian exit + review cycle, or a manual ticket)
+        # racing on the same symbol can both pass _guard_duplicate before
+        # either reaches the broker, and double-submit a real order.
+        self._submit_lock = asyncio.Lock()
 
     @property
     def mode(self) -> TradingMode:
@@ -141,7 +151,17 @@ class OrderManager:
         (which may be risk-rejected, human-rejected, or submitted)."""
         results: list[Order] = []
         for trade in decision.trades:
-            order = self._trade_to_order(trade, decision)
+            try:
+                order = self._trade_to_order(trade, decision)
+            except ValidationError as exc:
+                # A malformed trade (e.g. non-positive quantity) must not abort
+                # the loop after earlier orders were already submitted.
+                log.error("invalid proposed trade skipped", symbol=trade.symbol,
+                          quantity=str(trade.quantity), error=str(exc))
+                await self._audit.append("system", "order.invalid_trade_skipped",
+                                         {"decision_id": decision.id, "symbol": trade.symbol,
+                                          "reason": str(exc)})
+                continue
             results.append(await self._process_order(order, decision))
         return results
 
@@ -275,44 +295,89 @@ class OrderManager:
         # if a hot swap lands later, this order stays with the brokerage that
         # actually holds it.
         broker = self._broker
-        await self._guard_duplicate(order)
-        # Broker-side preflight (where supported): a definitive broker
-        # rejection is cheaper and cleaner caught here than as a failed
-        # submission. A None result (unsupported/unavailable) changes nothing.
-        preflight_reason = await broker.preflight(order)
-        if preflight_reason is not None:
+        # Capability gate: never hand a broker an order it cannot handle
+        # (e.g. options to the paper simulator, which would book the cost
+        # without the contract multiplier).
+        reason = self._missing_capability(order, broker)
+        if reason is not None:
             order.status = OrderStatus.REJECTED_BROKER
-            order.status_reason = preflight_reason
+            order.status_reason = reason
             await self._persist(order)
-            await self._audit.append("system", "order.preflight_rejected",
-                                     {"order_id": order.id, "reason": preflight_reason})
+            await self._audit.append("system", "order.capability_rejected",
+                                     {"order_id": order.id, "reason": reason})
             await self._bus.publish(Topics.ORDER_REJECTED,
-                                    {"order": order.model_dump(mode="json"),
-                                     "reason": preflight_reason})
+                                    {"order": order.model_dump(mode="json"), "reason": reason})
             return order
-        last_error: Exception | None = None
-        for attempt in range(1, _SUBMIT_RETRIES + 1):
+        # The duplicate guard and the actual broker submission must be atomic
+        # against other concurrent pipelines, or two of them can both clear
+        # the guard and double-submit. Held across retries too (retries are
+        # rare and this is a single-user platform, so serializing submissions
+        # is acceptable and safer than a narrow window).
+        async with self._submit_lock:
             try:
-                order = await broker.submit_order(order)
-                break
-            except BrokerError as exc:
-                last_error = exc
-                self._risk.note_execution_error(str(exc))
-                if not exc.retryable or attempt == _SUBMIT_RETRIES:
-                    order.status = OrderStatus.ERROR if exc.retryable else OrderStatus.REJECTED_BROKER
-                    order.status_reason = str(exc)
-                    await self._persist(order)
-                    await self._audit.append("system", "order.submit_failed",
-                                             {"order_id": order.id, "error": str(exc)})
-                    await self._bus.publish(Topics.ORDER_REJECTED,
-                                            {"order": order.model_dump(mode="json"),
-                                             "reason": str(exc)})
-                    return order
-                await asyncio.sleep(2 ** attempt)
-        else:  # pragma: no cover — loop always breaks or returns
-            raise AssertionError(str(last_error))
+                await self._guard_duplicate(order)
+            except DuplicateOrderError as exc:
+                # Terminal rejection, not an escape: an escaping exception
+                # would leave the row APPROVED forever (blocking broker
+                # switches, tripping restart reconciliation) and abort the
+                # decision's remaining trades.
+                order.status = OrderStatus.REJECTED_RISK
+                order.status_reason = str(exc)
+                await self._persist(order)
+                await self._audit.append("system", "order.duplicate_rejected",
+                                         {"order_id": order.id, "reason": str(exc)})
+                await self._bus.publish(Topics.ORDER_REJECTED,
+                                        {"order": order.model_dump(mode="json"),
+                                         "reason": str(exc)})
+                return order
+            # Broker-side preflight (where supported): a definitive broker
+            # rejection is cheaper and cleaner caught here than as a failed
+            # submission. A None result (unsupported/unavailable) changes nothing.
+            preflight_reason = await broker.preflight(order)
+            if preflight_reason is not None:
+                order.status = OrderStatus.REJECTED_BROKER
+                order.status_reason = preflight_reason
+                await self._persist(order)
+                await self._audit.append("system", "order.preflight_rejected",
+                                         {"order_id": order.id, "reason": preflight_reason})
+                await self._bus.publish(Topics.ORDER_REJECTED,
+                                        {"order": order.model_dump(mode="json"),
+                                         "reason": preflight_reason})
+                return order
+            last_error: Exception | None = None
+            for attempt in range(1, _SUBMIT_RETRIES + 1):
+                try:
+                    order = await broker.submit_order(order)
+                    break
+                except BrokerError as exc:
+                    last_error = exc
+                    self._risk.note_execution_error(str(exc))
+                    ambiguous = getattr(exc, "ambiguous", False)
+                    if ambiguous or not exc.retryable or attempt == _SUBMIT_RETRIES:
+                        if ambiguous:
+                            # Outcome unknown: do NOT resubmit (could double-fill).
+                            # Mark ERROR so startup reconciliation checks the broker.
+                            order.status = OrderStatus.ERROR
+                            order.status_reason = (
+                                f"submit outcome unknown ({exc}); not resubmitted — will be "
+                                "reconciled against the broker, or verify at the brokerage"
+                            )
+                        else:
+                            order.status = OrderStatus.ERROR if exc.retryable else OrderStatus.REJECTED_BROKER
+                            order.status_reason = str(exc)
+                        await self._persist(order)
+                        await self._audit.append("system", "order.submit_failed",
+                                                 {"order_id": order.id, "error": str(exc),
+                                                  "ambiguous": ambiguous})
+                        await self._bus.publish(Topics.ORDER_REJECTED,
+                                                {"order": order.model_dump(mode="json"),
+                                                 "reason": order.status_reason})
+                        return order
+                    await asyncio.sleep(2 ** attempt)
+            else:  # pragma: no cover — loop always breaks or returns
+                raise AssertionError(str(last_error))
 
-        self._risk.note_order_submitted(order.symbol)
+        self._risk.note_order_submitted(order)
         await self._persist(order)
         await self._audit.append("system", "order.submitted", {
             "order_id": order.id, "broker": order.broker,
@@ -345,6 +410,18 @@ class OrderManager:
             # Can't verify → don't trade. Duplicate prevention must not be skipped.
             raise DuplicateOrderError(f"cannot verify open orders at broker: {exc}") from exc
 
+    def _missing_capability(self, order: Order, broker: Broker) -> str | None:
+        caps = broker.capabilities()
+        if order.asset_class is AssetClass.OPTION and BrokerCapability.OPTIONS not in caps:
+            return f"broker '{broker.name}' does not support options orders"
+        if order.asset_class is AssetClass.CRYPTO and BrokerCapability.CRYPTO not in caps:
+            return f"broker '{broker.name}' does not support crypto orders"
+        if order.quantity % 1 != 0 and BrokerCapability.FRACTIONAL_SHARES not in caps:
+            return f"broker '{broker.name}' does not support fractional quantities"
+        if order.extended_hours and BrokerCapability.EXTENDED_HOURS not in caps:
+            return f"broker '{broker.name}' does not support extended-hours orders"
+        return None
+
     # -- lifecycle polling ---------------------------------------------------------------
 
     def _spawn_poller(self, order: Order, broker: Broker) -> None:
@@ -375,7 +452,12 @@ class OrderManager:
                                                   order.avg_fill_price)
             await self._persist(order)
             if order.status.is_terminal:
-                topic = Topics.ORDER_FILLED if order.status is OrderStatus.FILLED else Topics.ORDER_UPDATED
+                # A partial fill that ends CANCELED/EXPIRED is still a fill: a
+                # real position exists, so the guardian must arm its exit plan
+                # (it already arms with filled_quantity) and the operator must
+                # hear about the fill.
+                filled_any = order.status is OrderStatus.FILLED or order.filled_quantity > 0
+                topic = Topics.ORDER_FILLED if filled_any else Topics.ORDER_UPDATED
                 await self._audit.append("system", f"order.{order.status.value}", {
                     "order_id": order.id,
                     "filled_qty": str(order.filled_quantity),
@@ -386,9 +468,48 @@ class OrderManager:
                 return
         log.warning("order poll timed out; leaving order open", order_id=order.id)
 
+    async def stop(self) -> None:
+        """Cancel outstanding order-status pollers at shutdown so they stop
+        calling the broker and writing to the DB before those are closed.
+        Safe: any order left non-terminal gets a fresh poller from
+        resume_open_orders() on the next boot."""
+        tasks = list(self._poll_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def resume_open_orders(self) -> int:
-        """Crash recovery: re-attach pollers to orders that were open at the
-        broker when the process died."""
+        """Crash recovery, in three phases.
+
+        0. Orders still PENDING_APPROVAL are expired: the approval queue is
+           in-memory, so nothing can resolve them after a restart.
+        1. Orders already known open at the broker (SUBMITTED/ACCEPTED/
+           PARTIALLY_FILLED) get a fresh poller.
+        2. Orders left in an ambiguous state (APPROVED, persisted just before
+           submit; ERROR, a submit whose transport outcome is unknown) are
+           reconciled against the broker's live open orders so an order that
+           actually reached the broker before the crash is adopted and polled
+           (its fill then arms the guardian, records slippage, and audits),
+           instead of becoming an untracked live order.
+        """
+        # Phase 0: orders that were awaiting human approval when the process
+        # stopped. The approval queue is purely in-memory, so after a restart
+        # nothing can ever resolve these rows — and they were never submitted
+        # to the broker. Expire them (a stale approval must never execute) so
+        # they don't count as "open" forever and block broker switches.
+        stale = await self._db.fetch_all(
+            "SELECT payload FROM orders WHERE status = ?",
+            (OrderStatus.PENDING_APPROVAL.value,),
+        )
+        for (payload,) in stale:
+            order = Order.model_validate(json.loads(payload))
+            order.status = OrderStatus.REJECTED_HUMAN
+            order.status_reason = "approval request lost in restart — never submitted"
+            await self._persist(order)
+            await self._audit.append("system", "order.approval_lost",
+                                     {"order_id": order.id, "symbol": order.symbol})
+            log.warning("expired stale pending-approval order from before restart",
+                        order_id=order.id, symbol=order.symbol)
         rows = await self._db.fetch_all(
             "SELECT payload FROM orders WHERE status IN (?, ?, ?)",
             (OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
@@ -412,8 +533,64 @@ class OrderManager:
                 continue
             self._spawn_poller(order, self._broker)
             count += 1
+
+        count += await self._reconcile_ambiguous_orders()
         if count:
             log.info("resumed polling for open orders", count=count)
+        return count
+
+    async def _reconcile_ambiguous_orders(self) -> int:
+        """Match APPROVED/ERROR orders (whose submit outcome is unknown after a
+        crash) against the broker's live open orders. A live match is adopted
+        and polled; a non-match is left flagged for manual verification —
+        never assumed filled, never blindly resubmitted."""
+        rows = await self._db.fetch_all(
+            "SELECT payload FROM orders WHERE status IN (?, ?)",
+            (OrderStatus.APPROVED.value, OrderStatus.ERROR.value),
+        )
+        pending = [Order.model_validate(json.loads(p)) for (p,) in rows]
+        mine = [o for o in pending if not o.broker or o.broker == self._broker.name]
+        if not mine:
+            return 0
+        try:
+            live = await self._broker.open_orders()
+        except BrokerError as exc:
+            # Can't verify: leave every ambiguous order flagged so the operator
+            # checks the brokerage rather than trusting a possibly-live order.
+            for order in mine:
+                order.status = OrderStatus.ERROR
+                order.status_reason = (
+                    f"submit state unknown after restart and broker query failed ({exc}) "
+                    "— verify this order at the brokerage directly"
+                )
+                await self._persist(order)
+            return 0
+        by_coid = {o.client_order_id: o for o in live if o.client_order_id}
+        by_boid = {o.broker_order_id: o for o in live if o.broker_order_id}
+        count = 0
+        for order in mine:
+            match = by_coid.get(order.client_order_id)
+            if match is None and order.broker_order_id:
+                match = by_boid.get(order.broker_order_id)
+            if match is not None:
+                # Adopt the broker's view but keep our internal id/decision
+                # linkage so the guardian and attribution still resolve.
+                match.id = order.id
+                match.decision_id = order.decision_id or match.decision_id
+                match.strategy = order.strategy or match.strategy
+                await self._persist(match)
+                self._spawn_poller(match, self._broker)
+                count += 1
+                log.warning("reconciled ambiguous order: found live at broker",
+                            order_id=order.id, broker_order_id=match.broker_order_id)
+            else:
+                order.status = OrderStatus.ERROR
+                order.status_reason = (
+                    "not found among the broker's open orders after restart — it was "
+                    "never submitted or is already terminal; verify at the brokerage"
+                )
+                await self._persist(order)
+                log.warning("ambiguous order not live at broker; flagged", order_id=order.id)
         return count
 
     async def cancel(self, order_id: str) -> Order:
@@ -441,12 +618,16 @@ class OrderManager:
         if order.created_at is None:
             order.created_at = order.updated_at
         payload = json.dumps(order.model_dump(mode="json"))
+        # account_scope is stamped at creation and never updated (like broker),
+        # so a poller persisting after a hot swap can't re-scope an order.
         await self._db.execute(
-            "INSERT INTO orders (id, client_order_id, broker, broker_order_id, payload, status, "
-            "decision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO orders (id, client_order_id, broker, broker_order_id, account_scope, "
+            "payload, status, decision_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, status=excluded.status, "
             "broker_order_id=excluded.broker_order_id, updated_at=excluded.updated_at",
-            (order.id, order.client_order_id, order.broker, order.broker_order_id, payload,
+            (order.id, order.client_order_id, order.broker, order.broker_order_id,
+             self._broker.account_scope, payload,
              order.status.value, order.decision_id,
              order.created_at.isoformat(), order.updated_at.isoformat()),
         )

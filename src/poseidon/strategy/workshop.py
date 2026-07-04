@@ -122,6 +122,19 @@ class AlgorithmWorkshop:
             record["params"] = params
         if review_notes is not None:
             record["review_notes"] = review_notes
+        # Fail fast on a live edit: compile/exec the new source BEFORE
+        # persisting so a broken edit (a module-level error that passes the
+        # AST screen but raises at exec) leaves the running old source intact
+        # rather than storing unrunnable source still marked 'active'.
+        if source is not None and record["status"] == "active":
+            try:
+                CustomAlgorithm(
+                    algo_name=record["name"], source=record["source"],
+                    symbols=record["symbols"] or self._default_symbols,
+                    options=record["params"],
+                )
+            except Exception as exc:
+                raise ConfigError(f"edited algorithm does not compile/run: {exc}") from exc
         await self._db.execute(
             "UPDATE algorithms SET description=?, source=?, symbols=?, params=?, "
             "review_notes=?, sleeve_pct=?, updated_at=? WHERE id=?",
@@ -324,7 +337,9 @@ class AlgorithmWorkshop:
                     symbols=record["symbols"] or self._default_symbols,
                     options=record["params"],
                 )
-            except (ValueError, KeyError) as exc:
+            except Exception as exc:
+                # Any failure (validation, compile, or exec-time) demotes to
+                # draft rather than blocking boot — the platform must come up.
                 log.error("active algorithm failed to compile; demoted to draft",
                           name=record["name"], error=str(exc))
                 await self._set_status(record["id"], "draft")

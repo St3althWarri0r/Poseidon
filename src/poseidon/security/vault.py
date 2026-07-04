@@ -5,7 +5,7 @@ passwords, webhook tokens) live in a single encrypted file:
 
     <data_dir>/vault.bin
 
-Format: 16-byte magic+version header, 16-byte random salt, then a Fernet
+Format: 19-byte magic+version header (11-byte magic, 1-byte version, 7 zero-pad bytes), 16-byte random salt, then a Fernet
 token (AES-128-CBC + HMAC-SHA256) whose key is derived from the user's
 passphrase with scrypt (n=2**15, r=8, p=1). Plaintext secrets never touch
 disk; the decrypted mapping is held only in process memory while unlocked.
@@ -31,7 +31,7 @@ from ..core.errors import VaultError, VaultLockedError
 
 _MAGIC = b"POSEIDONVLT"
 _VERSION = b"\x01"
-_HEADER = _MAGIC + _VERSION + b"\x00" * 7  # pad header to 16 bytes
+_HEADER = _MAGIC + _VERSION + b"\x00" * 7  # 19-byte header: 11-byte magic + 1-byte version + 7 zero pad
 _SALT_LEN = 16
 _SCRYPT_N = 2**15
 _SCRYPT_R = 8
@@ -165,6 +165,25 @@ class Vault:
         token = Fernet(self._key).encrypt(json.dumps(self._secrets).encode("utf-8"))
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
-        tmp.write_bytes(_HEADER + self._salt + token)
-        tmp.chmod(0o600)
+        # Create the temp file 0600 from the start (O_CREAT mode), not via a
+        # post-hoc chmod — the latter leaves a brief umask-wide (often 0644)
+        # window where another local user could read it. O_TRUNC also clears any
+        # orphan .tmp left by a crashed prior write.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(_HEADER + self._salt + token)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         tmp.replace(self._path)  # atomic on POSIX
+        # Durability: fsync the parent directory so the rename itself survives
+        # a power loss; without this the directory may still reference the old
+        # vault inode after a crash even though the data above was fsynced.
+        dfd = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)

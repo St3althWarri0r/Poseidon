@@ -13,7 +13,7 @@ from typing import Any
 from ...core.enums import OptionRight
 from ...core.errors import ProviderError
 from ...core.models import Bar, Greeks, NewsArticle, OptionChain, OptionContract, Quote
-from ..base import DataCapability, MarketDataProvider
+from ..base import DataCapability, MarketDataProvider, bar_end
 
 _BASE = "https://api.polygon.io"
 
@@ -40,7 +40,9 @@ class PolygonProvider(MarketDataProvider):
         results = payload.get("results")
         if not results:
             raise ProviderError(self.name, f"no NBBO for {symbol}")
-        as_of = self._ts_from_epoch(results.get("t"), nanos=True) or self._now()
+        as_of = self._ts_from_epoch(results.get("t"), nanos=True)
+        if as_of is None:
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
         return Quote(
             symbol=symbol,
             bid=Decimal(str(results["p"])) if results.get("p") is not None else None,
@@ -63,18 +65,24 @@ class PolygonProvider(MarketDataProvider):
         )
         bars: list[Bar] = []
         for row in payload.get("results", []) or []:
-            start_ts = self._ts_from_epoch(row["t"], millis=True)
-            assert start_ts is not None
-            bars.append(
-                Bar(
-                    symbol=symbol.upper(),
-                    open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
-                    low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
-                    volume=int(row.get("v", 0)),
-                    start=start_ts, end=start_ts, source=self.name,
+            try:
+                start_ts = self._ts_from_epoch(row.get("t"), millis=True)
+                if start_ts is None:
+                    continue
+                bars.append(
+                    Bar(
+                        symbol=symbol.upper(),
+                        open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
+                        low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
+                        volume=int(row.get("v", 0)),
+                        start=start_ts, end=bar_end(start_ts, timeframe), source=self.name,
+                    )
                 )
-            )
+            except (KeyError, ValueError, TypeError):
+                continue
         bars.reverse()  # chronological
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None) -> OptionChain:
@@ -84,7 +92,6 @@ class PolygonProvider(MarketDataProvider):
         payload = await self._get(f"/v3/snapshot/options/{underlying.upper()}", **params)
         contracts: list[OptionContract] = []
         expirations: set[date] = set()
-        now = self._now()
         for row in payload.get("results", []) or []:
             details = row.get("details", {})
             quote_block = row.get("last_quote", {}) or {}
@@ -94,6 +101,13 @@ class PolygonProvider(MarketDataProvider):
                 exp = date.fromisoformat(details["expiration_date"])
                 right = OptionRight.CALL if details["contract_type"] == "call" else OptionRight.PUT
             except (KeyError, ValueError):
+                continue
+            # Real per-contract quote time so a frozen/stale chain can be
+            # graded and rejected — never receipt time (free-tier snapshots
+            # omit last_quote entirely; stamping `now` would grade a frozen
+            # chain REAL_TIME at the router).
+            ts = self._ts_from_epoch(quote_block.get("last_updated"), nanos=True)
+            if ts is None:
                 continue
             expirations.add(exp)
             contracts.append(
@@ -112,15 +126,20 @@ class PolygonProvider(MarketDataProvider):
                         theta=greeks_block.get("theta"), vega=greeks_block.get("vega"),
                         implied_volatility=row.get("implied_volatility"),
                     ),
-                    as_of=now,
+                    as_of=ts,
                     source=self.name,
                 )
             )
         if not contracts:
-            raise ProviderError(self.name, f"empty option chain for {underlying}")
+            raise ProviderError(
+                self.name, f"option chain for {underlying} has no contracts with quote timestamps"
+            )
+        # Conservative chain age = the OLDEST contract quote, so the router's
+        # freshness gate fires on any stale strike.
+        chain_as_of = min(c.as_of for c in contracts)
         return OptionChain(
             underlying=underlying.upper(), expirations=sorted(expirations),
-            contracts=contracts, as_of=now, source=self.name,
+            contracts=contracts, as_of=chain_as_of, source=self.name,
         )
 
     async def news(self, symbols: list[str] | None = None, *, limit: int = 25) -> list[NewsArticle]:

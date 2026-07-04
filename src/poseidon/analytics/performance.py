@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -30,6 +30,7 @@ class FillRecord:
     price: Decimal
     at: datetime
     strategy: str = ""
+    multiplier: Decimal = Decimal(1)  # OCC contract multiplier (100 for options)
 
 
 @dataclass
@@ -37,20 +38,24 @@ class RoundTrip:
     symbol: str
     strategy: str
     quantity: Decimal
-    entry_price: Decimal
-    exit_price: Decimal
+    entry_price: Decimal  # the opening price (buy for longs, sell for shorts)
+    exit_price: Decimal   # the closing price (sell for longs, cover-buy for shorts)
     entered_at: datetime
     exited_at: datetime
+    is_short: bool = False
+    multiplier: Decimal = Decimal(1)
 
     @property
     def pnl(self) -> Decimal:
-        return (self.exit_price - self.entry_price) * self.quantity
+        gross = (self.exit_price - self.entry_price) * self.quantity * self.multiplier
+        return -gross if self.is_short else gross
 
     @property
     def return_pct(self) -> float:
         if self.entry_price <= 0:
             return 0.0
-        return float((self.exit_price - self.entry_price) / self.entry_price)
+        raw = float((self.exit_price - self.entry_price) / self.entry_price)
+        return -raw if self.is_short else raw
 
     @property
     def holding_days(self) -> float:
@@ -58,33 +63,44 @@ class RoundTrip:
 
 
 def build_round_trips(fills: list[FillRecord]) -> list[RoundTrip]:
-    """FIFO-match sells against prior buys per symbol. Partial fills split
-    lots; sells without a matching open lot (external/imported positions)
-    are skipped rather than guessed at."""
-    open_lots: dict[str, deque[FillRecord]] = defaultdict(deque)
+    """FIFO-match closes against prior opens per symbol, keeping SEPARATE long
+    and short lot queues so a cover-buy (BUY_TO_CLOSE) closes a short instead of
+    opening a phantom long, and a short entry (SELL_TO_OPEN) is not dropped.
+    Partial fills split lots; a close with no matching open lot (external/
+    imported position) is skipped rather than guessed at."""
+    long_lots: dict[str, deque[FillRecord]] = defaultdict(deque)
+    short_lots: dict[str, deque[FillRecord]] = defaultdict(deque)
     trips: list[RoundTrip] = []
-    for f in sorted(fills, key=lambda x: x.at):
-        symbol = f.symbol.upper()
-        if f.side.is_buy:
-            open_lots[symbol].append(
-                FillRecord(symbol=symbol, side=f.side, quantity=f.quantity,
-                           price=f.price, at=f.at, strategy=f.strategy)
-            )
-            continue
+
+    def _match(lots: deque[FillRecord], f: FillRecord, symbol: str, *, is_short: bool) -> None:
         remaining = f.quantity
-        lots = open_lots[symbol]
         while remaining > 0 and lots:
             lot = lots[0]
             matched = min(lot.quantity, remaining)
             trips.append(
                 RoundTrip(symbol=symbol, strategy=lot.strategy or f.strategy,
                           quantity=matched, entry_price=lot.price, exit_price=f.price,
-                          entered_at=lot.at, exited_at=f.at)
+                          entered_at=lot.at, exited_at=f.at, is_short=is_short,
+                          multiplier=lot.multiplier)
             )
             lot.quantity -= matched
             remaining -= matched
             if lot.quantity <= 0:
                 lots.popleft()
+
+    for f in sorted(fills, key=lambda x: x.at):
+        symbol = f.symbol.upper()
+        lot = FillRecord(symbol=symbol, side=f.side, quantity=f.quantity,
+                         price=f.price, at=f.at, strategy=f.strategy,
+                         multiplier=f.multiplier)
+        if f.side in (OrderSide.BUY, OrderSide.BUY_TO_OPEN):
+            long_lots[symbol].append(lot)
+        elif f.side is OrderSide.SELL_TO_OPEN:
+            short_lots[symbol].append(lot)
+        elif f.side is OrderSide.BUY_TO_CLOSE:
+            _match(short_lots[symbol], f, symbol, is_short=True)
+        else:  # SELL / SELL_TO_CLOSE close a long
+            _match(long_lots[symbol], f, symbol, is_short=False)
     return trips
 
 
@@ -134,9 +150,13 @@ class PerformanceReport:
 
 
 def _daily_closes(equity_points: list[tuple[datetime, float]]) -> list[tuple[str, float]]:
-    """Collapse intraday marks to one close per calendar day (last mark wins)."""
+    """Collapse intraday marks to one close per calendar day (last mark wins).
+    Weekend marks are skipped: the sync loop records flat equity 24/7, and
+    flat non-trading days would dilute the TRADING_DAYS-annualized stats."""
     by_day: dict[str, float] = {}
     for at, equity in sorted(equity_points, key=lambda x: x[0]):
+        if at.date().weekday() >= 5:
+            continue
         by_day[at.date().isoformat()] = equity
     return sorted(by_day.items())
 
@@ -150,10 +170,10 @@ def compute_performance(equity_points: list[tuple[datetime, float]],
     if len(closes) >= 2 and closes[0][1] > 0:
         values = [v for _, v in closes]
         report.total_return = values[-1] / values[0] - 1
-        days = max(len(values) - 1, 1)
-        years = days / TRADING_DAYS
-        if years > 0 and values[-1] > 0:
-            report.cagr = (values[-1] / values[0]) ** (1 / max(years, 1 / TRADING_DAYS)) - 1
+        span_days = (date.fromisoformat(closes[-1][0]) - date.fromisoformat(closes[0][0])).days
+        years = max(span_days, 1) / 365.25
+        if values[-1] > 0:
+            report.cagr = (values[-1] / values[0]) ** (1 / years) - 1
         rets = [values[i] / values[i - 1] - 1 for i in range(1, len(values)) if values[i - 1] > 0]
         if len(rets) >= 2:
             mean = sum(rets) / len(rets)
@@ -165,7 +185,11 @@ def compute_performance(equity_points: list[tuple[datetime, float]],
                 report.sharpe = (mean - rf_daily) / std * TRADING_DAYS ** 0.5
             downside = [r for r in rets if r < rf_daily]
             if downside:
-                dvar = sum((r - rf_daily) ** 2 for r in downside) / len(downside)
+                # Target-downside-deviation (Sortino's definition): divide the
+                # squared shortfalls by the TOTAL sample (up days count as zero
+                # shortfall), matching the (n-1) convention used for Sharpe/vol
+                # above — NOT by the count of down days, which inflates it.
+                dvar = sum((r - rf_daily) ** 2 for r in downside) / (len(rets) - 1)
                 dstd = dvar ** 0.5
                 if dstd > 0:
                     report.sortino = (mean - rf_daily) / dstd * TRADING_DAYS ** 0.5

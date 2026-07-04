@@ -33,7 +33,7 @@ class _WatchBase(Strategy):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction=self.direction,
-                        strength=min(off_high / (dip * 3), 1.0),
+                        strength=min(off_high / (max(dip, 1e-9) * 3), 1.0),
                         evidence={
                             "off_52w_high_pct": round(off_high, 3),
                             "close": closes[-1],

@@ -86,6 +86,12 @@ class ClaudeAgent:
         """Shared API client (also used by the algorithm reviewer)."""
         return self._client
 
+    def last_cycle_usage(self) -> dict[str, int]:
+        """Tokens accumulated during the most recent cycle — readable even when
+        the cycle aborted before producing a Decision, so already-billed usage
+        can still be metered against the monthly budget."""
+        return dict(self._cycle_usage)
+
     async def run_cycle(self, *, mode: TradingMode, watchlist: list[str],
                         enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
                         market_session: str, market_regime: str | None = None) -> Decision:
@@ -213,21 +219,29 @@ class ClaudeAgent:
         return Decision(
             action=DecisionAction.NO_ACTION, trades=[], rationale=None,
             data_sources=sorted(self._dispatcher.sources_used),
+            summary=reason,
             model=self._config.model, cycle_id=cycle_id,
             usage=dict(self._cycle_usage), created_at=datetime.now(UTC),
         )
 
     def _parse_decision(self, payload: dict[str, Any], cycle_id: str, model: str) -> Decision:
         trades: list[ProposedTrade] = []
+        malformed = False
         for t in payload.get("trades", []) or []:
             try:
+                quantity = Decimal(str(t["quantity"]))
+                if not quantity.is_finite() or quantity <= 0:
+                    # Decimal() parses '0', '-5', 'NaN', 'Infinity' without
+                    # error; caught here they can't reach execute_decision and
+                    # crash it mid-loop after earlier orders were submitted.
+                    raise ValueError(f"trade quantity must be positive and finite, got {quantity}")
                 trades.append(
                     ProposedTrade(
                         symbol=str(t["symbol"]).upper(),
                         asset_class=AssetClass(t.get("asset_class", "equity")),
                         side=OrderSide(t["side"]),
                         order_type=OrderType(t.get("order_type", "limit")),
-                        quantity=Decimal(str(t["quantity"])),
+                        quantity=quantity,
                         limit_price=Decimal(str(t["limit_price"])) if t.get("limit_price") else None,
                         stop_price=Decimal(str(t["stop_price"])) if t.get("stop_price") else None,
                         time_in_force=TimeInForce(t.get("time_in_force", "day")),
@@ -237,7 +251,14 @@ class ClaudeAgent:
                     )
                 )
             except (KeyError, ValueError, InvalidOperation) as exc:
+                malformed = True
                 log.error("dropping malformed trade from decision", trade=t, error=str(exc))
+        if malformed and trades:
+            # Trades in one decision can be coupled (hedge legs, rebalance
+            # sell+buy); executing a partial set the model never intended is
+            # worse than no action. Mirror the missing-rationale voiding below.
+            log.error("decision contained a malformed trade — voiding all trades", cycle=cycle_id)
+            trades = []
         rationale: TradeRationale | None = None
         raw_rationale = payload.get("rationale")
         if raw_rationale:

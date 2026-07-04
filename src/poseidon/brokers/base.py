@@ -21,6 +21,7 @@ to unsupported automation (see docs/broker-setup.md).
 from __future__ import annotations
 
 import abc
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ from ..core.models import (
     Order,
     Position,
     TaxLot,
+    Transfer,
 )
 
 
@@ -44,6 +46,9 @@ class Broker(abc.ABC):
     name: str = ""
     #: human-readable label for docs and dashboard
     display_name: str = ""
+    #: set by connect() when the broker rotated a single-use credential (e.g.
+    #: tastytrade remember tokens); the kernel re-persists the vault.
+    rotated_credentials: dict[str, str] | None = None
 
     def __init__(self, *, credentials: dict[str, str], paper: bool = True,
                  timeout: float = 15.0, options: dict[str, Any] | None = None) -> None:
@@ -105,6 +110,13 @@ class Broker(abc.ABC):
     async def dividends(self, *, limit: int = 50) -> list[Dividend]:
         return []
 
+    async def transfers(self, *, since: datetime) -> list[Transfer]:
+        """Optional: external cash flows (deposits/withdrawals/journals)
+        strictly after ``since``, signed positive into the account. Brokers
+        whose API exposes account activities override this; the sync service
+        re-anchors the loss/drawdown baselines by the net flow."""
+        return []
+
     # -- orders ----------------------------------------------------------------------
 
     async def preflight(self, order: Order) -> str | None:
@@ -137,22 +149,48 @@ class Broker(abc.ABC):
 
     async def _request(self, method: str, url: str, *, headers: dict[str, str] | None = None,
                        params: dict[str, Any] | None = None, json_body: Any | None = None,
-                       data: dict[str, Any] | None = None) -> Any:
+                       data: dict[str, Any] | None = None, idempotent: bool = True) -> Any:
+        """``idempotent`` must be False for state-changing calls (order submit)
+        on brokers without a server-enforced idempotency key: a timeout after
+        the request was sent then has an UNKNOWN outcome and must not be
+        auto-retried (that could double-fill). Such failures are raised as
+        ambiguous, non-retryable BrokerErrors."""
         try:
             response = await self._client.request(
                 method, url, headers=headers, params=params, json=json_body, data=data
             )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Never established a connection: the request did not reach the
+            # broker, so retrying is safe even for non-idempotent calls.
+            raise BrokerError(self.name, f"could not connect: {exc}", retryable=True) from exc
         except httpx.TimeoutException as exc:
-            raise BrokerError(self.name, f"timeout: {exc}") from exc
+            raise BrokerError(self.name, f"timeout: {exc}",
+                              retryable=idempotent, ambiguous=not idempotent) from exc
         except httpx.HTTPError as exc:
-            raise BrokerError(self.name, f"transport error: {exc}") from exc
-        if response.status_code in (401, 403):
+            raise BrokerError(self.name, f"transport error: {exc}",
+                              retryable=idempotent, ambiguous=not idempotent) from exc
+        if response.status_code == 401:
             raise BrokerAuthError(self.name)
+        # 403 is deliberately NOT an auth failure: brokers use it for trade
+        # permission rejections (e.g. Alpaca 40310000 "insufficient buying
+        # power"), which must surface with the response body via the generic
+        # branch below. Plugins whose APIs signal expired tokens with 403 can
+        # translate locally.
         if response.status_code >= 400:
+            # A 5xx on a non-idempotent call has an UNKNOWN outcome: a 502/504
+            # (or a 500 emitted mid-processing) can arrive after the broker
+            # accepted the order, so treat it like a post-send timeout
+            # (ambiguous, never auto-resubmitted). 429 stays retryable — a
+            # rate-limited request was not executed.
+            if response.status_code >= 500:
+                retryable, ambiguous = idempotent, not idempotent
+            else:
+                retryable, ambiguous = response.status_code == 429, False
             raise BrokerError(
                 self.name,
                 f"HTTP {response.status_code} {method} {url}: {response.text[:300]}",
-                retryable=response.status_code >= 500 or response.status_code == 429,
+                retryable=retryable,
+                ambiguous=ambiguous,
             )
         if response.status_code == 204 or not response.content:
             return None

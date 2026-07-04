@@ -83,7 +83,7 @@ def open_window(url: str) -> int:
     return 0
 
 
-def launch(url: str) -> int:
+def launch(url: str, token: str | None = None) -> int:
     """The `poseidon app` entry point: ensure the engine is up, open the window."""
     if not engine_running(url):
         print("Poseidon engine is not running — trying the systemd user service…")
@@ -102,4 +102,8 @@ def launch(url: str) -> int:
             " passphrase as a systemd credential — see docs/security.md.)"
         )
         return 1
+    if token:
+        from urllib.parse import quote
+
+        url = f"{url}/?token={quote(token, safe='')}"
     return open_window(url)

@@ -199,11 +199,15 @@ class PublicDataProvider(MarketDataProvider):
                         open=Decimal(str(row["open"])), high=Decimal(str(row["high"])),
                         low=Decimal(str(row["low"])), close=Decimal(str(row["close"])),
                         volume=int(float(row.get("volume", 0))),
+                        # Public reports the session-close instant (20:00Z for
+                        # daily bars), so start already marks the bar end.
                         start=start, end=start, source=self.name,
                     )
                 )
             except (KeyError, ValueError):
                 continue
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars
 
     # -- options ---------------------------------------------------------------
@@ -226,26 +230,33 @@ class PublicDataProvider(MarketDataProvider):
             json_body={"instrument": instrument, "expirationDate": expiration.isoformat()},
             headers=headers,
         ) or {}
-        now = self._now()
         contracts: list[OptionContract] = []
         for right, key in ((OptionRight.CALL, "calls"), (OptionRight.PUT, "puts")):
             for q in payload.get(key) or []:
-                contract = self._contract(q, underlying, right, expiration, now)
+                contract = self._contract(q, underlying, right, expiration)
                 if contract is not None:
                     contracts.append(contract)
         if not contracts:
             raise ProviderError(self.name, f"empty option chain for {underlying} {expiration}")
+        # Contracts carry real per-quote timestamps; grade the chain by its
+        # oldest strike so a frozen feed is rejected upstream.
+        chain_as_of = min(c.as_of for c in contracts)
         return OptionChain(
             underlying=underlying.upper(), expirations=[expiration],
-            contracts=contracts, as_of=now, source=self.name,
+            contracts=contracts, as_of=chain_as_of, source=self.name,
         )
 
     def _contract(self, q: dict[str, Any], underlying: str, right: OptionRight,
-                  expiration: date, now: datetime) -> OptionContract | None:
+                  expiration: date) -> OptionContract | None:
         details = q.get("optionDetails") or {}
         strike = _dec(details.get("strikePrice"))
         symbol = (q.get("instrument") or {}).get("symbol")
         if not symbol or strike is None or q.get("outcome") != "SUCCESS":
+            return None
+        # No verifiable quote time -> no contract; a fabricated as_of would
+        # let a frozen chain pass the router's staleness gate.
+        ts = _ts(q.get("lastTimestamp"))
+        if ts is None:
             return None
         greeks_block = details.get("greeks") or {}
         greeks = Greeks(
@@ -260,5 +271,5 @@ class PublicDataProvider(MarketDataProvider):
             bid=_dec(q.get("bid")), ask=_dec(q.get("ask")), last=_dec(q.get("last")),
             volume=q.get("volume"), open_interest=q.get("openInterest"),
             greeks=greeks,
-            as_of=_ts(q.get("lastTimestamp")) or now, source=self.name,
+            as_of=ts, source=self.name,
         )

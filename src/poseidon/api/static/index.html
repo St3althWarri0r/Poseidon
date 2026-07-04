@@ -216,6 +216,19 @@
           <p class="meter-note" id="bf-notes"></p>
           <p class="meter-note warn-note" id="bf-cost" hidden></p>
           <div id="bf-fields"></div>
+          <div id="bf-oauth" hidden>
+            <p class="meter-note">No refresh token yet? Log in with your brokerage to get one — the app key and secret above are used to start the flow.</p>
+            <div class="ticket-actions">
+              <button type="button" class="btn" id="bf-oauth-login">Log in with Schwab →</button>
+            </div>
+            <div class="form-row"><label class="wide">Paste the redirect URL after logging in
+              <input id="bf-oauth-redirect" type="text" autocomplete="off"
+                placeholder="https://127.0.0.1:8182/?code=…">
+              <small>After you approve access, your browser lands on a “can’t connect” page — copy that full URL here.</small></label></div>
+            <div class="ticket-actions">
+              <button type="button" class="btn btn-ghost" id="bf-oauth-exchange">Get refresh token</button>
+            </div>
+          </div>
           <div id="bf-options"></div>
           <div class="form-row" id="bf-paper-row">
             <label class="check"><input type="checkbox" id="bf-paper" checked> Paper / sandbox environment</label>

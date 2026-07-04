@@ -15,7 +15,7 @@ Contract for implementers:
 from __future__ import annotations
 
 import abc
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -23,6 +23,21 @@ import httpx
 
 from ..core.errors import ProviderAuthError, ProviderError, ProviderRateLimitError
 from ..core.models import Bar, EarningsEvent, EconomicEvent, NewsArticle, OptionChain, Quote
+
+_BAR_DURATIONS: dict[str, timedelta] = {
+    "1m": timedelta(minutes=1),
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "1d": timedelta(days=1),
+    "1w": timedelta(weeks=1),
+}
+
+
+def bar_end(start: datetime, timeframe: str) -> datetime:
+    """Nominal end of a bar opening at ``start``. Upstream APIs report only
+    the bar-open timestamp; providers derive ``Bar.end`` from it."""
+    return start + _BAR_DURATIONS.get(timeframe, timedelta(0))
 
 
 class DataCapability(StrEnum):
@@ -105,14 +120,38 @@ class MarketDataProvider(abc.ABC):
         if response.status_code in (401, 403):
             raise ProviderAuthError(self.name)
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            raise ProviderRateLimitError(self.name, float(retry_after) if retry_after else None)
+            raise ProviderRateLimitError(
+                self.name, self._parse_retry_after(response.headers.get("Retry-After"))
+            )
         if response.status_code >= 400:
             raise ProviderError(self.name, f"HTTP {response.status_code}: {response.text[:300]}")
         try:
             return response.json()
         except ValueError as exc:
             raise ProviderError(self.name, "invalid JSON in response") from exc
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> float | None:
+        """Retry-After is either delta-seconds or an HTTP-date (RFC 9110).
+        Returns seconds-to-wait, or None if absent/unparseable — guaranteeing
+        the 429 path only ever raises a ProviderError (so the router fails
+        over) instead of a raw ValueError from float() on a date string."""
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0.0, (dt - datetime.now(UTC)).total_seconds())
 
     @staticmethod
     def _now() -> datetime:

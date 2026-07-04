@@ -72,7 +72,24 @@ def cmd_app(args: argparse.Namespace) -> int:
     config = _load(args)
     from .gui import launch
 
-    return launch(f"http://{config.dashboard.host}:{config.dashboard.port}")
+    host = config.dashboard.host
+    if host in ("0.0.0.0", "::"):  # wildcard bind — connect via loopback
+        host = "127.0.0.1"
+    elif ":" in host:  # bare IPv6 literal (e.g. ::1) must be bracketed in a URL
+        host = f"[{host}]"
+
+    from .core.config import dashboard_token_from_env
+
+    token = dashboard_token_from_env()
+    if token is None and config.dashboard.auth_token_credential:
+        vault = _vault_for(config)
+        if not vault.exists:
+            print("The dashboard requires an auth token but no vault exists. "
+                  "Run `poseidon vault init` first.", file=sys.stderr)
+            return 2
+        _unlock(vault, interactive_ok=sys.stdin.isatty())
+        token = vault.get(config.dashboard.auth_token_credential)
+    return launch(f"http://{host}:{config.dashboard.port}", token=token)
 
 
 def cmd_cycle(args: argparse.Namespace) -> int:
@@ -207,7 +224,16 @@ def cmd_config(args: argparse.Namespace) -> int:
               f"strategies={len([s for s in config.strategies if s.enabled])}")
         return 0
     if args.config_action == "example":
-        example = Path(__file__).resolve().parents[2] / "config" / "poseidon.example.yaml"
+        # Packaged inside poseidon for installed builds (wheel force-include),
+        # or the repo-root config/ for a source/editable checkout (same
+        # resolution as app.py's bundled example algorithms).
+        example = Path(__file__).resolve().parent / "config" / "poseidon.example.yaml"
+        if not example.is_file():
+            example = Path(__file__).resolve().parents[2] / "config" / "poseidon.example.yaml"
+        if not example.is_file():
+            print("starter config not found in this installation; "
+                  "see docs/configuration.md for a template", file=sys.stderr)
+            return 2
         target = default_config_dir() / "poseidon.yaml"
         if target.exists():
             print(f"{target} already exists; not overwriting.", file=sys.stderr)
@@ -253,6 +279,10 @@ def cmd_update(args: argparse.Namespace) -> int:
         from .updater import UpdateService
 
         service = UpdateService(config.updates, EventBus())
+        if not service.is_git_checkout:
+            print("Self-update requires a git checkout (git clone + pip install -e .); "
+                  "this installation is not one.", file=sys.stderr)
+            return 2
         if args.update_action == "check":
             remote = await service.check_once()
             print(f"Update available: {remote[:12]}" if remote else "Up to date.")

@@ -81,7 +81,7 @@ class CoveredCallStrategy(_OptionsStrategyBase):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction="income",
-                        strength=min(y / (min_yield * 3), 1.0),
+                        strength=min(y / (max(min_yield, 1e-9) * 3), 1.0),
                         evidence={
                             "contract": c.symbol, "strike": str(c.strike),
                             "expiration": c.expiration.isoformat(), "dte": _dte(c),
@@ -123,7 +123,7 @@ class CashSecuredPutStrategy(_OptionsStrategyBase):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction="income",
-                        strength=min(y / (min_yield * 3), 1.0),
+                        strength=min(y / (max(min_yield, 1e-9) * 3), 1.0),
                         evidence={
                             "contract": c.symbol, "strike": str(c.strike),
                             "expiration": c.expiration.isoformat(), "dte": _dte(c),
@@ -188,7 +188,7 @@ class ProtectivePutStrategy(_OptionsStrategyBase):
             signals.append(
                 Signal(
                     strategy=self.name, symbol=symbol, direction="hedge",
-                    strength=min(value / equity / (threshold * 2), 1.0),
+                    strength=min(value / equity / (max(threshold, 1e-9) * 2), 1.0),
                     evidence={
                         "position_pct_of_equity": round(value / equity, 3),
                         "contract": best.symbol, "strike": str(best.strike),
@@ -236,7 +236,7 @@ class VerticalSpreadStrategy(_OptionsStrategyBase):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction="income",
-                        strength=min(credit / width / (min_credit_ratio * 2), 1.0),
+                        strength=min(credit / width / (max(min_credit_ratio, 1e-9) * 2), 1.0),
                         evidence={
                             "structure": "bull_put_spread", "expiration": exp,
                             "short_leg": short.symbol, "long_leg": long.symbol,

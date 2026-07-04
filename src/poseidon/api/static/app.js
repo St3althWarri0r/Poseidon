@@ -1268,6 +1268,15 @@ function selectBroker(name) {
     + (saved && (b.fields || []).length
         ? '<p class="meter-note">A credential for this broker is already in the vault — leave every field blank to reuse it, or fill them all to replace it.</p>'
         : "");
+  // In-app OAuth login (Schwab): the "Log in with…" button opens the
+  // brokerage login page and the returned code is exchanged for a refresh
+  // token that fills the credential fields above.
+  const oauth = $("#bf-oauth");
+  oauth.hidden = !b.oauth;
+  if (b.oauth) {
+    $("#bf-oauth-login").textContent = "Log in with " + b.display_name + " →";
+    $("#bf-oauth-redirect").value = "";
+  }
   const paperRow = $("#bf-paper-row");
   const paperBox = $("#bf-paper");
   if (b.paper_choice === "toggle") { paperRow.hidden = false; paperBox.checked = true; paperBox.disabled = false; }
@@ -1275,6 +1284,38 @@ function selectBroker(name) {
   else { paperRow.hidden = true; paperBox.checked = false; paperBox.disabled = true; }
   updateLiveWarning();
 }
+
+function _credInput(key) {
+  return $(`#bf-fields [data-cred="${key}"]`);
+}
+
+// Step 1 of OAuth: open the brokerage login screen for the entered app key.
+$("#bf-oauth-login").addEventListener("click", async () => {
+  const appKey = (_credInput("app_key")?.value || "").trim();
+  if (!appKey) { toast("Enter the app key first", "bad"); return; }
+  try {
+    const res = await postJSON("/api/brokers/schwab/authorize-url", { app_key: appKey });
+    window.open(res.url, "_blank", "noopener");
+    toast("Opened the login page in a new tab", "good");
+  } catch (e) { toast("Could not build the login URL: " + e.message, "bad"); }
+});
+
+// Step 2 of OAuth: exchange the pasted redirect URL for a refresh token.
+$("#bf-oauth-exchange").addEventListener("click", async () => {
+  const appKey = (_credInput("app_key")?.value || "").trim();
+  const appSecret = (_credInput("app_secret")?.value || "").trim();
+  const pasted = ($("#bf-oauth-redirect").value || "").trim();
+  if (!appKey || !appSecret || !pasted) {
+    toast("Need the app key, app secret, and the pasted redirect URL", "bad"); return;
+  }
+  try {
+    const res = await postJSON("/api/brokers/schwab/exchange",
+      { app_key: appKey, app_secret: appSecret, redirect_response: pasted });
+    const rt = _credInput("refresh_token"); if (rt) rt.value = res.refresh_token;
+    const ah = _credInput("account_hash"); if (ah && res.account_hash) ah.value = res.account_hash;
+    toast("Refresh token retrieved — you can Test connection now", "good");
+  } catch (e) { toast("Login exchange failed: " + e.message, "bad"); }
+});
 
 function updateLiveWarning() {
   const b = brokerCatalog.find((x) => x.name === selectedBroker);
@@ -1395,6 +1436,17 @@ $("#mode-seg").addEventListener("click", (e) => {
     postJSON("/api/mode", { mode })
       .then(() => { toast("Mode: " + mode, mode === "autonomous" ? "warn" : "good"); refreshStatus(); })
       .catch((err) => { toast("Mode change failed: " + err.message, "bad"); refreshStatus(); });
+  // Entering autonomous means Claude trades real money without asking —
+  // gate it behind a confirm, like auto-invest and live-broker connect.
+  // Research/Approval switches stay one-click.
+  if (mode === "autonomous" && (!lastStatus || lastStatus.mode !== "autonomous")) {
+    const broker = (lastStatus && lastStatus.broker) || {};
+    const liveNote = broker.paper === false
+      ? `\n\nACTIVE BROKER IS LIVE (${broker.name}) — trades will use real money.` : "";
+    if (!window.confirm(
+        "Switch to AUTONOMOUS mode?\n\nClaude will execute trades from review cycles within " +
+        "every risk limit, without asking first." + liveNote)) return;
+  }
   go();
 });
 
@@ -1403,13 +1455,20 @@ $("#halt-cancel").addEventListener("click", () => { $("#halt-modal").hidden = tr
 $("#halt-modal").addEventListener("click", (e) => { if (e.target.id === "halt-modal") $("#halt-modal").hidden = true; });
 $("#halt-confirm").addEventListener("click", () => {
   $("#halt-modal").hidden = true;
+  // The emergency stop must never fail silently: surface a failed halt so the
+  // operator doesn't believe trading is stopped while the circuit stays closed.
   postJSON("/api/halt", { reason: "manual halt from dashboard" })
-    .then(() => { toast("Trading halted", "bad"); refreshStatus(); });
+    .then(() => { toast("Trading halted", "bad"); refreshStatus(); })
+    .catch((e) => { toast("HALT FAILED: " + e.message, "bad"); refreshStatus(); });
 });
 $("#btn-resume").addEventListener("click", () =>
-  postJSON("/api/resume").then(() => { toast("Trading resumed", "good"); refreshStatus(); }));
+  postJSON("/api/resume")
+    .then(() => { toast("Trading resumed", "good"); refreshStatus(); })
+    .catch((e) => { toast("Resume failed: " + e.message, "bad"); refreshStatus(); }));
 $("#btn-cycle").addEventListener("click", () =>
-  postJSON("/api/cycle").then(() => toast("Review cycle started")));
+  postJSON("/api/cycle")
+    .then(() => toast("Review cycle started"))
+    .catch((e) => toast("Review cycle failed: " + e.message, "bad")));
 
 window.addEventListener("resize", drawEquity);
 route();

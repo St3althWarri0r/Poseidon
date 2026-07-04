@@ -123,8 +123,11 @@ update availability. Repeats are deduplicated for 5 minutes.
 - `watchlists[]`: named symbol lists; the union feeds the AI and default
   strategy universes.
 - `dashboard`: `host` (default `127.0.0.1`), `port` (8321),
-  `auth_token_credential` — a vault entry holding a bearer token, **required
-  by validation whenever `host` is non-loopback**; clients send
+  `auth_token_credential` — a vault entry holding a bearer token. **A token
+  is required by validation whenever `host` is non-loopback**: set the vault
+  entry, or supply one via `POSEIDON_DASHBOARD_TOKEN` /
+  `POSEIDON_DASHBOARD_TOKEN_FILE` (used by the Docker deployment; the vault
+  entry takes precedence when both are set). Clients send
   `Authorization: Bearer <token>` or open `/?token=<token>`.
 - `updates`: `enabled`, `check_interval_hours`, `auto_apply`.
 

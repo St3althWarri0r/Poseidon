@@ -1,9 +1,11 @@
 """Dashboard API server.
 
-Binds to localhost only by default. There is deliberately no remote
-authentication story here — the dashboard is a local desktop surface; if
-you must access it remotely, put it behind an authenticated reverse proxy
-or an SSH tunnel (docs/security.md).
+Binds to localhost only by default. On a non-loopback bind a bearer token
+is mandatory — config validation refuses to start without one (see
+core/config.py) — and is checked constant-time on every API request and
+websocket handshake; only /static assets are exempt. The token travels in
+clear over plain HTTP, so for remote access still prefer an SSH tunnel or
+an authenticated TLS reverse proxy (docs/security.md).
 """
 
 from __future__ import annotations
@@ -23,7 +25,14 @@ from fastapi.staticfiles import StaticFiles
 from ..ai.chat import ChatBusyError
 from ..brokers.registry import broker_catalog
 from ..core.enums import TradingMode
-from ..core.errors import AgentError, BrokerError, ConfigError, DataError, VaultError
+from ..core.errors import (
+    AgentError,
+    BrokerAuthError,
+    BrokerError,
+    ConfigError,
+    DataError,
+    VaultError,
+)
 from ..core.events import EventBus
 
 if TYPE_CHECKING:
@@ -45,16 +54,19 @@ class WebsocketHub:
         if not self._clients:
             return
         message = json.dumps({"topic": topic, "payload": payload}, default=str)
-        dead: list[WebSocket] = []
-        # Snapshot: send_text awaits, and a client connecting/disconnecting
-        # during that await would otherwise mutate the set mid-iteration.
-        for ws in list(self._clients):
-            try:
-                await ws.send_text(message)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._clients.discard(ws)
+        # Send to every client concurrently, each bounded by a deadline, so a
+        # single stalled peer (e.g. a suspended laptop) cannot delay delivery
+        # to the others or pile up tasks behind its full send buffer.
+        clients = list(self._clients)
+        results = await asyncio.gather(
+            *(asyncio.wait_for(ws.send_text(message), timeout=5.0) for ws in clients),
+            return_exceptions=True,
+        )
+        for ws, result in zip(clients, results, strict=True):
+            if isinstance(result, Exception):
+                # Send failed or the peer stalled past the deadline: drop it.
+                # handle()'s receive loop will error and finish cleanup.
+                self._clients.discard(ws)
 
     async def handle(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -72,6 +84,16 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     app = FastAPI(title="Poseidon", docs_url=None, redoc_url=None, openapi_url=None)
     hub = WebsocketHub(kernel.bus)
 
+    # Strong references to fire-and-forget background tasks: the event loop
+    # keeps only weak refs, so an unreferenced task can be GC'd mid-run.
+    background_tasks: set[asyncio.Task[None]] = set()
+
+    def _bg_done(task: asyncio.Task[None]) -> None:
+        background_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.error("background task failed", task=task.get_name(),
+                      error=str(task.exception()))
+
     # DNS-rebinding protection: a malicious website resolving to 127.0.0.1
     # sends its own domain in the Host header; reject anything that is not a
     # genuine loopback/configured host. On a non-loopback bind the operator
@@ -84,12 +106,65 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         app.add_middleware(TrustedHostMiddleware,
                            allowed_hosts=["127.0.0.1", "localhost", "::1"])
 
+    # The origins a legitimate dashboard page is served from. Used to reject
+    # cross-site state-changing requests and cross-origin websocket handshakes
+    # — TrustedHost only stops DNS rebinding, not a direct-IP CSRF from a page
+    # the operator has open in the same browser.
+    _port = kernel.config.dashboard.port
+    allowed_origins: set[str] = set()
+    for _host in ("127.0.0.1", "localhost", "::1", configured_host):
+        allowed_origins.add(f"http://{_host}:{_port}")
+        allowed_origins.add(f"https://{_host}:{_port}")
+
+    def _origin_allowed(origin: str, host_header: str) -> bool:
+        """Besides the static allowlist (loopbacks + configured host), accept
+        the origin matching the request's own Host header: on a non-loopback
+        bind the operator reaches the dashboard by a machine address or via a
+        reverse proxy, and the browser's Origin carries that address, not the
+        bind address. Origin==Host does not weaken the guard — DNS rebinding
+        is stopped by TrustedHostMiddleware on loopback binds and by the
+        mandatory bearer token on non-loopback binds."""
+        if origin in allowed_origins:
+            return True
+        return bool(host_header) and origin in (
+            f"http://{host_header}", f"https://{host_header}")
+
+    # CSRF guard: runs for every request regardless of whether a bearer token
+    # is configured. Blocks unsafe methods issued cross-site (the parameterless
+    # POSTs — /api/resume, /api/halt, /api/cycle, /api/sync — are otherwise
+    # reachable as CORS "simple" requests with no preflight). Modern browsers
+    # always send Sec-Fetch-Site; Origin is the fallback. A request with
+    # neither header (a non-browser client like curl) is not a CSRF vector and
+    # is allowed — the loopback bind already constrains reachability.
+    from starlette.requests import Request as _Request
+    from starlette.responses import JSONResponse as _StarletteJSON
+
+    _unsafe_methods = {"POST", "PUT", "DELETE", "PATCH"}
+
+    @app.middleware("http")
+    async def _csrf_guard(request: _Request, call_next):  # type: ignore[no-untyped-def]
+        if request.method in _unsafe_methods and not request.url.path.startswith("/static"):
+            sec_fetch_site = request.headers.get("sec-fetch-site")
+            origin = request.headers.get("origin")
+            if sec_fetch_site is not None:
+                if sec_fetch_site not in ("same-origin", "none"):
+                    return _StarletteJSON({"detail": "cross-site request blocked"}, status_code=403)
+            elif origin is not None and not _origin_allowed(
+                    origin, request.headers.get("host", "")):
+                return _StarletteJSON({"detail": "cross-origin request blocked"}, status_code=403)
+        return await call_next(request)
+
     # Optional bearer-token auth (required by config validation whenever the
     # host is non-loopback). Static assets are exempt — they contain nothing
     # sensitive and <link>/<script> tags cannot carry headers.
     auth_token: str | None = None
     if kernel.config.dashboard.auth_token_credential:
         auth_token = kernel.vault.get(kernel.config.dashboard.auth_token_credential)
+    else:
+        # Fallback: a token supplied directly via env/secret file (container
+        # deployments that cannot pre-seed the vault). See config.py.
+        from ..core.config import dashboard_token_from_env
+        auth_token = dashboard_token_from_env()
 
     def _token_ok(supplied: str | None) -> bool:
         import hmac
@@ -175,7 +250,13 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.post("/api/approvals/{order_id}")
     async def resolve_approval(order_id: str, body: dict[str, Any]) -> JSONResponse:
-        approve = bool(body.get("approve"))
+        # Require an explicit JSON boolean: bool("false") is True, so coercing
+        # a stringified boolean here would approve a real-money trade a
+        # scripted client meant to reject.
+        approve = body.get("approve")
+        if not isinstance(approve, bool):
+            raise HTTPException(status_code=422,
+                                detail="approve must be a JSON boolean (true/false)")
         try:
             kernel.approvals.resolve(order_id, approved=approve)
         except (KeyError, ValueError) as exc:
@@ -218,7 +299,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.post("/api/cycle")
     async def trigger_cycle() -> JSONResponse:
-        asyncio.create_task(kernel.run_review_cycle())
+        task = asyncio.create_task(kernel.run_review_cycle(), name="api-review-cycle")
+        background_tasks.add(task)
+        task.add_done_callback(_bg_done)
         return JSONResponse({"ok": True, "detail": "review cycle started"})
 
     @app.get("/api/performance")
@@ -267,6 +350,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         from ..core.enums import AssetClass, OrderSide, OrderType, TimeInForce
         from ..core.models import Order
 
+        extended_hours = body.get("extended_hours", False)
+        if not isinstance(extended_hours, bool):
+            raise HTTPException(status_code=422, detail="extended_hours must be a JSON boolean")
         try:
             order = Order(
                 symbol=str(body["symbol"]).upper().strip(),
@@ -277,7 +363,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 limit_price=Decimal(str(body["limit_price"])) if body.get("limit_price") else None,
                 stop_price=Decimal(str(body["stop_price"])) if body.get("stop_price") else None,
                 time_in_force=TimeInForce(str(body.get("time_in_force", "day"))),
-                extended_hours=bool(body.get("extended_hours", False)),
+                extended_hours=extended_hours,
                 strategy="manual",
             )
         except (KeyError, ValueError, InvalidOperation) as exc:
@@ -324,7 +410,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 created_by="user", review_notes=str(body.get("review_notes", "")),
                 sleeve_pct=float(body.get("sleeve_pct", 0) or 0),
             )
-        except CfgErr as exc:
+        except (CfgErr, ValueError, TypeError) as exc:
+            # ValueError/TypeError: malformed numeric/iterable fields (e.g.
+            # sleeve_pct="5%") — a 422, not an uncaught 500. Matches update_algorithm.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse({"algorithm": record})
 
@@ -358,10 +446,11 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.post("/api/algorithms/{algo_id}/deactivate")
     async def deactivate_algorithm(algo_id: str, body: dict[str, Any] | None = None) -> JSONResponse:
+        archive = (body or {}).get("archive", False)
+        if not isinstance(archive, bool):
+            raise HTTPException(status_code=422, detail="archive must be a JSON boolean")
         try:
-            record = await kernel.workshop.deactivate(
-                algo_id, archive=bool((body or {}).get("archive", False))
-            )
+            record = await kernel.workshop.deactivate(algo_id, archive=archive)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return JSONResponse({"algorithm": record})
@@ -449,7 +538,11 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         name = str(body.get("name", "")).strip()
         if not name:
             raise HTTPException(status_code=422, detail="broker name required")
-        paper = bool(body.get("paper", True))
+        # An empty string would coerce to paper=False, silently selecting the
+        # LIVE account — require an explicit boolean when the key is present.
+        paper = body.get("paper", True)
+        if not isinstance(paper, bool):
+            raise HTTPException(status_code=422, detail="paper must be a JSON boolean")
         credentials: dict[str, str] | None = None
         raw = body.get("credentials")
         if isinstance(raw, dict):
@@ -497,6 +590,51 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "broker": result})
 
+    @app.post("/api/brokers/schwab/authorize-url")
+    async def schwab_authorize_url(body: dict[str, Any]) -> JSONResponse:
+        """Build the Schwab OAuth login URL for the entered app key. POST (not
+        GET) so the app key never lands in access logs / browser history."""
+        from ..brokers.plugins.schwab import DEFAULT_REDIRECT_URI, SchwabBroker
+        app_key = str(body.get("app_key", "")).strip()
+        if not app_key:
+            raise HTTPException(status_code=422, detail="app_key required")
+        redirect_uri = str(body.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip()
+        return JSONResponse({
+            "url": SchwabBroker.authorize_url(app_key, redirect_uri),
+            "redirect_uri": redirect_uri,
+        })
+
+    @app.post("/api/brokers/schwab/exchange")
+    async def schwab_exchange(body: dict[str, Any]) -> JSONResponse:
+        """Finish the Schwab login: swap the pasted redirect URL's code for a
+        refresh token and resolve the account hash, so the Connect form's
+        credential fields can be filled in without leaving the dashboard."""
+        from ..brokers.plugins.schwab import DEFAULT_REDIRECT_URI, SchwabBroker
+        app_key = str(body.get("app_key", "")).strip()
+        app_secret = str(body.get("app_secret", "")).strip()
+        pasted = str(body.get("redirect_response", "")).strip()
+        redirect_uri = str(body.get("redirect_uri") or DEFAULT_REDIRECT_URI).strip()
+        if not (app_key and app_secret and pasted):
+            raise HTTPException(
+                status_code=422,
+                detail="app_key, app_secret, and the pasted redirect URL are all required")
+        try:
+            code = SchwabBroker.extract_code(pasted)
+            tokens = await SchwabBroker.exchange_code(
+                app_key=app_key, app_secret=app_secret, code=code, redirect_uri=redirect_uri)
+            account_hash = ""
+            access = str(tokens.get("access_token", ""))
+            if access:
+                with contextlib.suppress(BrokerError):
+                    account_hash = await SchwabBroker.fetch_account_hash(access)
+        except (BrokerError, BrokerAuthError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse({
+            "ok": True,
+            "refresh_token": tokens["refresh_token"],
+            "account_hash": account_hash,
+        })
+
     @app.post("/api/sync")
     async def sync_now() -> JSONResponse:
         """Manual portfolio sync — pull the account from the broker right now."""
@@ -543,6 +681,16 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket(ws: WebSocket) -> None:
+        # Websocket handshakes are exempt from the same-origin/CORS read
+        # restrictions that protect fetch(), so a cross-site page could
+        # otherwise open /ws and read the full live event bus (positions,
+        # fills, AI decisions). Reject a browser Origin that is not ours,
+        # independent of the bearer token.
+        origin = ws.headers.get("origin")
+        if origin is not None and not _origin_allowed(
+                origin, ws.headers.get("host", "")):
+            await ws.close(code=4403)
+            return
         if auth_token and not _token_ok(ws.query_params.get("token")):
             await ws.close(code=4401)
             return

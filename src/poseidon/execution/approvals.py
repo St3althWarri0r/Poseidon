@@ -76,9 +76,13 @@ class ApprovalQueue:
         try:
             await asyncio.wait_for(entry.resolved.wait(), timeout=entry.seconds_remaining)
         except TimeoutError:
-            entry.approved = False
-            entry.resolver = "expired"
-            entry.resolved.set()
+            # A resolve() that won the race (delivered while wait_for was
+            # unwinding the cancellation) stands; resolve() already applies
+            # its own expiry check, so a stale approval still ends False.
+            if not entry.resolved.is_set():
+                entry.approved = False
+                entry.resolver = "expired"
+                entry.resolved.set()
         finally:
             self._pending.pop(entry.order.id, None)
         return bool(entry.approved)

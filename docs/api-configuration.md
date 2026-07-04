@@ -29,7 +29,7 @@ shifts to the next one.
 | `polygon` | quotes (NBBO), bars, option chains + greeks, news | polygon.io | plain API key |
 | `finnhub` | quotes, news, earnings calendar, economic calendar, sector taxonomy | finnhub.io | plain API key |
 | `twelvedata` | quotes, bars | twelvedata.com | plain API key |
-| `alphavantage` | EOD quotes, daily bars, news+sentiment | alphavantage.co | plain API key |
+| `alphavantage` | EOD quotes, news+sentiment (bars not offered: free series is split-unadjusted) | alphavantage.co | plain API key |
 | `alpaca` | quotes, bars, option chains, news | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |
 | `tradier_data` | quotes, daily bars, option chains + greeks | tradier.com | access token (options: `{sandbox: true}`) |
 
@@ -42,7 +42,9 @@ The platform is designed so the only thing you pay for is Claude:
   API secret as the `public` broker. If you trade through Public, this is
   your primary source and costs nothing.
 - **`finnhub`**, **`twelvedata`**, and **`alphavantage`** free tiers cover
-  news, both calendars, and backup quotes/bars.
+  news, both calendars, and backup quotes (plus bars from `twelvedata`;
+  Alpha Vantage bars are not offered — its free daily series is
+  split-unadjusted and would change the price basis on failover).
 - **`alpaca`** (IEX feed) and **`tradier_data`** (sandbox) are also free
   with their respective accounts.
 

@@ -113,7 +113,12 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         for s in longs:
             raw = s.evidence.get("target_weight")
             try:
-                weights[s.symbol.upper()] = float(raw) if raw is not None else 0.0
+                # Clamp: user-authored algorithms can emit any float. A negative
+                # weight is dropped by the `weight > 0` filter below anyway, but if
+                # left in the sum it deflates `total` and defeats the "never lever
+                # up" normalization, silently levering the surviving longs past
+                # 100% of equity.
+                weights[s.symbol.upper()] = max(0.0, float(raw)) if raw is not None else 0.0
             except (TypeError, ValueError):
                 weights[s.symbol.upper()] = 0.0
         total = sum(weights.values())
@@ -123,11 +128,19 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         if total > 1.0:  # never lever up beyond fully invested
             weights = {k: v / total for k, v in weights.items()}
 
+        # Equity locked in holdings that didn't print today (halt, gap,
+        # delisting) cannot be sold — the loop below keeps those positions —
+        # so it must not also fund new buys, or the book buys on cash it
+        # doesn't have and ends up levered for free.
+        locked = sum(qty * mark(s) for s, qty in holdings.items()
+                     if price(s, day) is None)
+        investable = max(marked - locked, 0.0)
+
         target_shares: dict[str, float] = {}
         for symbol, weight in weights.items():
             px = price(symbol, day)
             if px and weight > 0:
-                target_shares[symbol] = marked * weight / px
+                target_shares[symbol] = investable * weight / px
         changed = False
         for symbol in set(holdings) | set(target_shares):
             px = price(symbol, day)
@@ -163,10 +176,12 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
             max_dd = max(max_dd, (peak - v) / peak)
     by_year: dict[str, float] = {}
     year_start: dict[str, float] = {}
+    prev: float | None = None
     for day, value in equity_curve:
         year = str(day.year)
-        year_start.setdefault(year, value)
+        year_start.setdefault(year, prev if prev is not None else value)
         by_year[year] = value / year_start[year] - 1
+        prev = value
 
     step = max(1, len(equity_curve) // 400)
     return {

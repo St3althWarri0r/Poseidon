@@ -74,7 +74,12 @@ class NotificationService:
             self._recent = {k: v for k, v in self._recent.items() if v > cutoff}
         targets = [c for c in self._channels if c.accepts(level)]
         if targets:
-            await asyncio.gather(*(c.send(level, title, body) for c in targets))
+            results = await asyncio.gather(*(c.send(level, title, body) for c in targets))
+            if not any(results) and self._recent.get(key) == now:
+                # Every channel failed: forget the dedupe record so a
+                # re-published alert (e.g. a repeated CIRCUIT_OPENED) can
+                # retry instead of being suppressed for the full window.
+                self._recent.pop(key, None)
 
     # -- event handlers -----------------------------------------------------------
 
@@ -101,6 +106,10 @@ class NotificationService:
         await self.notify(
             NotificationLevel.WARNING, f"Risk violation: {payload.get('rule')}",
             f"{payload.get('symbol', '')} — {payload.get('detail', '')}",
+            # Include the symbol so a second symbol breaching the SAME rule is
+            # not suppressed by the dedupe window (rule+title alone collapsed
+            # distinct-symbol alerts).
+            dedupe_key=f"risk:{payload.get('rule')}:{payload.get('symbol', '')}",
         )
 
     async def _on_circuit(self, _topic: str, payload: Any) -> None:

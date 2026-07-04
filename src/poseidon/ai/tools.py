@@ -69,7 +69,22 @@ class ToolDispatcher:
             for key, value in result.items():
                 if isinstance(value, list) and len(value) > 50:
                     result[key] = value[:50] + [f"... truncated {len(value) - 50} items"]
-        return json.dumps(result, default=str)[:_MAX_RESULT_CHARS]
+        payload = json.dumps(result, default=str)
+        if len(payload) <= _MAX_RESULT_CHARS:
+            return payload
+        # Still too large: never hand the model a mid-token slice of market
+        # data (a price '412.87' cut to '412.8' reads as a plausible but wrong
+        # quote). Return a valid JSON envelope with an explicit signal instead.
+        # Preview budget is halved because json.dumps re-escapes the embedded
+        # fragment, which would otherwise inflate the envelope past the bound.
+        return json.dumps({
+            "truncated": True,
+            "preview": payload[: _MAX_RESULT_CHARS // 2],
+            "error": "tool result exceeded the size limit and was truncated",
+            "instruction": "The preview is an incomplete fragment. Treat any field not "
+                           "fully visible in it as unavailable, record the gap in "
+                           "data_gaps, and do not trade on values that may be cut off.",
+        })
 
     # -- data tools --------------------------------------------------------------
 

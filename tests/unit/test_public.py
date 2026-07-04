@@ -361,8 +361,9 @@ class TestPublicDataProvider:
         provider = self.make_provider()
         expiry = date(2026, 7, 17)
 
-        def quote_row(symbol: str, strike: str, outcome: str = "SUCCESS") -> dict[str, Any]:
-            return {
+        def quote_row(symbol: str, strike: str, outcome: str = "SUCCESS",
+                      ts: str | None = "2026-07-02T15:30:00Z") -> dict[str, Any]:
+            row: dict[str, Any] = {
                 "instrument": {"symbol": symbol, "type": "OPTION"},
                 "outcome": outcome, "bid": "2.40", "ask": "2.60", "last": "2.50",
                 "volume": 100, "openInterest": 5000,
@@ -371,6 +372,9 @@ class TestPublicDataProvider:
                     "greeks": {"delta": "0.55", "impliedVolatility": "0.28"},
                 },
             }
+            if ts is not None:
+                row["lastTimestamp"] = ts
+            return row
 
         async def fake_post(url: str, *, json_body: Any, headers: Any = None) -> Any:
             assert url.endswith("/marketdata/ACC1/option-chain")
@@ -391,3 +395,27 @@ class TestPublicDataProvider:
         assert call.greeks is not None and call.greeks.delta == 0.55
         put = next(c for c in chain.contracts if c.right is OptionRight.PUT)
         assert put.symbol == "AAPL260717P00180000"
+
+    async def test_option_chain_requires_quote_timestamps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Contracts with no quote timestamp are dropped rather than stamped
+        with receipt time; an all-dropped chain raises so the router fails
+        over instead of grading a frozen chain REAL_TIME."""
+        provider = self.make_provider()
+        expiry = date(2026, 7, 17)
+
+        async def fake_post(url: str, *, json_body: Any, headers: Any = None) -> Any:
+            return {
+                "baseSymbol": "AAPL",
+                "calls": [{
+                    "instrument": {"symbol": "AAPL260717C00190000", "type": "OPTION"},
+                    "outcome": "SUCCESS", "bid": "2.40", "ask": "2.60",
+                    "optionDetails": {"strikePrice": "190"},
+                }],
+                "puts": [],
+            }
+
+        monkeypatch.setattr(provider, "_post_json", fake_post)
+        with pytest.raises(ProviderError, match="empty option chain"):
+            await provider.option_chain("AAPL", expiration=expiry)

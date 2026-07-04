@@ -4,11 +4,20 @@ Every consequential action (AI decisions, order submissions, approvals,
 risk rejections, config changes, vault operations) is appended to an
 audit table where each record carries the SHA-256 hash of the previous
 record — an in-database hash chain. Records are never updated or deleted
-by the application; ``verify_chain`` detects any external tampering.
+by the application.
+
+``verify_chain`` detects any modification or reordering of retained
+records. It cannot, by itself, detect deletion of the most-recent
+record(s) or a full table wipe — a truncated chain re-verifies as
+internally consistent, and an empty table is indistinguishable from a
+fresh database. Detecting truncation would require a head anchor
+(expected max seq + last hash) persisted outside this database; that is
+not currently implemented.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -25,20 +34,27 @@ def _canonical(payload: dict[str, Any]) -> str:
 
 
 def _record_hash(seq: int, at: str, actor: str, action: str, payload_json: str, prev_hash: str) -> str:
-    material = f"{seq}|{at}|{actor}|{action}|{payload_json}|{prev_hash}"
+    # JSON-array encoding escapes delimiters, making field boundaries unambiguous.
+    material = json.dumps([seq, at, actor, action, payload_json, prev_hash], separators=(",", ":"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class AuditLog:
     def __init__(self, db: Database) -> None:
         self._db = db
+        # Serializes the read-max-seq / insert-next-seq critical section.
+        # The whole Database shares one aiosqlite connection, so concurrent
+        # appends (event-bus handlers, guardian exits, approvals) could
+        # otherwise both read the same max seq and collide on the seq PK
+        # — forking or aborting the chain. The lock makes appends atomic.
+        self._lock = asyncio.Lock()
 
     async def append(self, actor: str, action: str, payload: dict[str, Any] | None = None) -> AuditRecord:
         payload = payload or {}
         payload_json = _canonical(payload)
         at = datetime.now(UTC)
         at_iso = at.isoformat()
-        async with self._db.transaction() as conn:
+        async with self._lock, self._db.transaction() as conn:
             row = await (
                 await conn.execute("SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1")
             ).fetchone()
@@ -71,13 +87,13 @@ class AuditLog:
 
     async def verify_chain(self) -> tuple[bool, int | None]:
         """Recompute the whole chain. Returns (ok, first_bad_seq)."""
-        rows = await self._db.fetch_all(
-            "SELECT seq, at, actor, action, payload, prev_hash, hash FROM audit ORDER BY seq ASC"
-        )
         prev = GENESIS_HASH
-        for r in rows:
-            expected = _record_hash(r[0], r[1], r[2], r[3], r[4], prev)
-            if r[5] != prev or r[6] != expected:
-                return False, int(r[0])
-            prev = r[6]
+        async with self._db.conn.execute(
+            "SELECT seq, at, actor, action, payload, prev_hash, hash FROM audit ORDER BY seq ASC"
+        ) as cursor:
+            async for r in cursor:
+                expected = _record_hash(r[0], r[1], r[2], r[3], r[4], prev)
+                if r[5] != prev or r[6] != expected:
+                    return False, int(r[0])
+                prev = r[6]
         return True, None

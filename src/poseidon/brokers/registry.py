@@ -138,13 +138,18 @@ _CONNECT_META: dict[str, dict[str, object]] = {
         "fields": [
             _field("app_key", "App key"),
             _field("app_secret", "App secret", secret=True),
-            _field("refresh_token", "Refresh token", secret=True,
-                   help_text="From the one-time OAuth consent — see docs/broker-setup.md (Schwab)."),
-            _field("account_hash", "Account hash"),
+            _field("refresh_token", "Refresh token", secret=True, optional=True,
+                   help_text="Use “Log in with Schwab” to fill this automatically, or paste a "
+                             "token from a prior OAuth consent (docs/broker-setup.md)."),
+            _field("account_hash", "Account hash", optional=True,
+                   help_text="Auto-filled by “Log in with Schwab”; else GET "
+                             "/trader/v1/accounts/accountNumbers."),
         ],
+        # Drives the dashboard's in-app OAuth login button for this broker.
+        "oauth": "schwab",
         "paper_choice": "live_only",
         "notes": "Schwab has no paper environment; the 7-day refresh token needs periodic "
-                 "re-consent (docs/broker-setup.md walks through the OAuth flow).",
+                 "re-consent — “Log in with Schwab” runs the OAuth flow in your browser.",
     },
     "ibkr": {
         "credential": "ibkr_creds",
@@ -196,6 +201,7 @@ def broker_catalog() -> list[dict[str, object]]:
                 "paper_choice": meta["paper_choice"],
                 "notes": meta["notes"],
                 "cost_note": meta.get("cost_note", ""),
+                "oauth": meta.get("oauth", ""),
             })
         elif not stub:
             # Connectable class without UI metadata (e.g. an external

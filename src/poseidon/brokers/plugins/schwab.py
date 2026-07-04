@@ -24,6 +24,9 @@ import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
 
 from ...core.enums import (
     AssetClass,
@@ -38,6 +41,10 @@ from ...core.models import AccountSnapshot, Order, Position
 from ..base import Broker
 
 _API = "https://api.schwabapi.com"
+# The callback registered on the Schwab developer app. Schwab redirects the
+# browser here with ?code=... after login+consent; nothing needs to listen on
+# it (there is no local HTTPS server) — the user pastes the redirected URL back.
+DEFAULT_REDIRECT_URI = "https://127.0.0.1:8182"
 
 _STATUS_MAP = {
     "AWAITING_PARENT_ORDER": OrderStatus.SUBMITTED,
@@ -71,7 +78,15 @@ class SchwabBroker(Broker):
     def __init__(self, *, credentials: dict[str, str], paper: bool = True,
                  timeout: float = 15.0, options: dict[str, Any] | None = None) -> None:
         super().__init__(credentials=credentials, paper=False, timeout=timeout, options=options)
-        # Schwab has no paper environment; `paper` is ignored (documented).
+        # Schwab has no paper environment. Refuse a paper request outright
+        # rather than silently trading live (mirrors PublicBroker).
+        if paper:
+            raise BrokerError(
+                self.name,
+                "Schwab has no paper environment — set `paper: false` explicitly to "
+                "acknowledge live trading, or use the built-in `paper` broker for simulation",
+                retryable=False,
+            )
         try:
             self._app_key = credentials["app_key"]
             self._app_secret = credentials["app_secret"]
@@ -91,6 +106,85 @@ class SchwabBroker(Broker):
                 BrokerCapability.EXTENDED_HOURS,
             }
         )
+
+    # -- one-time OAuth consent (the interactive login) ------------------------
+    #
+    # Getting the first refresh_token needs a human browser login at Schwab.
+    # These helpers drive that flow from the dashboard so the operator never
+    # has to run a separate OAuth script (docs/broker-setup.md, Schwab):
+    #   1. authorize_url(app_key)  -> open it; user logs in and consents
+    #   2. Schwab redirects to the app's callback with ?code=...
+    #   3. exchange_code(...)      -> swap the code for a refresh_token
+    #   4. fetch_account_hash(...) -> the hashed account id the API needs
+
+    @staticmethod
+    def authorize_url(app_key: str, redirect_uri: str = DEFAULT_REDIRECT_URI) -> str:
+        """Schwab OAuth2 authorization URL — opening it lands on Schwab's login
+        and consent screen. redirect_uri must match the app's registered
+        callback (default https://127.0.0.1:8182)."""
+        query = urlencode({
+            "client_id": app_key,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+        })
+        return f"{_API}/v1/oauth/authorize?{query}"
+
+    @staticmethod
+    def extract_code(redirect_response: str) -> str:
+        """Pull the authorization code out of what Schwab redirected to. Accepts
+        the full pasted redirect URL (…/?code=XXXX&session=…) or a bare code."""
+        value = redirect_response.strip()
+        if "code=" in value:
+            parsed = urlparse(value)
+            codes = parse_qs(parsed.query).get("code")
+            if codes and codes[0]:
+                return codes[0]
+        if value and "=" not in value and "/" not in value:
+            return value  # already a bare code
+        raise BrokerError("schwab", "no ?code= found in the pasted redirect URL", retryable=False)
+
+    @classmethod
+    async def exchange_code(cls, *, app_key: str, app_secret: str, code: str,
+                            redirect_uri: str = DEFAULT_REDIRECT_URI,
+                            timeout: float = 15.0) -> dict[str, Any]:
+        """Exchange an authorization code for tokens. Returns the raw token
+        payload (includes refresh_token). Raises BrokerAuthError on failure."""
+        basic = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{_API}/v1/oauth/token",
+                headers={"Authorization": f"Basic {basic}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type": "authorization_code", "code": code,
+                      "redirect_uri": redirect_uri},
+            )
+        if resp.status_code >= 400:
+            raise BrokerAuthError(
+                "schwab",
+                f"token exchange failed (HTTP {resp.status_code}): {resp.text[:300]} — "
+                "check the app key/secret and that the code was not already used or expired",
+            )
+        payload: dict[str, Any] = resp.json()
+        if not payload.get("refresh_token"):
+            raise BrokerAuthError("schwab", "token exchange returned no refresh_token")
+        return payload
+
+    @staticmethod
+    async def fetch_account_hash(access_token: str, timeout: float = 15.0) -> str:
+        """Look up the hashed account id the Trader API addresses accounts by."""
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{_API}/trader/v1/accounts/accountNumbers",
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            )
+        if resp.status_code >= 400:
+            raise BrokerError(
+                "schwab", f"could not list account numbers (HTTP {resp.status_code})",
+                retryable=False)
+        rows = resp.json() or []
+        if not rows or not rows[0].get("hashValue"):
+            raise BrokerError("schwab", "no accounts returned for this login", retryable=False)
+        return str(rows[0]["hashValue"])
 
     async def _ensure_token(self) -> str:
         if self._access_token and time.monotonic() < self._token_expiry - 60:
@@ -196,16 +290,34 @@ class SchwabBroker(Broker):
                 f"{_API}/trader/v1/accounts/{self._account_hash}/orders",
                 headers=headers, json=body,
             )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Connection never established: the order did not reach Schwab, so
+            # a retry is safe.
+            raise BrokerError(self.name, f"could not connect: {exc}", retryable=True) from exc
         except Exception as exc:
-            raise BrokerError(self.name, f"transport error: {exc}") from exc
+            # Sent but no clean response. Schwab has no client-order-id, so a
+            # resubmit could double-fill — outcome is ambiguous, never retried.
+            raise BrokerError(self.name, f"submit outcome unknown: {exc}",
+                              retryable=False, ambiguous=True) from exc
         if response.status_code in (401, 403):
             raise BrokerAuthError(self.name)
         if response.status_code >= 400:
             raise BrokerError(self.name, f"order rejected HTTP {response.status_code}: {response.text[:300]}",
                               retryable=False)
         location = response.headers.get("Location", "")
+        broker_order_id = location.rstrip("/").rsplit("/", 1)[-1] if location else ""
+        if not broker_order_id:
+            # 201 but no order id: the order is likely live at Schwab yet cannot
+            # be polled or canceled without an id, and Schwab has no client order
+            # id to reconcile by. Ambiguous — mark ERROR, never auto-resubmit.
+            raise BrokerError(
+                self.name,
+                "order accepted (HTTP 201) but no order id in Location header — "
+                "verify the order at Schwab directly",
+                retryable=False, ambiguous=True,
+            )
         order.broker = self.name
-        order.broker_order_id = location.rstrip("/").rsplit("/", 1)[-1] if location else None
+        order.broker_order_id = broker_order_id
         order.status = OrderStatus.SUBMITTED
         order.updated_at = datetime.now(UTC)
         return order

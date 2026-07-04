@@ -4,7 +4,7 @@
 # The vault passphrase is provided through systemd credentials:
 #   systemd-ask-password stores nothing; instead we load an encrypted
 #   credential created once with:
-#     systemd-creds encrypt --name=poseidon-vault-passphrase <(printf '%s' 'PASSPHRASE') \
+#     systemd-creds encrypt --user --name=poseidon-vault-passphrase <(printf '%s' 'PASSPHRASE') \
 #         ~/.config/poseidon/vault-passphrase.cred
 # (see docs/security.md for the full walkthrough)
 
@@ -28,6 +28,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/share/poseidon
+ReadWritePaths=%h/.config/poseidon
 LockPersonality=true
 RestrictRealtime=true
 

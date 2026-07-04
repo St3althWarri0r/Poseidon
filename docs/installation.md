@@ -34,18 +34,22 @@ rebuilding the package.
 ```bash
 mkdir -p docker/secrets
 printf '%s' 'your-vault-passphrase' > docker/secrets/vault_passphrase.txt
-chmod 600 docker/secrets/vault_passphrase.txt
+printf '%s' "$(openssl rand -hex 32)" > docker/secrets/dashboard_token.txt
+chmod 600 docker/secrets/vault_passphrase.txt docker/secrets/dashboard_token.txt
+docker compose -f docker/docker-compose.yml run --rm poseidon vault init
+docker compose -f docker/docker-compose.yml run --rm poseidon vault set anthropic_api_key
 docker compose -f docker/docker-compose.yml up -d
 ```
 
 State lives in the `poseidon-data` volume; the dashboard binds to
-`127.0.0.1:8321` on the host. Initialize the vault once inside the
-container:
-
-```bash
-docker exec -it poseidon poseidon vault init
-docker exec -it poseidon poseidon vault set anthropic_api_key
-```
+`127.0.0.1:8321` on the host. `dashboard_token.txt` is the dashboard
+bearer token (the container binds 0.0.0.0, so token auth is mandatory) —
+open `http://127.0.0.1:8321/?token=<token>` or send
+`Authorization: Bearer <token>`. The passphrase entered at `vault init`
+must be exactly the contents of `docker/secrets/vault_passphrase.txt`:
+the service unlocks the vault non-interactively from that file
+(`POSEIDON_VAULT_PASSPHRASE_FILE`), and a mismatch leaves the container
+in a restart loop with "wrong passphrase or corrupt vault".
 
 Use the `discord`/`telegram`/`email`/`webhook` notification channels in
 Docker (there is no desktop notification daemon in a container).
