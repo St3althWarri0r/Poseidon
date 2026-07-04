@@ -190,15 +190,47 @@ class AlgorithmWorkshop:
         }
 
     async def backtest(self, algo_id: str, router: DataRouter, portfolio: PortfolioState,
-                       *, years: int = 5, starting_cash: float = 100_000.0) -> dict[str, Any]:
+                       *, years: int = 5, starting_cash: float = 100_000.0,
+                       period: str | None = None, start: str | None = None,
+                       end: str | None = None) -> dict[str, Any]:
         """Backtest the CURRENT saved source against real historical daily
         bars. A live discovery scan first records every symbol the
         algorithm actually touches (rotation trees fetch far beyond their
         configured universe); full history is then pulled for each and the
         code replays through the anti-lookahead window. Symbols whose
         history cannot be fetched are reported, never silently invented."""
+        from datetime import date, timedelta
+
         from ..backtest.rebalance import rebalance_backtest
         from ..core.errors import DataError
+
+        # Resolve the lookback window. period wins over years; explicit
+        # dates win over both ("custom").
+        today = date.today()
+        window_start: date | None = None
+        window_end: date | None = None
+        if start or (period or "").lower() == "custom":
+            if not start:
+                raise ValueError("custom period needs a start date (YYYY-MM-DD)")
+            window_start = date.fromisoformat(start)
+            window_end = date.fromisoformat(end) if end else None
+        elif period:
+            key = period.lower()
+            if key == "ytd":
+                window_start = date(today.year, 1, 1)
+            elif key in ("1y", "3y", "5y", "10y"):
+                window_start = today - timedelta(days=365 * int(key[:-1]))
+            else:
+                raise ValueError(f"unknown period '{period}' — use ytd/1y/3y/5y/10y/custom")
+        if window_start is not None:
+            if window_start >= today:
+                raise ValueError("start date must be in the past")
+            # Trading days from start to today, plus the 200-day warmup.
+            span_days = (today - window_start).days
+            years = 0  # sentinel; limit computed below
+            fetch_limit = min(int(span_days * 252 / 365) + 340, 10 * 252 + 340)
+        else:
+            fetch_limit = min(max(years, 1), 10) * 252 + 320
 
         record = await self.get(algo_id)
         symbols = record["symbols"] or self._default_symbols
@@ -222,11 +254,10 @@ class AlgorithmWorkshop:
                                symbols=symbols, options=record["params"])
         await algo.scan(_RecordingRouter(router), portfolio)  # type: ignore[arg-type]
 
-        limit = min(max(years, 1), 10) * 252 + 320  # warmup on top of the window
         history, skipped = {}, []
         for symbol in sorted(touched):
             try:
-                bars = await router.bars(symbol, timeframe="1d", limit=limit)
+                bars = await router.bars(symbol, timeframe="1d", limit=fetch_limit)
             except DataError:
                 bars = []
             if len(bars) >= 60:
@@ -236,7 +267,8 @@ class AlgorithmWorkshop:
         if not history:
             raise ValueError("no historical bars available for any symbol the algorithm uses")
 
-        report = await rebalance_backtest(algo, history, starting_cash=starting_cash)
+        report = await rebalance_backtest(algo, history, starting_cash=starting_cash,
+                                          start=window_start, end=window_end)
         report["algorithm"] = record["name"]
         report["symbols_tested"] = sorted(history)
         report["symbols_skipped_no_history"] = skipped

@@ -33,12 +33,13 @@ def _load_builtin() -> dict[str, type[Broker]]:
     from .plugins.schwab import SchwabBroker
     from .plugins.tastytrade import TastytradeBroker
     from .plugins.tradier import TradierBroker
+    from .plugins.vanguard import VanguardBroker
     from .plugins.webull import WebullBroker
 
     plugins: list[type[Broker]] = [
         PaperBroker, AlpacaBroker, TradierBroker, TastytradeBroker, SchwabBroker,
         IBKRBroker, ETradeBroker, PublicBroker, WebullBroker,
-        FidelityBroker, M1FinanceBroker, RobinhoodBroker,
+        FidelityBroker, M1FinanceBroker, RobinhoodBroker, VanguardBroker,
     ]
     return {p.name: p for p in plugins}
 

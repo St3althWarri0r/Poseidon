@@ -21,6 +21,7 @@ endpoints.
 | Robinhood | crypto only; no equities API | ⛔ stub (`robinhood`) |
 | Fidelity | no self-service API | ⛔ stub (`fidelity`) |
 | M1 Finance | no API of any kind | ⛔ stub (`m1finance`) |
+| Vanguard | no API of any kind | ⛔ stub (`vanguard`) |
 
 Scaffold/stub plugins raise a clear error explaining why, with the
 integration checklist in the module docstring

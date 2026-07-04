@@ -18,6 +18,7 @@ weigh yourself.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import structlog
@@ -34,7 +35,9 @@ _MIN_WARMUP_DAYS = 210  # algorithms routinely ask for 200d averages
 async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], *,
                              starting_cash: float = 100_000.0,
                              slippage_pct: float = 0.0005,
-                             commission_per_trade: float = 0.0) -> dict[str, Any]:
+                             commission_per_trade: float = 0.0,
+                             start: date | None = None,
+                             end: date | None = None) -> dict[str, Any]:
     history = {s.upper(): bars for s, bars in history.items() if bars}
     all_dates = sorted({b.start.date() for bars in history.values() for b in bars})
     if len(all_dates) <= _MIN_WARMUP_DAYS + 20:
@@ -42,6 +45,22 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
             f"only {len(all_dates)} trading days of history — need at least "
             f"{_MIN_WARMUP_DAYS + 21} (a 200-day warmup plus a test window)"
         )
+    if start is not None and end is not None and end <= start:
+        raise ValueError("end date must be after start date")
+    eval_from = _MIN_WARMUP_DAYS
+    if start is not None:
+        from bisect import bisect_left
+
+        start_index = bisect_left(all_dates, start)
+        if start_index < _MIN_WARMUP_DAYS:
+            raise ValueError(
+                f"only {start_index} trading days of history exist before {start} — "
+                f"the algorithms need a {_MIN_WARMUP_DAYS}-day warmup; choose a later "
+                "start or a symbol universe with deeper history"
+            )
+        eval_from = start_index
+        if start_index >= len(all_dates):
+            raise ValueError(f"no trading days on or after {start} in the fetched history")
     window = _HistoricalWindow(history)
     router = _RouterShim(window)
 
@@ -65,8 +84,10 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
             while cursor < len(bars) and bars[cursor].start.date() <= day:
                 cursor += 1
             window.cursor[symbol] = cursor
-        if day_index < _MIN_WARMUP_DAYS:
+        if day_index < eval_from:
             continue
+        if end is not None and day > end:
+            break
 
         marked = cash + sum(qty * (price(s, day) or 0.0) for s, qty in holdings.items())
         try:
@@ -141,6 +162,8 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
     return {
         "days_tested": len(equity_curve),
         "warmup_days": _MIN_WARMUP_DAYS,
+        "window": {"start": str(start) if start else "history start + warmup",
+                   "end": str(end) if end else "latest bar"},
         "start": str(equity_curve[0][0]), "end": str(equity_curve[-1][0]),
         "starting_cash": starting_cash,
         "final_equity": round(values[-1], 2),

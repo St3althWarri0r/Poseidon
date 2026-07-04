@@ -691,7 +691,7 @@ function selectAlgo(id) {
   notes.textContent = a.review_notes || "";
   $("#al-save").hidden = true;
   $("#al-test").hidden = false;
-  $("#al-backtest").hidden = false;
+  $("#al-bt-controls").hidden = false;
   $("#al-testout").hidden = true;
   $("#al-update").hidden = false;
   $("#al-activate").hidden = a.status === "active";
@@ -709,7 +709,7 @@ function clearAlgoEditor() {
   $("#al-notes").hidden = true;
   $("#al-save").hidden = false;
   $("#al-testout").hidden = true;
-  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test", "#al-backtest"]
+  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test", "#al-bt-controls"]
     .forEach((s) => ($(s).hidden = true));
   refreshAlgorithms();
 }
@@ -758,12 +758,25 @@ $("#al-delete").addEventListener("click", () =>
     clearAlgoEditor();
   }, "Deleted"));
 $("#al-new").addEventListener("click", clearAlgoEditor);
+$("#al-bt-period").addEventListener("change", () => {
+  const custom = $("#al-bt-period").value === "custom";
+  $("#al-bt-start").hidden = !custom;
+  $("#al-bt-end").hidden = !custom;
+});
+
 $("#al-backtest").addEventListener("click", async () => {
   const btn = $("#al-backtest");
+  const period = $("#al-bt-period").value;
+  const body = { period };
+  if (period === "custom") {
+    if (!$("#al-bt-start").value) { toast("Custom range needs a start date", "warn"); return; }
+    body.start = $("#al-bt-start").value;
+    if ($("#al-bt-end").value) body.end = $("#al-bt-end").value;
+  }
   btn.disabled = true;
   btn.textContent = "Backtesting…";
   try {
-    const r = await postJSON(`/api/algorithms/${selectedAlgo}/backtest`, { years: 5 });
+    const r = await postJSON(`/api/algorithms/${selectedAlgo}/backtest`, body);
     const out = $("#al-testout");
     out.hidden = false;
     const yearRows = Object.entries(r.annual_returns || {})
@@ -783,7 +796,7 @@ $("#al-backtest").addEventListener("click", async () => {
     toast("Backtest failed: " + String(e.message).slice(0, 200), "bad");
   } finally {
     btn.disabled = false;
-    btn.textContent = "Backtest 5y";
+    btn.textContent = "Backtest";
   }
 });
 

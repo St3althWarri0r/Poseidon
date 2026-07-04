@@ -336,10 +336,13 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.post("/api/algorithms/{algo_id}/backtest")
     async def backtest_algorithm(algo_id: str, body: dict[str, Any] | None = None) -> JSONResponse:
-        years = int((body or {}).get("years", 5))
+        payload = body or {}
         try:
             result = await kernel.workshop.backtest(
-                algo_id, kernel.router, kernel.portfolio, years=years
+                algo_id, kernel.router, kernel.portfolio,
+                years=int(payload.get("years", 5)),
+                period=payload.get("period"),
+                start=payload.get("start"), end=payload.get("end"),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

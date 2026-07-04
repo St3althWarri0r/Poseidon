@@ -482,3 +482,60 @@ class TestV2AndDayTrader:
         # Flat fake data: RSI is neutral, so no entry — and that's correct
         # behavior for a day trader with no setup. It must never raise.
         assert all(s.direction in ("long", "exit") for s in signals)
+
+
+class TestBacktestWindows:
+    async def test_custom_window_subsets_history(self) -> None:
+        from datetime import timedelta
+
+        from poseidon.backtest.rebalance import rebalance_backtest
+
+        algo = CustomAlgorithm(algo_name="rot", source=ROTATION_SOURCE, symbols=["AAA"])
+        history = TestRebalanceBacktest()._history(400)
+        dates = sorted({b.start.date() for b in history["AAA"]})
+        start, end = dates[250], dates[320]
+        report = await rebalance_backtest(algo, history, start=start, end=end)
+        assert report["start"] == str(start)
+        assert report["end"] <= str(end)
+        assert report["days_tested"] <= 71
+        assert report["window"]["start"] == str(start)
+
+        with pytest.raises(ValueError, match="warmup"):
+            await rebalance_backtest(algo, history, start=dates[50])
+        with pytest.raises(ValueError, match="after start"):
+            await rebalance_backtest(algo, history, start=end, end=start)
+        _ = timedelta  # imported for clarity of intent
+
+    async def test_workshop_period_parsing(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "w2.db")
+        await db.open()
+        try:
+            shop = AlgorithmWorkshop(db, StrategyEngine([], ["AAPL"]), AuditLog(db),
+                                     default_symbols=["AAPL"])
+            record = await shop.create(name="p", source=GOOD_SOURCE)
+            router = DataRouter([(FakeProvider(name="feed", bars_count=320), 10)],
+                                FreshnessPolicy())
+            with pytest.raises(ValueError, match="unknown period"):
+                await shop.backtest(record["id"], router, PortfolioState(), period="2w")
+            with pytest.raises(ValueError, match="start date"):
+                await shop.backtest(record["id"], router, PortfolioState(), period="custom")
+            # YTD resolves without error when history allows (FakeProvider
+            # serves 320 days; whether warmup fits depends on the calendar,
+            # so accept either a report or the honest warmup refusal).
+            try:
+                report = await shop.backtest(record["id"], router, PortfolioState(),
+                                             period="ytd")
+                assert report["days_tested"] >= 1
+            except ValueError as exc:
+                assert "warmup" in str(exc)
+        finally:
+            await db.close()
+
+
+def test_vanguard_is_an_explicit_stub() -> None:
+    from poseidon.brokers.base import UnsupportedBroker
+    from poseidon.brokers.registry import broker_registry
+
+    registry = broker_registry()
+    assert "vanguard" in registry
+    assert issubclass(registry["vanguard"], UnsupportedBroker)

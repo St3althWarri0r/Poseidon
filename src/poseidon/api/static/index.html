@@ -253,7 +253,18 @@
           <button class="btn" id="al-save">Save as new draft</button>
           <button class="btn" id="al-update" hidden>Save changes</button>
           <button class="btn" id="al-test" hidden>Test run</button>
-          <button class="btn" id="al-backtest" hidden>Backtest 5y</button>
+          <span id="al-bt-controls" class="bt-controls" hidden>
+            <select id="al-bt-period" title="Backtest lookback window">
+              <option value="ytd">YTD</option>
+              <option value="1y">1Y</option>
+              <option value="3y">3Y</option>
+              <option value="5y" selected>5Y</option>
+              <option value="custom">Custom…</option>
+            </select>
+            <input type="date" id="al-bt-start" hidden title="Start date">
+            <input type="date" id="al-bt-end" hidden title="End date (blank = latest)">
+            <button class="btn" id="al-backtest">Backtest</button>
+          </span>
           <button class="btn" id="al-activate" hidden>Activate</button>
           <button class="btn btn-ghost" id="al-deactivate" hidden>Deactivate</button>
           <button class="btn btn-reject" id="al-delete" hidden>Delete</button>

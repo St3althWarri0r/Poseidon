@@ -394,3 +394,7 @@ textarea.code {
 }
 
 label input, label select { width: 100%; min-width: 0; }
+
+.bt-controls { display: inline-flex; gap: 6px; align-items: center; }
+.bt-controls[hidden] { display: none; }
+.bt-controls select, .bt-controls input { padding: 5px 8px; font-size: 12.5px; }
