@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Poseidon
-Comment=Autonomous AI trading platform dashboard
-Exec=xdg-open http://127.0.0.1:8321
+Comment=Autonomous AI trading platform
+Exec=poseidon app
 Icon=utilities-terminal
 Terminal=false
 Categories=Office;Finance;

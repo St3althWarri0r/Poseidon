@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poseidon"
-version = "2.2.0"
+version = "2.3.0"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -39,6 +39,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Native desktop window for `poseidon app` (otherwise a Chromium app-mode
+# window is used automatically). On Arch/CachyOS the GTK backend also needs:
+#   sudo pacman -S webkit2gtk-4.1 python-gobject
+gui = ["pywebview>=5.0"]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",

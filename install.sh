@@ -89,6 +89,8 @@ ${BOLD}Poseidon installed.${RESET} Next steps:
   3. First run (foreground):
        poseidon run
      Dashboard: http://127.0.0.1:8321
+     Desktop window (own app window, no browser chrome):
+       poseidon app        # also in your application menu as "Poseidon"
   4. 24/7 operation (after storing the vault passphrase as a systemd credential —
      see docs/security.md):
        systemctl --user enable --now poseidon

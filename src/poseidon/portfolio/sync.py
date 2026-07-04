@@ -116,6 +116,10 @@ class PortfolioSyncService:
                  str(account.day_pnl) if account.day_pnl is not None else None,
                  broker.account_scope),
             )
+            # A successful pass proves the broker healthy no matter who
+            # triggered it (loop or the dashboard's Sync now) — reset the
+            # failure streak so backoff ends and reconnect fires only once.
+            self._consecutive_failures = 0
             if was_disconnected:
                 await self._bus.publish(Topics.BROKER_RECONNECTED, {"broker": broker.name})
             await self._bus.publish(Topics.ACCOUNT_SYNCED, self._state.snapshot_dict())
