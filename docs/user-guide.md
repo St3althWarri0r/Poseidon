@@ -54,7 +54,7 @@ you're notified). A daily digest lands on your notification channels at
 
 ## The dashboard (http://127.0.0.1:8321)
 
-A sidebar-navigated app with six views. The header is always present:
+A sidebar-navigated app with eight views. The header is always present:
 mode switch (Research / Approval / Auto), market session, **market
 regime**, health, circuit state, *Run cycle*, and **HALT** (kill switch —
 opens the circuit breaker until *Resume*; asks for confirmation). Action
@@ -68,8 +68,9 @@ await your approval.
   (your own orders — see *Trading manually*), armed guardian exit plans,
   and the order blotter (fills show their slippage; open orders can be
   canceled).
-- **AI Desk** — pending approvals with thesis/confidence/max-loss and
-  countdown; the full reasoning log; AI token usage and estimated spend.
+- **AI Desk** — **chat with Claude** (see *Chatting with Claude*); pending
+  approvals with thesis/confidence/max-loss and countdown; the full
+  reasoning log; AI token usage and estimated spend (chat included).
 - **Risk** — 1-day VaR/expected shortfall, portfolio beta, annualized
   vol, most-correlated pair, the market-regime read (trend, vol
   percentile, drawdown), loss-limit meters, and metric coverage.
@@ -78,8 +79,44 @@ await your approval.
 - **Algorithms** — the workshop: your saved custom screeners (drafts,
   active, archived), an editor, and the Claude import/review flow (see
   *The algorithm workshop*).
+- **Account** — the active broker (paper/LIVE badge, equity, sync state)
+  and the brokerage connector (see *Connecting your brokerage*).
 - **System** — component health, data-provider latency/penalty status,
   scheduler runtime, and the tamper-evident audit trail.
+
+## Connecting your brokerage
+
+The Account view connects a real brokerage without touching a terminal:
+
+1. Pick a broker tile (Public, Alpaca, Tradier, tastytrade, Schwab, IBKR —
+   the paper simulator is a tile too, so you can always switch back).
+2. Enter the credentials the form asks for. They are written **only to the
+   encrypted vault**, never to a file; a saved credential can be reused by
+   leaving the fields blank.
+3. **Test connection** proves auth and shows the account (id, equity,
+   buying power) without changing anything.
+4. **Connect & switch** re-proves the connection, stores the credential,
+   persists the choice (`poseidon.local.yaml` — safe to delete to revert),
+   and hot-swaps the active broker. No restart needed.
+
+Safety rails: switching never changes the operating mode (a LIVE account in
+research mode still cannot trade); the switch is refused while any order is
+open; and equity history, loss baselines, and peak-drawdown tracking are
+per-broker, so a paper history can never trip a halt on your real account.
+Brokers without an official self-service API (Fidelity, Vanguard, M1,
+Robinhood equities, …) are listed with the reason they cannot be connected.
+
+## Chatting with Claude
+
+The AI Desk's chat panel talks to the same Claude that runs review cycles,
+with the same live-data tools — quotes, bars, chains, news, your portfolio,
+risk metrics, performance, backtests. The same honesty rules apply: it
+fetches live numbers rather than reciting from memory, and says so when data
+is unavailable. The chat **cannot place, modify, or cancel orders** — for
+trading it will point you to the trade ticket or the operating modes. It can
+draft algorithms into the workshop on request (drafts only; you activate).
+History survives restarts; *Clear* wipes it. Chat tokens are metered into
+the same monthly budget as review cycles.
 
 ## Trading manually
 

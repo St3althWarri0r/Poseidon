@@ -41,6 +41,13 @@ class PortfolioSyncService:
         self._stop = asyncio.Event()
         self._consecutive_failures = 0
 
+    def set_broker(self, broker: Broker) -> None:
+        """Hot-swap the broker (Account view switch). The next sync pulls the
+        new account; failure counters reset so a flap on the old broker does
+        not carry a disconnected banner onto the new one."""
+        self._broker = broker
+        self._consecutive_failures = 0
+
     async def start(self) -> None:
         await self._restore_baselines()
         self._task = asyncio.create_task(self._loop(), name="portfolio-sync")
@@ -93,9 +100,11 @@ class PortfolioSyncService:
 
         await self._roll_baselines(now)
         await self._db.execute(
-            "INSERT OR REPLACE INTO equity_marks (at, equity, cash, day_pnl) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO equity_marks (at, equity, cash, day_pnl, broker) "
+            "VALUES (?, ?, ?, ?, ?)",
             (now.isoformat(), str(account.equity), str(account.cash),
-             str(account.day_pnl) if account.day_pnl is not None else None),
+             str(account.day_pnl) if account.day_pnl is not None else None,
+             self._broker.name),
         )
         if was_disconnected:
             await self._bus.publish(Topics.BROKER_RECONNECTED, {"broker": self._broker.name})
@@ -107,6 +116,7 @@ class PortfolioSyncService:
         stored_day = await self._db.kv_get("baseline.day.date")
         equity = self._state.equity
         assert equity is not None
+        await self._db.kv_set("baseline.broker", self._broker.name)
         if stored_day != eastern_date.isoformat():
             self._state.day_start_equity = equity
             await self._db.kv_set("baseline.day.date", eastern_date.isoformat())
@@ -120,15 +130,39 @@ class PortfolioSyncService:
                 await self._db.kv_set("baseline.week.equity", str(equity))
 
     async def _restore_baselines(self) -> None:
-        """Crash recovery: reload baselines and peak equity from the DB."""
+        """Crash recovery: reload baselines and peak equity from the DB.
+
+        Everything is scoped to the CURRENT broker: baselines and peaks that
+        belong to a previously active broker (e.g. the paper account before a
+        real brokerage was connected) must never carry over — a paper peak
+        would otherwise read as a massive drawdown on a smaller real account
+        and halt trading."""
         from decimal import Decimal
 
-        day_equity = await self._db.kv_get("baseline.day.equity")
-        week_equity = await self._db.kv_get("baseline.week.equity")
-        if day_equity:
-            self._state.day_start_equity = Decimal(day_equity)
-        if week_equity:
-            self._state.week_start_equity = Decimal(week_equity)
-        row = await self._db.fetch_one("SELECT MAX(CAST(equity AS REAL)) FROM equity_marks")
+        # One-time upgrade backfill: rows written before marks were
+        # broker-scoped all belong to the broker active at upgrade time.
+        if not await self._db.kv_get("equity_marks.broker_backfilled"):
+            await self._db.execute(
+                "UPDATE equity_marks SET broker = ? WHERE broker = ''", (self._broker.name,)
+            )
+            await self._db.kv_set("equity_marks.broker_backfilled", True)
+
+        baseline_broker = await self._db.kv_get("baseline.broker")
+        if baseline_broker in (None, "", self._broker.name):
+            day_equity = await self._db.kv_get("baseline.day.equity")
+            week_equity = await self._db.kv_get("baseline.week.equity")
+            if day_equity:
+                self._state.day_start_equity = Decimal(day_equity)
+            if week_equity:
+                self._state.week_start_equity = Decimal(week_equity)
+        else:
+            # Broker changed since the last run: force a re-baseline on the
+            # next sync instead of inheriting another account's numbers.
+            await self._db.kv_set("baseline.day.date", "")
+            await self._db.kv_set("baseline.week.key", "")
+        row = await self._db.fetch_one(
+            "SELECT MAX(CAST(equity AS REAL)) FROM equity_marks WHERE broker = ?",
+            (self._broker.name,),
+        )
         if row and row[0] is not None:
             self._state.peak_equity = Decimal(str(row[0]))

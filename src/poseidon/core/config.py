@@ -183,6 +183,10 @@ class WatchlistConfig(StrictModel):
 class AppConfig(StrictModel):
     mode: TradingMode = TradingMode.RESEARCH  # safest default
     data_dir: Path = Field(default_factory=default_data_dir)
+    # Set by load_config() to the file it loaded — lets runtime features
+    # (the dashboard's Account view) locate the sibling poseidon.local.yaml
+    # overlay. Not meant to be set in YAML; harmless if it is.
+    config_path: Path | None = None
     log_level: str = "INFO"
     ai: AIConfig = Field(default_factory=AIConfig)
     data: DataConfig = Field(default_factory=DataConfig)
@@ -257,6 +261,60 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+def _merge_named_list(base: list[Any], overlay: list[Any]) -> list[Any]:
+    """Merge two lists of {name: ...} entries: an overlay entry REPLACES the
+    same-name base entry wholesale, unknown names are appended. Order: base
+    order first, new overlay names after."""
+    by_name: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for entry in [*base, *overlay]:
+        if not isinstance(entry, dict) or "name" not in entry:
+            continue  # malformed rows surface later as pydantic errors on base
+        name = str(entry["name"])
+        if name not in by_name:
+            order.append(name)
+        by_name[name] = dict(entry)
+    return [by_name[n] for n in order]
+
+
+def apply_local_overlay(raw: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge the dashboard-managed poseidon.local.yaml over the main config.
+
+    Semantics differ from _deep_merge for the two named lists the dashboard
+    manages: ``brokers`` and ``data.providers`` merge per-entry by name
+    instead of being replaced wholesale, and if the overlay marks a broker
+    primary every base broker loses its primary flag first (there can be
+    only one, and the overlay's choice wins).
+    """
+    merged = dict(raw)
+    overlay = dict(overlay)
+    overlay_brokers = overlay.pop("brokers", None)
+    overlay_data = dict(overlay.pop("data", {}) or {})
+    overlay_providers = overlay_data.pop("providers", None)
+
+    merged = _deep_merge(merged, overlay)
+    if overlay_data:
+        merged["data"] = _deep_merge(dict(merged.get("data", {}) or {}), overlay_data)
+    if overlay_providers is not None:
+        data_section = dict(merged.get("data", {}) or {})
+        data_section["providers"] = _merge_named_list(
+            list(data_section.get("providers", []) or []), list(overlay_providers)
+        )
+        merged["data"] = data_section
+    if overlay_brokers is not None:
+        base_brokers = list(merged.get("brokers", []) or [])
+        if any(isinstance(b, dict) and b.get("primary") for b in overlay_brokers):
+            base_brokers = [
+                {**b, "primary": False} if isinstance(b, dict) else b for b in base_brokers
+            ]
+        merged["brokers"] = _merge_named_list(base_brokers, list(overlay_brokers))
+    return merged
+
+
+def local_overlay_path(config_path: Path) -> Path:
+    return config_path.with_name("poseidon.local.yaml")
+
+
 def load_config(path: Path | None = None) -> AppConfig:
     path = path or default_config_dir() / "poseidon.yaml"
     raw: dict[str, Any] = {}
@@ -268,8 +326,21 @@ def load_config(path: Path | None = None) -> AppConfig:
         if loaded is not None and not isinstance(loaded, dict):
             raise ConfigError(f"{path} must contain a YAML mapping")
         raw = loaded or {}
+    # Dashboard-managed overlay (broker connected from the Account view).
+    overlay_file = local_overlay_path(path)
+    if overlay_file.exists():
+        try:
+            overlay = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"cannot parse {overlay_file}: {exc}") from exc
+        if overlay is not None and not isinstance(overlay, dict):
+            raise ConfigError(f"{overlay_file} must contain a YAML mapping")
+        if overlay:
+            raw = apply_local_overlay(raw, overlay)
     raw = _deep_merge(raw, _deep_env_overrides())
     try:
-        return AppConfig.model_validate(raw)
+        config = AppConfig.model_validate(raw)
     except Exception as exc:  # pydantic.ValidationError formats nicely via str()
         raise ConfigError(f"invalid configuration ({path}):\n{exc}") from exc
+    config.config_path = path
+    return config

@@ -23,7 +23,9 @@ from live, authoritative data providers — never from memory, never estimated.
   news, earnings, economic calendar, option chains, volatility, and
   strategy signals; every decision ships with a full explainability report
   (thesis, timing, edge, risk/reward, confidence, exit plan, max loss,
-  alternatives).
+  alternatives). A **chat panel** on the AI Desk lets you talk to the same
+  Claude with the same live-data tools — discussion only; chat can never
+  place an order.
 - **Live data only, enforced in code** — every datum is timestamped and
   graded; stale data is rejected before it can reach the AI or an order.
   If data is unavailable, Poseidon explains why and does not trade.
@@ -55,9 +57,10 @@ from live, authoritative data providers — never from memory, never estimated.
   thinkScript, ...) for Claude to review and convert. Activate, edit,
   archive — validated, hot-reloaded, audited.
 - **Professional dashboard** — a sidebar-navigated dark UI (Overview,
-  Portfolio, AI Desk, Risk, Performance, System) with live tiles, equity
-  curve, approvals with one-click actions, toasts, and the full audit
-  trail. No frameworks, no CDNs — self-contained and localhost-only.
+  Portfolio, AI Desk, Risk, Performance, Algorithms, Account, System) with
+  live tiles, equity curve, Claude chat, approvals with one-click actions,
+  toasts, and the full audit trail. No frameworks, no CDNs —
+  self-contained and localhost-only.
 - **Execution quality (TCA)** — arrival price captured at risk validation,
   signed slippage in bps on every fill, and a standing best-execution
   report (fill rate, per-side/per-symbol cost, time-to-fill).
@@ -70,9 +73,12 @@ from live, authoritative data providers — never from memory, never estimated.
   Every order passes every rule.
 - **Broker plugins** — Alpaca, Tradier, tastytrade, Schwab, Interactive
   Brokers (Client Portal), Public.com (stocks/options/crypto, free API),
-  and a live-quote paper broker. Brokers without official APIs (Fidelity,
-  M1, Robinhood equities, …) ship as documented stubs — no terms-violating
-  automation, ever. Add a broker by implementing one class
+  and a live-quote paper broker. **Connect your account from the
+  dashboard's Account view** — credentials go straight into the encrypted
+  vault, the connection is tested first, and the switch is live without a
+  restart. Brokers without official APIs (Fidelity, M1, Robinhood
+  equities, …) ship as documented stubs — no terms-violating automation,
+  ever. Add a broker by implementing one class
   ([docs/plugin-development.md](docs/plugin-development.md)).
 - **Market data failover** — Public.com, Finnhub, Twelve Data, Alpha
   Vantage, Alpaca, Tradier, Polygon, tried in priority order with
@@ -88,7 +94,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 215 unit/integration tests, paper trading, historical
+- **Testing** — 229 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 

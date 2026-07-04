@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS equity_marks (
     at TEXT PRIMARY KEY,
     equity TEXT NOT NULL,
     cash TEXT NOT NULL,
-    day_pnl TEXT
+    day_pnl TEXT,
+    broker TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS exit_plans (
@@ -115,6 +116,13 @@ CREATE TABLE IF NOT EXISTS audit (
     prev_hash TEXT NOT NULL,
     hash TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL,        -- user | assistant
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -131,6 +139,13 @@ class Database:
         with contextlib.suppress(aiosqlite.OperationalError):
             await self._conn.execute(
                 "ALTER TABLE algorithms ADD COLUMN sleeve_pct REAL NOT NULL DEFAULT 0"
+            )
+        with contextlib.suppress(aiosqlite.OperationalError):
+            # Equity marks are broker-scoped so a paper account's history can
+            # never leak into a real account's drawdown/performance after a
+            # broker switch. Legacy rows keep broker='' and are excluded.
+            await self._conn.execute(
+                "ALTER TABLE equity_marks ADD COLUMN broker TEXT NOT NULL DEFAULT ''"
             )
         await self._conn.commit()
         # New databases must not be world readable.

@@ -70,6 +70,27 @@ class OrderManager:
     def set_mode(self, mode: TradingMode) -> None:
         self._mode = mode
 
+    @property
+    def broker_name(self) -> str:
+        return self._broker.name
+
+    def set_broker(self, broker: Broker) -> None:
+        """Hot-swap the broker (Account view switch). The kernel guarantees
+        there are no open orders before calling this — an order created at
+        one broker must never be polled or canceled against another."""
+        self._broker = broker
+
+    async def open_order_count(self) -> int:
+        """Orders that are (or may still go) live at the broker — the guard
+        the kernel checks before allowing a broker switch."""
+        row = await self._db.fetch_one(
+            "SELECT COUNT(*) FROM orders WHERE status IN (?, ?, ?, ?, ?)",
+            (OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
+             OrderStatus.PARTIALLY_FILLED.value, OrderStatus.PENDING_APPROVAL.value,
+             OrderStatus.APPROVED.value),
+        )
+        return int(row[0]) if row else 0
+
     # -- entry point --------------------------------------------------------------
 
     async def execute_decision(self, decision: Decision) -> list[Order]:
@@ -309,6 +330,19 @@ class OrderManager:
         count = 0
         for (payload,) in rows:
             order = Order.model_validate(json.loads(payload))
+            # Never poll an order against a different broker than the one it
+            # was submitted to (e.g. the operator switched brokers between
+            # runs): the ids mean nothing there and a cancel could misfire.
+            if order.broker and order.broker != self._broker.name:
+                order.status = OrderStatus.ERROR
+                order.status_reason = (
+                    f"order was open at '{order.broker}' but the active broker is now "
+                    f"'{self._broker.name}' — verify it at the brokerage directly"
+                )
+                await self._persist(order)
+                log.warning("open order orphaned by broker switch",
+                            order_id=order.id, was=order.broker, now=self._broker.name)
+                continue
             self._spawn_poller(order)
             count += 1
         if count:

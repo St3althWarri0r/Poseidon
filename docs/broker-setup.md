@@ -32,6 +32,16 @@ Exactly one enabled broker is marked `primary: true`; all orders route to
 it. Credentials are JSON objects stored in the vault under the name given
 in `brokers[].credential`.
 
+**The easy path: the dashboard's Account view.** Every full plugin below
+can be connected from the UI — pick the broker, enter the fields, *Test
+connection*, then *Connect & switch*. Credentials are written to the
+encrypted vault, the choice is persisted to `poseidon.local.yaml` (merged
+over `poseidon.yaml` at startup; delete it to revert), and the active
+broker is swapped live. The YAML instructions in each section below remain
+the equivalent manual path — Schwab's one-time OAuth browser consent (see
+its section below) still happens outside Poseidon before its refresh token
+can be pasted into either path.
+
 ## Paper (built-in)
 
 ```yaml

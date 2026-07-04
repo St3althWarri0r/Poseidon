@@ -398,3 +398,57 @@ label input, label select { width: 100%; min-width: 0; }
 .bt-controls { display: inline-flex; gap: 6px; align-items: center; }
 .bt-controls[hidden] { display: none; }
 .bt-controls select, .bt-controls input { padding: 5px 8px; font-size: 12.5px; }
+
+/* ---------- AI chat ---------- */
+
+.chat-log {
+  height: 380px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  padding: 4px 2px; margin-bottom: 10px;
+}
+.chat-msg {
+  max-width: 86%; padding: 9px 12px; border-radius: var(--radius-sm);
+  font-size: 13.5px; white-space: pre-wrap; overflow-wrap: break-word;
+}
+.chat-msg.user {
+  align-self: flex-end; background: var(--series-1-soft);
+  border: 1px solid var(--series-1); color: var(--ink);
+}
+.chat-msg.assistant {
+  align-self: flex-start; background: var(--surface-2);
+  border: 1px solid var(--border); color: var(--ink-2);
+}
+.chat-msg .chat-meta {
+  display: block; margin-top: 6px; font-size: 11px; color: var(--ink-muted);
+}
+.chat-msg.pending { opacity: .75; font-style: italic; }
+.chat-form { display: flex; gap: 8px; }
+.chat-form input {
+  flex: 1; min-width: 0; background: var(--surface-2); color: var(--ink);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  padding: 9px 12px; font-size: 13.5px;
+}
+
+/* ---------- Account / broker connect ---------- */
+
+.broker-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; }
+.broker-tile {
+  text-align: left; cursor: pointer; padding: 10px 12px;
+  background: var(--page); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--ink-2); font-size: 13px;
+}
+.broker-tile:hover { background: var(--surface-2); }
+.broker-tile.selected { border-color: var(--series-1); background: var(--series-1-soft); color: var(--ink); }
+.broker-tile .name { display: block; font-weight: 600; color: var(--ink); font-size: 13.5px; }
+.broker-tile .sub { display: block; margin-top: 2px; font-size: 11.5px; color: var(--ink-muted); }
+.broker-tile .chip { margin-top: 6px; }
+.bf-title { margin: 14px 0 2px; font-size: 14px; color: var(--ink); }
+.warn-note { color: var(--warning); }
+.stub-row { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
+.stub-row .name { color: var(--ink); font-weight: 600; min-width: 130px; }
+.stub-row .why { color: var(--ink-muted); font-size: 12.5px; }
+.acct-badge {
+  display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--border-strong); color: var(--ink-2);
+}
+.acct-badge.live { border-color: var(--warning); color: var(--warning); background: var(--warning-soft); }
+.acct-badge.paper { border-color: var(--good); color: var(--good); background: var(--good-soft); }
