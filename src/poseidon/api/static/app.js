@@ -56,6 +56,7 @@ const VIEWS = {
   algorithms:  { title: "Algorithms",  refresh: () => Promise.allSettled([refreshStatus(), refreshAlgorithms()]) },
   ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage(), refreshChat()]) },
   account:     { title: "Account",     refresh: () => Promise.allSettled([refreshStatus(), refreshAccount()]) },
+  dryrun:      { title: "Dry Run",     refresh: () => refreshDryRun() },
   risk:        { title: "Risk",        refresh: () => Promise.allSettled([refreshStatus(), refreshRiskMetrics()]) },
   performance: { title: "Performance", refresh: () => Promise.allSettled([refreshPerformance(), refreshExecution()]) },
   system:      { title: "System",      refresh: () => Promise.allSettled([refreshStatus(), refreshAudit()]) },
@@ -1194,6 +1195,72 @@ $("#chat-clear").addEventListener("click", async () => {
 
 let brokerCatalog = [];
 let selectedBroker = null;
+
+/* ================= Dry Run ================= */
+
+async function refreshDryRun() {
+  let s;
+  try { s = await getJSON("/api/dryrun"); }
+  catch (e) { $("#dryrun-summary").textContent = "Could not load dry-run state: " + e.message; return; }
+  renderDryRun(s);
+}
+
+function renderDryRun(s) {
+  const on = (ok) => ok ? "✅" : "▫️";
+  const brokerOk = s.broker_is_paper;
+  const algosOk = s.active_algo_count > 0;
+  const autoOk = s.mode === "autonomous";
+  $("#dryrun-steps").innerHTML = `
+    <div class="form-row dryrun-step"><span>${on(brokerOk)} Broker = Paper simulator</span>
+      <button type="button" class="btn btn-ghost" id="dryrun-broker-toggle" ${brokerOk ? "disabled" : ""}>
+        ${brokerOk ? "Active" : "Switch to paper"}</button>
+      <small>${brokerOk ? "The safe simulator is active." : "Currently: " + esc(s.active_broker) + ". Switch to paper to dry-run safely."}</small></div>
+    <div class="form-row dryrun-step"><span>${on(algosOk)} Built-in algorithms active (${s.active_algo_count} on)</span>
+      <button type="button" class="btn btn-ghost" id="dryrun-algos-activate" ${s.bundled_draft_count ? "" : "disabled"}>
+        ${s.bundled_draft_count ? "Activate the " + s.bundled_draft_count + " built-in algorithm(s)" : "None pending"}</button>
+      <small>Their signals feed each review cycle alongside Claude.</small></div>
+    <div class="form-row dryrun-step"><span id="dryrun-mode-state">${on(autoOk)} Autonomous mode (${esc(s.mode)})</span>
+      <button type="button" class="btn btn-ghost" id="dryrun-mode-toggle" ${brokerOk ? "" : "disabled"}>
+        ${autoOk ? "On" : "Turn on"}</button>
+      <small>${brokerOk ? "Safe on paper — Claude executes its own trades." : "Switch to paper first."}</small></div>`;
+  const m = s.market;
+  $("#dryrun-market").textContent = m.is_open
+    ? "Market open — paper trades can execute now."
+    : `Market closed — the dry run will start trading at the next open (${m.opens_hint}).`;
+  $("#dryrun-summary").textContent = (brokerOk && algosOk && autoOk)
+    ? "✅ Dry run active — Claude and your algorithms are trading the paper account."
+    : "Turn on all three steps above to start the dry run.";
+  $("#dryrun-broker-toggle")?.addEventListener("click", dryrunSwitchToPaper);
+  $("#dryrun-algos-activate")?.addEventListener("click", () => dryrunActivateStarters(s));
+  $("#dryrun-mode-toggle")?.addEventListener("click", () => dryrunSetMode(autoOk ? "research" : "autonomous"));
+}
+
+async function dryrunSwitchToPaper() {
+  try { await postJSON("/api/brokers/connect", { name: "paper", paper: true }); toast("Switched to the paper simulator", "good"); }
+  catch (e) { toast("Could not switch to paper: " + e.message, "bad"); }
+  refreshDryRun();
+}
+
+async function dryrunActivateStarters(s) {
+  const starters = (s.algorithms || []).filter((a) => a.bundled && a.status === "draft");
+  for (const a of starters) {
+    try { await postJSON(`/api/algorithms/${a.id}/activate`, {}); }
+    catch (e) { toast(`Could not activate ${a.name}: ${e.message}`, "bad"); }
+  }
+  toast(`Activated ${starters.length} built-in algorithm(s)`, "good");
+  refreshDryRun();
+}
+
+async function dryrunSetMode(mode) {
+  try { await postJSON("/api/mode", { mode }); toast("Mode: " + mode, mode === "autonomous" ? "warn" : "good"); }
+  catch (e) { toast("Mode change failed: " + e.message, "bad"); }
+  refreshDryRun();
+}
+
+$("#dryrun-run-now").addEventListener("click", () =>
+  postJSON("/api/cycle").then(() => toast("Review cycle started"))
+    .catch((e) => toast("Review cycle failed: " + e.message, "bad")));
+$("#dryrun-stop").addEventListener("click", () => dryrunSetMode("research"));
 
 async function refreshAccount() {
   const data = await getJSON("/api/brokers");

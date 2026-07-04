@@ -290,6 +290,9 @@ class FakeKernel:
         self.mode = mode
         self.order_manager.mode = mode
 
+    async def run_review_cycle(self):
+        return None
+
 
 async def drive() -> None:
     from playwright.async_api import async_playwright
@@ -427,6 +430,33 @@ async def drive() -> None:
         toasts = await page.text_content("#toasts")
         check("sync now", toasts is not None and "synced" in toasts.lower(), repr(toasts))
         await page.screenshot(path=f"{SHOTS}/v-account.png")
+
+        # -- Dry Run: the guided paper-dry-run panel -----------------------
+        await page.click('a[data-view="dryrun"]')
+        await page.wait_for_timeout(400)
+        banner = await page.text_content("#dryrun-banner")
+        check("dry run safe banner", banner is not None and "no real money" in banner.lower(),
+              repr(banner))
+        steps = await page.locator("#dryrun-steps .dryrun-step").count()
+        check("dry run has three steps", steps == 3, f"count={steps}")
+        market = await page.text_content("#dryrun-market")
+        check("dry run market indicator", market is not None and "market" in market.lower(),
+              repr(market))
+        await page.click("#dryrun-mode-toggle")  # paper broker -> no real-money confirm needed
+        await page.wait_for_timeout(400)
+        mode_state = await page.text_content("#dryrun-mode-state")
+        check("dry run autonomous engaged", mode_state is not None
+              and "autonomous" in mode_state.lower(), repr(mode_state))
+        await page.click("#dryrun-run-now")
+        await page.wait_for_timeout(300)
+        toasts = await page.text_content("#toasts")
+        check("dry run run-now", toasts is not None and "cycle" in toasts.lower(), repr(toasts))
+        await page.click("#dryrun-stop")
+        await page.wait_for_timeout(400)
+        mode_state = await page.text_content("#dryrun-mode-state")
+        check("dry run stop -> research", mode_state is not None
+              and "research" in mode_state.lower(), repr(mode_state))
+        await page.screenshot(path=f"{SHOTS}/v-dryrun.png")
 
         # -- Algorithms: auto-invest flow ----------------------------------
         await page.click('a[data-view="algorithms"]')

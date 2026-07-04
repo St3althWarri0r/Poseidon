@@ -457,3 +457,7 @@ label input, label select { width: 100%; min-width: 0; }
 [hidden] { display: none !important; }
 
 .chip.auto { border-color: var(--good); color: var(--good); background: var(--good-soft); }
+
+/* Dry Run guided panel */
+.dryrun-step { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dryrun-step > span { min-width: 16rem; font-weight: 600; }
