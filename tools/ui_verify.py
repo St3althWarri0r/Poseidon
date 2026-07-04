@@ -133,7 +133,8 @@ class FakeWorkshop:
              "created_at": NOW.isoformat(), "updated_at": NOW.isoformat()},
             {"id": "a2", "name": "tqqq_day_trader", "description": "draft", "source": "async def scan(ctx):\n    return []",
              "symbols": [], "params": {}, "status": "draft", "created_by": "claude",
-             "review_notes": "", "sleeve_pct": 0,
+             # Marks it as a bundled starter so the Dry Run panel offers to activate it.
+             "review_notes": "bundled example — review before activating", "sleeve_pct": 0,
              "created_at": NOW.isoformat(), "updated_at": NOW.isoformat()},
         ]
 
