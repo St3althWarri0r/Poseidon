@@ -330,3 +330,111 @@ class TestSecondExampleAndDryRun:
             assert engine.enabled_names == []  # dry run never registers
         finally:
             await db.close()
+
+
+ROTATION_SOURCE = '''
+async def scan(ctx):
+    # Deterministic rotation: hold A above its 20d average, else B.
+    bars_a = await ctx.bars("AAA", timeframe="1d", limit=30)
+    closes = [float(b.close) for b in bars_a]
+    avg = ctx.sma(closes, 20)
+    if avg is None:
+        return []
+    pick = "AAA" if closes[-1] >= avg else "BBB"
+    return [{"symbol": pick, "direction": "long", "strength": 1.0,
+             "evidence": {"target_weight": 1.0}}]
+'''
+
+
+class TestRebalanceBacktest:
+    def _history(self, days: int = 300):  # noqa: ANN202
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from poseidon.core.models import Bar
+
+        now = datetime.now(UTC)
+        history = {}
+        for symbol, drift in (("AAA", 1.001), ("BBB", 1.0)):
+            price, bars = 100.0, []
+            for i in range(days):
+                day = now - timedelta(days=days - i)
+                price *= drift
+                bars.append(Bar(symbol=symbol, open=Decimal(str(round(price, 4))),
+                                high=Decimal(str(round(price * 1.01, 4))),
+                                low=Decimal(str(round(price * 0.99, 4))),
+                                close=Decimal(str(round(price, 4))), volume=1_000_000,
+                                start=day, end=day, source="t"))
+            history[symbol] = bars
+        return history
+
+    async def test_rotation_backtest_tracks_uptrend(self) -> None:
+        from poseidon.backtest.rebalance import rebalance_backtest
+
+        algo = CustomAlgorithm(algo_name="rot", source=ROTATION_SOURCE, symbols=["AAA"])
+        report = await rebalance_backtest(algo, self._history(320))
+        # AAA drifts +0.1%/day and the algo holds it after warmup.
+        assert report["total_return"] > 0.05
+        assert report["rebalances"] >= 1
+        assert report["days_tested"] > 80
+        assert report["equity_curve"][0]["equity"] > 0
+        assert "survivorship" in report["note"]
+
+    async def test_insufficient_history_is_refused(self) -> None:
+        from poseidon.backtest.rebalance import rebalance_backtest
+
+        algo = CustomAlgorithm(algo_name="rot", source=ROTATION_SOURCE, symbols=["AAA"])
+        with pytest.raises(ValueError, match="warmup"):
+            await rebalance_backtest(algo, self._history(100))
+
+    async def test_workshop_backtest_end_to_end(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "bt.db")
+        await db.open()
+        try:
+            engine = StrategyEngine([], ["AAPL"])
+            shop = AlgorithmWorkshop(db, engine, AuditLog(db), default_symbols=["AAPL"])
+            record = await shop.create(name="bt", source=GOOD_SOURCE)
+            router = DataRouter([(FakeProvider(name="feed", bars_count=320), 10)],
+                                FreshnessPolicy())
+            report = await shop.backtest(record["id"], router, PortfolioState(), years=2)
+            assert report["algorithm"] == "bt"
+            assert "AAPL" in report["symbols_tested"]
+            assert report["days_tested"] > 50
+        finally:
+            await db.close()
+
+
+class TestSleeves:
+    async def test_sleeve_registered_on_activate_and_cleared(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "s.db")
+        await db.open()
+        try:
+            caps: dict[str, float] = {}
+            engine = StrategyEngine([], ["AAPL"])
+            shop = AlgorithmWorkshop(db, engine, AuditLog(db),
+                                     default_symbols=["AAPL"], sleeve_caps=caps)
+            record = await shop.create(name="rot", source=GOOD_SOURCE, sleeve_pct=0.35)
+            assert record["sleeve_pct"] == 0.35
+            assert caps == {}  # drafts have no sleeve in force
+            await shop.activate(record["id"])
+            assert caps == {"algo:rot": 0.35}
+            await shop.deactivate(record["id"])
+            assert caps == {}
+            # Reload path registers active sleeves at startup.
+            await shop.activate(record["id"])
+            caps.clear()
+            assert await shop.load_active() == 1
+            assert caps == {"algo:rot": 0.35}
+        finally:
+            await db.close()
+
+    async def test_sleeve_bounds_enforced(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "s2.db")
+        await db.open()
+        try:
+            shop = AlgorithmWorkshop(db, StrategyEngine([], []), AuditLog(db),
+                                     default_symbols=[])
+            with pytest.raises(ConfigError, match="sleeve_pct"):
+                await shop.create(name="bad", source=GOOD_SOURCE, sleeve_pct=1.5)
+        finally:
+            await db.close()

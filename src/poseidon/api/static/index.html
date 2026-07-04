@@ -239,7 +239,12 @@
           <label>Name<input id="al-name" placeholder="my_breakout_screen"></label>
           <label>Symbols <small>(blank = watchlist)</small><input id="al-symbols" placeholder="AAPL, MSFT"></label>
         </div>
-        <label class="wide">Description<input id="al-desc" placeholder="What this screen looks for"></label>
+        <div class="form-row">
+          <label class="wide">Description<input id="al-desc" placeholder="What this screen looks for"></label>
+          <label>Sleeve % of equity <small>(0 = advisory only)</small>
+            <input id="al-sleeve" inputmode="decimal" placeholder="0"
+              title="Dedicated capital sleeve: this algorithm's positions may use up to this % of equity, overriding max_position_pct for its orders only. All other risk rules still apply."></label>
+        </div>
         <textarea id="al-source" class="code" spellcheck="false" rows="16"
           placeholder="async def scan(ctx):&#10;    signals = []&#10;    for symbol in ctx.symbols:&#10;        bars = await ctx.bars(symbol, timeframe=&quot;1d&quot;, limit=50)&#10;        ...&#10;    return signals"></textarea>
         <div id="al-notes" class="review-notes" hidden></div>
@@ -248,6 +253,7 @@
           <button class="btn" id="al-save">Save as new draft</button>
           <button class="btn" id="al-update" hidden>Save changes</button>
           <button class="btn" id="al-test" hidden>Test run</button>
+          <button class="btn" id="al-backtest" hidden>Backtest 5y</button>
           <button class="btn" id="al-activate" hidden>Activate</button>
           <button class="btn btn-ghost" id="al-deactivate" hidden>Deactivate</button>
           <button class="btn btn-reject" id="al-delete" hidden>Delete</button>

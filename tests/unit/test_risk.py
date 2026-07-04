@@ -305,3 +305,37 @@ class TestCircuitBreaker:
         cooldowns.record_trade("AAPL")
         assert cooldowns.remaining("aapl") > 290
         assert cooldowns.remaining("MSFT") == 0
+
+
+class TestSleeveOverride:
+    """A dedicated sleeve substitutes ONLY the per-position cap."""
+
+    def _order(self, strategy: str, qty: str) -> Order:
+        return Order(symbol="TQQQ", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                     quantity=Decimal(qty), limit_price=Decimal("100.00"),
+                     strategy=strategy)
+
+    def test_sleeve_raises_cap_for_its_strategy_only(self) -> None:
+        # 100k equity; default cap 10% blocks a 40k order, a 50% sleeve allows it.
+        context = ctx(self._order("algo:rot", "400"))
+        context.sleeve_caps = {"algo:rot": 0.5}
+        PositionSizeRule().check(context)
+        blocked = ctx(self._order("momentum", "400"))
+        blocked.sleeve_caps = {"algo:rot": 0.5}
+        with pytest.raises(RiskViolation, match="max_position_pct"):
+            PositionSizeRule().check(blocked)
+
+    def test_sleeve_is_still_a_ceiling(self) -> None:
+        context = ctx(self._order("algo:rot", "600"))  # 60k > 50% sleeve
+        context.sleeve_caps = {"algo:rot": 0.5}
+        with pytest.raises(RiskViolation, match="sleeve"):
+            PositionSizeRule().check(context)
+
+    def test_other_rules_unaffected_by_sleeve(self) -> None:
+        # Gross-exposure cap still applies to sleeve orders (1.0x equity).
+        from poseidon.risk.rules import PortfolioExposureRule
+
+        context = ctx(self._order("algo:rot", "1100"))  # 110k > 100k gross cap
+        context.sleeve_caps = {"algo:rot": 1.0}
+        with pytest.raises(RiskViolation, match="gross exposure"):
+            PortfolioExposureRule().check(context)

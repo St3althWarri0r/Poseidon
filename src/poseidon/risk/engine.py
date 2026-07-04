@@ -41,6 +41,10 @@ class RiskEngine:
             cooldown_seconds=config.circuit_breaker_cooldown_seconds,
         )
         self.cooldowns = TradeCooldowns(per_symbol_seconds=config.trade_cooldown_seconds)
+        # Dedicated sleeves: strategy name -> fraction of equity its
+        # positions may occupy (overrides max_position_pct for that
+        # strategy only). Maintained by the algorithm workshop.
+        self.sleeve_caps: dict[str, float] = {}
         self._orders_today = 0
         self._orders_today_date: str = ""
 
@@ -110,6 +114,7 @@ class RiskEngine:
             cooldown_remaining=self.cooldowns.remaining(order.symbol),
             order_sector=order_sector,
             position_sectors=position_sectors,
+            sleeve_caps=dict(self.sleeve_caps),
         )
         for rule in self._rules:
             try:

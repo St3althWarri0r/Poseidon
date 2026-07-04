@@ -88,7 +88,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 174 unit/integration tests, paper trading, historical
+- **Testing** — 197 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 

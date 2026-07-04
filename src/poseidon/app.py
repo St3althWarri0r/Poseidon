@@ -112,6 +112,7 @@ class ApplicationKernel:
         self.workshop = AlgorithmWorkshop(
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
+            sleeve_caps=self.risk.sleeve_caps,
         )
         await self.workshop.load_active()
         dispatcher = ToolDispatcher(

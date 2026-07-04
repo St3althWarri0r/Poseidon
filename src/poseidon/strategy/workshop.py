@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 _COLUMNS = ("id, name, description, source, symbols, params, status, "
-            "created_by, review_notes, created_at, updated_at")
+            "created_by, review_notes, sleeve_pct, created_at, updated_at")
 
 
 def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
@@ -49,11 +49,15 @@ def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
 
 class AlgorithmWorkshop:
     def __init__(self, db: Database, engine: StrategyEngine, audit: AuditLog,
-                 *, default_symbols: list[str]) -> None:
+                 *, default_symbols: list[str],
+                 sleeve_caps: dict[str, float] | None = None) -> None:
         self._db = db
         self._engine = engine
         self._audit = audit
         self._default_symbols = default_symbols
+        # Shared with the risk engine: strategy name -> fraction of equity
+        # that positions from that algorithm may occupy (its sleeve).
+        self._sleeve_caps = sleeve_caps if sleeve_caps is not None else {}
 
     # -- queries ---------------------------------------------------------------
 
@@ -75,8 +79,10 @@ class AlgorithmWorkshop:
 
     async def create(self, *, name: str, source: str, description: str = "",
                      symbols: list[str] | None = None, params: dict[str, Any] | None = None,
-                     created_by: str = "user", review_notes: str = "") -> dict[str, Any]:
+                     created_by: str = "user", review_notes: str = "",
+                     sleeve_pct: float = 0.0) -> dict[str, Any]:
         name = self._clean_name(name)
+        sleeve_pct = self._clean_sleeve(sleeve_pct)
         problems = validate_algorithm(source)
         if problems:
             raise ConfigError("algorithm failed validation: " + "; ".join(problems))
@@ -84,11 +90,11 @@ class AlgorithmWorkshop:
         algo_id = uuid.uuid4().hex[:12]
         await self._db.execute(
             "INSERT INTO algorithms (id, name, description, source, symbols, params, status, "
-            "created_by, review_notes, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+            "created_by, review_notes, sleeve_pct, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)",
             (algo_id, name, description, source,
              json.dumps([s.upper() for s in (symbols or [])]), json.dumps(params or {}),
-             created_by, review_notes, now, now),
+             created_by, review_notes, sleeve_pct, now, now),
         )
         await self._audit.append(created_by if created_by == "claude" else "human",
                                  "algorithm.created", {"id": algo_id, "name": name})
@@ -98,8 +104,11 @@ class AlgorithmWorkshop:
     async def update(self, algo_id: str, *, source: str | None = None,
                      description: str | None = None, symbols: list[str] | None = None,
                      params: dict[str, Any] | None = None,
-                     review_notes: str | None = None) -> dict[str, Any]:
+                     review_notes: str | None = None,
+                     sleeve_pct: float | None = None) -> dict[str, Any]:
         record = await self.get(algo_id)
+        if sleeve_pct is not None:
+            record["sleeve_pct"] = self._clean_sleeve(float(sleeve_pct))
         if source is not None:
             problems = validate_algorithm(source)
             if problems:
@@ -115,9 +124,9 @@ class AlgorithmWorkshop:
             record["review_notes"] = review_notes
         await self._db.execute(
             "UPDATE algorithms SET description=?, source=?, symbols=?, params=?, "
-            "review_notes=?, updated_at=? WHERE id=?",
+            "review_notes=?, sleeve_pct=?, updated_at=? WHERE id=?",
             (record["description"], record["source"], json.dumps(record["symbols"]),
-             json.dumps(record["params"]), record["review_notes"],
+             json.dumps(record["params"]), record["review_notes"], record["sleeve_pct"],
              datetime.now(UTC).isoformat(), algo_id),
         )
         await self._audit.append("human", "algorithm.updated", {"id": algo_id, "name": record["name"]})
@@ -134,6 +143,10 @@ class AlgorithmWorkshop:
             options=record["params"],
         )
         self._engine.add_strategy(strategy)
+        if record["sleeve_pct"] > 0:
+            self._sleeve_caps[f"algo:{record['name']}"] = float(record["sleeve_pct"])
+        else:
+            self._sleeve_caps.pop(f"algo:{record['name']}", None)
         await self._set_status(algo_id, "active")
         await self._audit.append("human", "algorithm.activated",
                                  {"id": algo_id, "name": record["name"]})
@@ -143,6 +156,7 @@ class AlgorithmWorkshop:
     async def deactivate(self, algo_id: str, *, archive: bool = False) -> dict[str, Any]:
         record = await self.get(algo_id)
         self._engine.remove_strategy(f"algo:{record['name']}")
+        self._sleeve_caps.pop(f"algo:{record['name']}", None)
         await self._set_status(algo_id, "archived" if archive else "draft")
         await self._audit.append("human", "algorithm.deactivated",
                                  {"id": algo_id, "name": record["name"]})
@@ -151,6 +165,7 @@ class AlgorithmWorkshop:
     async def delete(self, algo_id: str) -> None:
         record = await self.get(algo_id)
         self._engine.remove_strategy(f"algo:{record['name']}")
+        self._sleeve_caps.pop(f"algo:{record['name']}", None)
         await self._db.execute("DELETE FROM algorithms WHERE id = ?", (algo_id,))
         await self._audit.append("human", "algorithm.deleted",
                                  {"id": algo_id, "name": record["name"]})
@@ -173,6 +188,62 @@ class AlgorithmWorkshop:
             "count": len(signals),
             "note": "dry run against live data — nothing was traded or saved",
         }
+
+    async def backtest(self, algo_id: str, router: DataRouter, portfolio: PortfolioState,
+                       *, years: int = 5, starting_cash: float = 100_000.0) -> dict[str, Any]:
+        """Backtest the CURRENT saved source against real historical daily
+        bars. A live discovery scan first records every symbol the
+        algorithm actually touches (rotation trees fetch far beyond their
+        configured universe); full history is then pulled for each and the
+        code replays through the anti-lookahead window. Symbols whose
+        history cannot be fetched are reported, never silently invented."""
+        from ..backtest.rebalance import rebalance_backtest
+        from ..core.errors import DataError
+
+        record = await self.get(algo_id)
+        symbols = record["symbols"] or self._default_symbols
+
+        touched: set[str] = {s.upper() for s in symbols}
+
+        class _RecordingRouter:
+            """Pass-through to the live router that records bar requests."""
+
+            def __init__(self, inner: DataRouter) -> None:
+                self._inner = inner
+
+            async def bars(self, symbol: str, **kwargs: Any) -> Any:
+                touched.add(symbol.upper())
+                return await self._inner.bars(symbol, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        algo = CustomAlgorithm(algo_name=record["name"], source=record["source"],
+                               symbols=symbols, options=record["params"])
+        await algo.scan(_RecordingRouter(router), portfolio)  # type: ignore[arg-type]
+
+        limit = min(max(years, 1), 10) * 252 + 320  # warmup on top of the window
+        history, skipped = {}, []
+        for symbol in sorted(touched):
+            try:
+                bars = await router.bars(symbol, timeframe="1d", limit=limit)
+            except DataError:
+                bars = []
+            if len(bars) >= 60:
+                history[symbol] = bars
+            else:
+                skipped.append(symbol)
+        if not history:
+            raise ValueError("no historical bars available for any symbol the algorithm uses")
+
+        report = await rebalance_backtest(algo, history, starting_cash=starting_cash)
+        report["algorithm"] = record["name"]
+        report["symbols_tested"] = sorted(history)
+        report["symbols_skipped_no_history"] = skipped
+        await self._audit.append("human", "algorithm.backtested",
+                                 {"id": algo_id, "name": record["name"],
+                                  "total_return": report["total_return"]})
+        return report
 
     async def load_active(self) -> int:
         """Startup: compile and register every active algorithm. One broken
@@ -198,6 +269,8 @@ class AlgorithmWorkshop:
                 )
                 continue
             self._engine.add_strategy(strategy)
+            if record["sleeve_pct"] > 0:
+                self._sleeve_caps[f"algo:{record['name']}"] = float(record["sleeve_pct"])
             count += 1
         if count:
             log.info("workshop algorithms loaded", active=count)
@@ -210,6 +283,12 @@ class AlgorithmWorkshop:
             "UPDATE algorithms SET status=?, updated_at=? WHERE id=?",
             (status, datetime.now(UTC).isoformat(), algo_id),
         )
+
+    @staticmethod
+    def _clean_sleeve(value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ConfigError("sleeve_pct must be between 0 (no sleeve) and 1")
+        return round(float(value), 4)
 
     @staticmethod
     def _clean_name(name: str) -> str:

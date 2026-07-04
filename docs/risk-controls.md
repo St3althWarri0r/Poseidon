@@ -93,6 +93,19 @@ else: session checks, notional bounds, slippage protection, duplicate
 prevention, and the circuit breaker. `sell_to_open` (opening short option
 risk) is deliberately **not** exempt.
 
+### Dedicated sleeves
+
+An algorithm can be given a **capital sleeve** (a fraction of equity, set
+in the Algorithms editor). Orders attributed to that algorithm use the
+sleeve as their per-position cap instead of `max_position_pct`, so a
+concentrated rotation model (e.g. a 100%-TQQQ symphony) can run at full
+weight *inside its allocation* while the rest of the book keeps the
+tighter institutional limit. Sleeves substitute exactly one rule — the
+position-size cap — and nothing else: gross exposure, leverage, loss
+halts, liquidity filters, VaR, blackouts, and the circuit breaker apply
+to sleeve orders unchanged. Sleeves take effect only while the algorithm
+is active, and every change is audited.
+
 ## Position guardian
 
 Every AI entry carries an exit plan; the guardian makes it binding. When

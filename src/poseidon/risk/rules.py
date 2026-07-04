@@ -36,6 +36,8 @@ class RiskContext:
     # Sector taxonomy (None = unknown/unavailable; ETFs have no sector).
     order_sector: str | None = None
     position_sectors: dict[str, str] = field(default_factory=dict)
+    # Dedicated sleeves: strategy -> per-position equity fraction override.
+    sleeve_caps: dict[str, float] = field(default_factory=dict)
 
     @property
     def reference_price(self) -> Decimal:
@@ -106,6 +108,13 @@ class BuyingPowerRule(RiskRule):
 
 
 class PositionSizeRule(RiskRule):
+    """Per-position cap. An order from a strategy with a dedicated sleeve
+    uses the sleeve as its cap instead — a concentrated rotation model can
+    run at full weight inside its allocation while everything else keeps
+    the tighter institutional limit. Sleeves only substitute this one
+    rule: gross exposure, leverage, loss halts, liquidity filters, and
+    every other rule still apply unchanged."""
+
     name = "max_position_size"
 
     def check(self, ctx: RiskContext) -> None:
@@ -118,12 +127,15 @@ class PositionSizeRule(RiskRule):
         position = ctx.portfolio.position_for(ctx.order.symbol)
         if position is not None and position.market_value is not None:
             existing = abs(position.market_value)
-        limit = equity * Decimal(str(ctx.config.max_position_pct))
+        sleeve = ctx.sleeve_caps.get(ctx.order.strategy)
+        cap_pct = sleeve if sleeve is not None else ctx.config.max_position_pct
+        limit = equity * Decimal(str(cap_pct))
         if existing + ctx.notional > limit:
+            source = "sleeve" if sleeve is not None else "max_position_pct"
             raise RiskViolation(
                 self.name,
                 f"position would be {(existing + ctx.notional):.2f}, limit {limit:.2f} "
-                f"({ctx.config.max_position_pct:.0%} of equity)",
+                f"({cap_pct:.0%} of equity, {source})",
             )
 
 

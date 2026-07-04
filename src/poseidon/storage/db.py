@@ -12,6 +12,7 @@ protected by directory permissions plus optional fscrypt/LUKS).
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS algorithms (
     status TEXT NOT NULL DEFAULT 'draft', -- draft | active | archived
     created_by TEXT NOT NULL DEFAULT 'user',  -- user | claude
     review_notes TEXT NOT NULL DEFAULT '',
+    sleeve_pct REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -125,6 +127,11 @@ class Database:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self._path)
         await self._conn.executescript(_SCHEMA)
+        # Additive migrations for databases created before a column existed.
+        with contextlib.suppress(aiosqlite.OperationalError):
+            await self._conn.execute(
+                "ALTER TABLE algorithms ADD COLUMN sleeve_pct REAL NOT NULL DEFAULT 0"
+            )
         await self._conn.commit()
         # New databases must not be world readable.
         self._path.chmod(0o600)

@@ -133,8 +133,13 @@ standard desk set (`macd`, `bollinger`, `stochastic`, `atr`, `adx`,
 `obv`, `rate_of_change`, `highest`/`lowest`), with the four most common
 also directly on ctx (`ctx.rsi`, `ctx.sma`, ...). Every function returns
 None on insufficient history — never a guess. Use **Test run** in the
-editor to dry-run any saved algorithm against live data (nothing is
-traded or saved) before activating. `examples/algorithms/` ships two
+editor to dry-run any saved algorithm against live data, and
+**Backtest 5y** to replay it through real historical daily bars with the
+anti-lookahead window — target-weight rebalancing, slippage, annual
+returns, Sharpe, drawdown — before activating. Give a concentrated
+rotation model a **sleeve** (% of equity) and its orders may use that
+allocation as their position cap while every other risk rule still
+applies (docs/risk-controls.md#dedicated-sleeves). `examples/algorithms/` ships two
 complete faithful symphony ports as templates.
 
 A word on trust: algorithms run in-process, like installed plugins. The

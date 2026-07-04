@@ -272,6 +272,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 symbols=[str(s) for s in body.get("symbols", [])],
                 params=dict(body.get("params", {})),
                 created_by="user", review_notes=str(body.get("review_notes", "")),
+                sleeve_pct=float(body.get("sleeve_pct", 0) or 0),
             )
         except CfgErr as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -286,6 +287,8 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 source=body.get("source"), description=body.get("description"),
                 symbols=body.get("symbols"), params=body.get("params"),
                 review_notes=body.get("review_notes"),
+                sleeve_pct=(float(body["sleeve_pct"]) if body.get("sleeve_pct")
+                            is not None else None),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -325,6 +328,19 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     async def test_algorithm(algo_id: str) -> JSONResponse:
         try:
             result = await kernel.workshop.test_run(algo_id, kernel.router, kernel.portfolio)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(result)
+
+    @app.post("/api/algorithms/{algo_id}/backtest")
+    async def backtest_algorithm(algo_id: str, body: dict[str, Any] | None = None) -> JSONResponse:
+        years = int((body or {}).get("years", 5))
+        try:
+            result = await kernel.workshop.backtest(
+                algo_id, kernel.router, kernel.portfolio, years=years
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

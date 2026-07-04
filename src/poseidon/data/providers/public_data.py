@@ -156,6 +156,13 @@ class PublicDataProvider(MarketDataProvider):
             raise ProviderError(
                 self.name, f"unsupported timeframe {timeframe}", retryable=False
             ) from None
+        if timeframe == "1d":
+            # Deep history for backtests: pick the smallest window that
+            # covers the request (~252 trading days per year).
+            if limit > 1250:
+                period = "TEN_YEARS"
+            elif limit > 250:
+                period = "FIVE_YEARS"
         instrument_type = self._instrument(symbol)["type"]
         payload = await self._get_json(
             f"{_BASE}/userapigateway/historicdata/{instrument_type}"

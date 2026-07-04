@@ -666,6 +666,7 @@ async function refreshAlgorithms() {
       <div class="algo-row ${selectedAlgo === a.id ? "selected" : ""}" data-algo="${esc(a.id)}">
         <div class="head"><span class="name">${esc(a.name)}</span>
           ${a.created_by === "claude" ? '<span class="chip claude">claude</span>' : ""}
+          ${a.sleeve_pct ? `<span class="chip">sleeve ${(a.sleeve_pct * 100).toFixed(0)}%</span>` : ""}
           <span class="chip ${esc(a.status)}">${esc(a.status)}</span></div>
         ${a.description ? `<div class="desc">${esc(a.description)}</div>` : ""}
         <div class="meta">updated ${new Date(a.updated_at).toLocaleString()}</div>
@@ -683,12 +684,14 @@ function selectAlgo(id) {
   $("#al-name").disabled = true; // names are identity; edit source/desc instead
   $("#al-desc").value = a.description || "";
   $("#al-symbols").value = (a.symbols || []).join(", ");
+  $("#al-sleeve").value = a.sleeve_pct ? (a.sleeve_pct * 100).toFixed(0) : "";
   $("#al-source").value = a.source;
   const notes = $("#al-notes");
   notes.hidden = !a.review_notes;
   notes.textContent = a.review_notes || "";
   $("#al-save").hidden = true;
   $("#al-test").hidden = false;
+  $("#al-backtest").hidden = false;
   $("#al-testout").hidden = true;
   $("#al-update").hidden = false;
   $("#al-activate").hidden = a.status === "active";
@@ -702,10 +705,11 @@ function clearAlgoEditor() {
   selectedAlgo = null;
   $("#al-name").value = ""; $("#al-name").disabled = false;
   $("#al-desc").value = ""; $("#al-symbols").value = ""; $("#al-source").value = "";
+  $("#al-sleeve").value = "";
   $("#al-notes").hidden = true;
   $("#al-save").hidden = false;
   $("#al-testout").hidden = true;
-  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test"]
+  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test", "#al-backtest"]
     .forEach((s) => ($(s).hidden = true));
   refreshAlgorithms();
 }
@@ -716,6 +720,7 @@ function algoBody() {
     description: $("#al-desc").value.trim(),
     symbols: $("#al-symbols").value.split(",").map((s) => s.trim()).filter(Boolean),
     source: $("#al-source").value,
+    sleeve_pct: ($("#al-sleeve").value.trim() ? Number($("#al-sleeve").value) / 100 : 0),
   };
 }
 
@@ -753,6 +758,35 @@ $("#al-delete").addEventListener("click", () =>
     clearAlgoEditor();
   }, "Deleted"));
 $("#al-new").addEventListener("click", clearAlgoEditor);
+$("#al-backtest").addEventListener("click", async () => {
+  const btn = $("#al-backtest");
+  btn.disabled = true;
+  btn.textContent = "Backtesting…";
+  try {
+    const r = await postJSON(`/api/algorithms/${selectedAlgo}/backtest`, { years: 5 });
+    const out = $("#al-testout");
+    out.hidden = false;
+    const yearRows = Object.entries(r.annual_returns || {})
+      .map(([y, v]) => `<div class="kv"><span class="k">${esc(y)}</span>
+        <span class="v ${v > 0 ? "ok" : v < 0 ? "bad" : ""}">${fmtPct(v)}</span></div>`).join("");
+    out.innerHTML = `<div class="rv-block"><h3>Backtest — ${esc(r.start)} → ${esc(r.end)} (${r.days_tested} days, real history)</h3>
+      <div class="kv"><span class="k">Total return</span><span class="v ${r.total_return > 0 ? "ok" : "bad"}">${fmtPct(r.total_return)}</span></div>
+      <div class="kv"><span class="k">CAGR</span><span class="v">${fmtPct(r.cagr)}</span></div>
+      <div class="kv"><span class="k">Sharpe</span><span class="v">${r.sharpe}</span></div>
+      <div class="kv"><span class="k">Max drawdown</span><span class="v">${fmtPct(r.max_drawdown)}</span></div>
+      <div class="kv"><span class="k">Rebalances / orders</span><span class="v">${r.rebalances} / ${r.orders_simulated}</span></div>
+      <div class="kv"><span class="k">Final equity</span><span class="v">${fmtUsd(r.final_equity)}</span></div>
+      ${yearRows}
+      ${(r.symbols_skipped_no_history || []).length ? `<p class="meter-note">no history available: ${esc(r.symbols_skipped_no_history.join(", "))}</p>` : ""}
+      <p class="meter-note">${esc(r.note)}</p></div>`;
+  } catch (e) {
+    toast("Backtest failed: " + String(e.message).slice(0, 200), "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Backtest 5y";
+  }
+});
+
 $("#al-test").addEventListener("click", async () => {
   const btn = $("#al-test");
   btn.disabled = true;
