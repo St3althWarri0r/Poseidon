@@ -6,6 +6,9 @@ FROM python:3.12-slim AS build
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
+# Bundled example algorithms are force-included into the wheel (pyproject.toml)
+# so first-run seeding works; the build needs them present in the context.
+COPY examples ./examples
 RUN pip install --no-cache-dir --prefix=/install .
 
 FROM python:3.12-slim
