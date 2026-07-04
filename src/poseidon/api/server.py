@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..ai.chat import ChatBusyError
 from ..brokers.registry import broker_catalog
-from ..core.enums import TradingMode
+from ..core.enums import MarketSession, TradingMode
 from ..core.errors import (
     AgentError,
     BrokerAuthError,
@@ -41,6 +41,29 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def build_dryrun_state(*, broker_is_paper: bool, active_broker: str, mode_value: str,
+                       algorithms_raw: list[dict[str, Any]], session: MarketSession) -> dict[str, Any]:
+    """Aggregate the Dry Run panel's state from plain inputs (pure, testable)."""
+    from ..strategy.workshop import BUNDLED_REVIEW_NOTE
+    algorithms = [
+        {"id": a["id"], "name": a["name"], "status": a["status"],
+         "bundled": a.get("review_notes") == BUNDLED_REVIEW_NOTE}
+        for a in algorithms_raw
+    ]
+    is_open = session is MarketSession.REGULAR
+    return {
+        "broker_is_paper": broker_is_paper,
+        "active_broker": active_broker,
+        "mode": mode_value,
+        "algorithms": algorithms,
+        "active_algo_count": sum(1 for a in algorithms if a["status"] == "active"),
+        "bundled_draft_count": sum(1 for a in algorithms
+                                   if a["bundled"] and a["status"] == "draft"),
+        "market": {"session": session.value, "is_open": is_open,
+                   "opens_hint": None if is_open else "9:30 ET"},
+    }
 
 
 class WebsocketHub:
@@ -634,6 +657,17 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             "refresh_token": tokens["refresh_token"],
             "account_hash": account_hash,
         })
+
+    @app.get("/api/dryrun")
+    async def dryrun_state() -> JSONResponse:
+        """Everything the Dry Run panel needs, in one read."""
+        return JSONResponse(build_dryrun_state(
+            broker_is_paper=kernel.broker.is_paper,
+            active_broker=kernel.broker.name,
+            mode_value=kernel.order_manager.mode.value,
+            algorithms_raw=await kernel.workshop.list_all(),
+            session=kernel.clock.session(),
+        ))
 
     @app.post("/api/sync")
     async def sync_now() -> JSONResponse:
