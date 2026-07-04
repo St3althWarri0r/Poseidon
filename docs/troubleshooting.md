@@ -27,6 +27,12 @@ modified outside the app (or disk corruption). Poseidon refuses to start.
 Investigate first (`poseidon audit tail`); if you accept losing history,
 archive the DB file and start fresh.
 
+> Upgrading from 2.3.x? 2.4.0 changed the audit hash encoding. A log written
+> by an older version is re-anchored automatically on the first start of
+> 2.4.1+ (only if it is fully intact under the old encoding — a genuinely
+> tampered log still fails), so this error should not appear from the upgrade
+> alone. If you are on exactly 2.4.0 and hit it, update to 2.4.1+.
+
 **`unknown broker '...'` / `unknown strategy '...'`** — the error lists
 valid names; check spelling in config.
 

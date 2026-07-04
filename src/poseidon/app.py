@@ -103,6 +103,17 @@ class ApplicationKernel:
         await self.db.open()
         self.audit = AuditLog(self.db)
         ok, bad_seq = await self.audit.verify_chain()
+        # A pre-2.4.0 audit log was written with the previous hash encoding and
+        # re-verifies as "bad" purely because of the format change. Only
+        # re-anchor it when it is fully intact under a known legacy encoding (a
+        # genuinely tampered log still fails); this preserves the tamper-evidence
+        # guarantee while letting existing installs upgrade.
+        if not ok and await self.audit.migrate_legacy_chain():
+            ok, bad_seq = await self.audit.verify_chain()
+            if ok:
+                log.info("migrated audit log to the current hash encoding")
+                await self.audit.append("system", "audit.chain_migrated",
+                                        {"from": "v1", "reason": "hash-encoding upgrade"})
         if not ok:
             raise ConfigError(
                 f"audit chain verification FAILED at seq {bad_seq} — the audit log has been "

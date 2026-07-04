@@ -1,7 +1,7 @@
 # Maintainer: local build — CachyOS/Arch native package for Poseidon
 # Build & install:  cd packaging && makepkg -si
 pkgname=poseidon
-pkgver=2.4.0
+pkgver=2.4.1
 pkgrel=1
 pkgdesc="Autonomous AI trading platform with Claude as the portfolio manager"
 arch=('any')

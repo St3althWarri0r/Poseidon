@@ -90,3 +90,59 @@ def test_proposed_trade_rejects_nonpositive_quantity() -> None:
         with pytest.raises(ValidationError):
             ProposedTrade(symbol="AAPL", side=OrderSide.BUY, asset_class=AssetClass.EQUITY,
                           quantity=bad)
+
+
+# ---------------------------------------------------------------- audit hash-encoding migration
+
+async def _seed_legacy_chain(db, rows):
+    from poseidon.security.audit import GENESIS_HASH, _record_hash_v1
+    prev = GENESIS_HASH
+    async with db.transaction() as conn:
+        for seq, at, actor, action, payload in rows:
+            h = _record_hash_v1(seq, at, actor, action, payload, prev)
+            await conn.execute(
+                "INSERT INTO audit (seq, at, actor, action, payload, prev_hash, hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (seq, at, actor, action, payload, prev, h),
+            )
+            prev = h
+
+
+async def test_audit_legacy_chain_migrates(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from poseidon.security.audit import AuditLog
+    from poseidon.storage.db import Database
+
+    db = Database(tmp_path / "a.db")
+    await db.open()
+    await _seed_legacy_chain(db, [
+        (1, "2026-01-01T00:00:00+00:00", "system", "a.one", "{}"),
+        (2, "2026-01-01T00:00:01+00:00", "system", "a.two", '{"k":1}'),
+        (3, "2026-01-01T00:00:02+00:00", "human", "a.three", "{}"),
+    ])
+    audit = AuditLog(db)
+    ok, _ = await audit.verify_chain()
+    assert ok is False  # current encoding rejects the legacy chain
+    assert await audit.migrate_legacy_chain() is True
+    ok2, bad = await audit.verify_chain()
+    assert ok2 is True and bad is None
+    await db.close()
+
+
+async def test_audit_tampered_chain_refuses_migration(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from poseidon.security.audit import AuditLog
+    from poseidon.storage.db import Database
+
+    db = Database(tmp_path / "b.db")
+    await db.open()
+    await _seed_legacy_chain(db, [
+        (1, "2026-01-01T00:00:00+00:00", "system", "a", "{}"),
+        (2, "2026-01-01T00:00:01+00:00", "system", "b", "{}"),
+    ])
+    # Tamper with seq 1's payload without recomputing the hashes.
+    await db.conn.execute("UPDATE audit SET payload='{\"evil\":1}' WHERE seq=1")
+    await db.conn.commit()
+    audit = AuditLog(db)
+    assert await audit.migrate_legacy_chain() is False  # tampered -> refuse
+    ok, _ = await audit.verify_chain()
+    assert ok is False
+    await db.close()
