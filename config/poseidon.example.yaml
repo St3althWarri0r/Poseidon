@@ -43,7 +43,7 @@ data:
     - name: twelvedata           # free tier: quotes + bars (8 req/min)
       credential: twelvedata_api_key
       priority: 30
-    - name: alphavantage         # free tier: daily bars, econ calendar (25 req/day)
+    - name: alphavantage         # free tier: EOD quotes, news+sentiment (25 req/day)
       credential: alphavantage_api_key
       priority: 40
     # Optional extras:

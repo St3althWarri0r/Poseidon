@@ -8,18 +8,31 @@ rule for every order — there is no fast path that skips checks.
 from __future__ import annotations
 
 import abc
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from ..core.clock import MarketClock
 from ..core.config import RiskConfig
-from ..core.enums import AssetClass, MarketSession
+from ..core.enums import AssetClass, MarketSession, OrderSide
 from ..core.errors import RiskViolation
 from ..core.models import Bar, EconomicEvent, Order, Quote
 from ..portfolio.state import PortfolioState
 
 MAX_STATE_AGE_SECONDS = 120.0
+
+_OCC_STRIKE_RE = re.compile(r"[CP](\d{8})$")
+
+
+def _option_strike(occ_symbol: str) -> Decimal | None:
+    """Strike from an OCC option symbol (e.g. AAPL240621C00190000 -> 190).
+    The trailing 8 digits encode strike*1000. Returns None if the symbol is
+    not OCC-formatted."""
+    match = _OCC_STRIKE_RE.search(occ_symbol.strip().upper())
+    if match is None:
+        return None
+    return Decimal(match.group(1)) / Decimal(1000)
 
 
 @dataclass
@@ -33,6 +46,12 @@ class RiskContext:
     upcoming_econ: list[EconomicEvent] = field(default_factory=list)
     orders_today: int = 0
     cooldown_remaining: float = 0.0
+    # In-flight exposure reserved by the engine for orders submitted but not
+    # yet visible in a portfolio sync, so several orders validated against the
+    # same snapshot cannot stack past the exposure/leverage caps.
+    pending_gross: Decimal = Decimal(0)  # in-flight risk-increasing notional
+    pending_options: Decimal = Decimal(0)
+    pending_by_symbol: dict[str, Decimal] = field(default_factory=dict)
     # Sector taxonomy (None = unknown/unavailable; ETFs have no sector).
     order_sector: str | None = None
     position_sectors: dict[str, str] = field(default_factory=dict)
@@ -53,7 +72,44 @@ class RiskContext:
 
     @property
     def notional(self) -> Decimal:
-        multiplier = Decimal(100) if self.order.asset_class is AssetClass.OPTION else Decimal(1)
+        # A short option open must be sized by its assignment/margin basis
+        # (strike x 100 x qty), NOT the premium received — premium sizing
+        # understates capital at risk by orders of magnitude and lets a naked
+        # short slip past buying-power, position-size, exposure and leverage
+        # caps. Multi-leg packages (OptionLeg is options-only) are sized at the
+        # sum of their SELL_TO_OPEN legs' strike bases regardless of the
+        # order-level side or asset_class: nothing here verifies that a long
+        # leg covers a short one, so short legs are deliberately over-sized
+        # (fail safe) rather than trusted as defined risk. Long-only packages
+        # keep premium (net debit) sizing.
+        if self.order.legs:
+            short_basis = Decimal(0)
+            for leg in self.order.legs:
+                if leg.side is not OrderSide.SELL_TO_OPEN:
+                    continue
+                strike = _option_strike(leg.contract_symbol)
+                if strike is None:
+                    raise RiskViolation(
+                        "notional",
+                        f"cannot determine the strike for short leg {leg.contract_symbol}; "
+                        "refusing to size a short option by premium received",
+                    )
+                short_basis += strike * Decimal(100) * Decimal(leg.quantity) * abs(self.order.quantity)
+            if short_basis > 0:
+                return short_basis
+        elif (self.order.asset_class is AssetClass.OPTION
+                and self.order.side is OrderSide.SELL_TO_OPEN):
+            strike = _option_strike(self.order.symbol)
+            if strike is None:
+                raise RiskViolation(
+                    "notional",
+                    f"cannot determine the strike for short option {self.order.symbol}; "
+                    "refusing to size an uncovered short by premium received",
+                )
+            return strike * Decimal(100) * abs(self.order.quantity)
+        multiplier = Decimal(100) if (
+            self.order.asset_class is AssetClass.OPTION or self.order.legs
+        ) else Decimal(1)
         notional = self.order.estimated_notional(self.reference_price)
         if notional is None:  # unreachable: reference_price already raised if unusable
             raise RiskViolation("reference_price", f"no usable notional for {self.order.symbol}")
@@ -83,11 +139,14 @@ class FreshPortfolioRule(RiskRule):
 class MarketOpenRule(RiskRule):
     """Regular-hours only, unless the order explicitly requests extended hours.
     Also covers holidays and (via the clock's fail-safe) unknown calendar
-    years and exchange-wide halts surfaced as CLOSED."""
+    years and exchange-wide halts surfaced as CLOSED.
+    Crypto orders are exempt: crypto markets trade continuously."""
 
     name = "market_session"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.asset_class is AssetClass.CRYPTO:
+            return  # crypto trades 24/7 — the NYSE session gate does not apply
         session = ctx.clock.session()
         if session is MarketSession.REGULAR:
             return
@@ -132,6 +191,7 @@ class PositionSizeRule(RiskRule):
         position = ctx.portfolio.position_for(ctx.order.symbol)
         if position is not None and position.market_value is not None:
             existing = abs(position.market_value)
+        existing += ctx.pending_by_symbol.get(ctx.order.symbol.upper(), Decimal(0))
         # A sleeve applies only if this order's symbol was actually signalled
         # by the sleeved strategy this cycle — the order's self-declared
         # `strategy` string (AI-controlled) is not trusted on its own.
@@ -159,7 +219,7 @@ class PortfolioExposureRule(RiskRule):
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
-        gross = ctx.portfolio.gross_exposure() + ctx.notional
+        gross = ctx.portfolio.gross_exposure() + ctx.pending_gross + ctx.notional
         limit = equity * Decimal(str(ctx.config.max_portfolio_exposure_pct))
         if gross > limit:
             raise RiskViolation(self.name, f"gross exposure would be {gross:.2f}, limit {limit:.2f}")
@@ -174,7 +234,7 @@ class LeverageRule(RiskRule):
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
-        gross = ctx.portfolio.gross_exposure() + ctx.notional
+        gross = ctx.portfolio.gross_exposure() + ctx.pending_gross + ctx.notional
         leverage = gross / equity
         if float(leverage) > ctx.config.max_leverage:
             raise RiskViolation(self.name, f"leverage would be {float(leverage):.2f}x, max {ctx.config.max_leverage}x")
@@ -189,7 +249,7 @@ class OptionsExposureRule(RiskRule):
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
-        exposure = ctx.portfolio.options_exposure() + ctx.notional
+        exposure = ctx.portfolio.options_exposure() + ctx.pending_options + ctx.notional
         limit = equity * Decimal(str(ctx.config.max_options_exposure_pct))
         if exposure > limit:
             raise RiskViolation(self.name, f"options exposure would be {exposure:.2f}, limit {limit:.2f}")
@@ -213,8 +273,9 @@ class SectorConcentrationRule(RiskRule):
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
-        exposure = ctx.notional
         order_symbol = ctx.order.symbol.upper()
+        # Own-symbol in-flight notional is same-sector by definition.
+        exposure = ctx.notional + ctx.pending_by_symbol.get(order_symbol, Decimal(0))
         for position in ctx.portfolio.positions:
             symbol = position.symbol.upper()
             # The order's own symbol always counts toward its sector.
@@ -272,6 +333,12 @@ class OrderNotionalRule(RiskRule):
     def check(self, ctx: RiskContext) -> None:
         if ctx.notional > ctx.config.max_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} exceeds max {ctx.config.max_order_notional}")
+        if ctx.order.side.is_risk_reducing:
+            # The min bound is an anti-churn entry filter. It must not apply to
+            # exits: unlike an over-max exit (which can be split), an under-min
+            # exit cannot be restructured to pass, so a sub-min position could
+            # never be closed — guardian stops included.
+            return
         if ctx.notional < ctx.config.min_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} below min {ctx.config.min_order_notional}")
 
@@ -382,9 +449,20 @@ class VolatilityHaltRule(RiskRule):
         if ctx.order.side.is_risk_reducing or not ctx.recent_bars:
             return
         last = ctx.recent_bars[-1]
-        if last.open <= 0:
+        # Anchor to the prior close (exchange circuit/LULD references are
+        # prior-close based) so overnight gap moves count, and keep the
+        # open-to-close measure so an intraday spike that round-trips to a
+        # flat close still trips the halt.
+        moves = []
+        if last.open > 0:
+            moves.append(abs(last.close - last.open) / last.open)
+        if len(ctx.recent_bars) >= 2:
+            prev_close = ctx.recent_bars[-2].close
+            if prev_close > 0:
+                moves.append(abs(last.close - prev_close) / prev_close)
+        if not moves:
             return
-        move = abs(last.close - last.open) / last.open
+        move = max(moves)
         if float(move) >= ctx.config.volatility_halt_daily_move_pct:
             raise RiskViolation(
                 self.name,
@@ -435,9 +513,75 @@ class CooldownRule(RiskRule):
             )
 
 
+class ReduceOnlyRule(RiskRule):
+    """The platform does not open short positions via a plain SELL / *_to_close.
+    A closing order may only reduce an existing same-direction position; it can
+    never exceed what is held and flip the book short. This rule is deliberately
+    NOT exempted for risk-reducing sides — it is what makes the size/exposure/
+    leverage/loss-halt exemptions on those sides safe. Opening sides (BUY,
+    BUY_TO_OPEN, SELL_TO_OPEN) are left to the full risk gate."""
+
+    name = "reduce_only"
+    _closing_sides = (OrderSide.SELL, OrderSide.SELL_TO_CLOSE, OrderSide.BUY_TO_CLOSE)
+
+    def check(self, ctx: RiskContext) -> None:
+        if ctx.order.legs:
+            # Multi-leg option order: the parent symbol is the underlying, never
+            # itself a position (public.com submits only the legs). Validate each
+            # closing leg against its own contract position; opening legs are
+            # gated by the size/exposure/leverage rules like any other open.
+            for leg in ctx.order.legs:
+                if leg.side not in self._closing_sides:
+                    continue
+                position = ctx.portfolio.position_for(leg.contract_symbol)
+                held = position.quantity if position is not None else Decimal(0)
+                available = -held if leg.side is OrderSide.BUY_TO_CLOSE else held
+                available = available if available > 0 else Decimal(0)
+                closing = leg.quantity * ctx.order.quantity  # ratio qty x spreads
+                if closing > available:
+                    raise RiskViolation(
+                        self.name,
+                        f"{leg.side.value} {closing} {leg.contract_symbol} exceeds the "
+                        f"closable position ({available}) — the platform does not open short positions",
+                    )
+            return
+        if ctx.order.side not in self._closing_sides:
+            return  # opening orders are gated by the size/exposure/leverage rules
+        position = ctx.portfolio.position_for(ctx.order.symbol)
+        held = position.quantity if position is not None else Decimal(0)
+        # BUY_TO_CLOSE covers a short (held < 0); the others close a long.
+        available = -held if ctx.order.side is OrderSide.BUY_TO_CLOSE else held
+        # A position only shrinks when an exit FILLS, so unfilled same-direction
+        # orders still open at the broker already consume the closable quantity.
+        # Without subtracting them, a resting exit (e.g. an unfilled guardian
+        # stop) plus a second exit (review cycle / manual ticket) each pass
+        # alone and together oversell the book into a short. Direction is
+        # matched via is_buy because broker open-order snapshots normalize
+        # *_to_close sides to plain buy/sell (e.g. alpaca._row_to_order).
+        symbol = ctx.order.symbol.upper()
+        pending = sum(
+            (max(o.quantity - o.filled_quantity, Decimal(0))
+             for o in ctx.portfolio.open_orders
+             if o.symbol.upper() == symbol
+             and o.status.is_open_at_broker
+             and o.side.is_buy == ctx.order.side.is_buy),
+            Decimal(0),
+        )
+        available -= pending
+        available = available if available > 0 else Decimal(0)
+        if ctx.order.quantity > available:
+            raise RiskViolation(
+                self.name,
+                f"{ctx.order.side.value} {ctx.order.quantity} {ctx.order.symbol} exceeds the "
+                f"closable position ({available} after {pending} already pending in open "
+                f"closing orders) — the platform does not open short positions",
+            )
+
+
 ALL_RULES: list[RiskRule] = [
     FreshPortfolioRule(),
     MarketOpenRule(),
+    ReduceOnlyRule(),
     DailyLossRule(),
     WeeklyLossRule(),
     DrawdownRule(),

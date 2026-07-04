@@ -125,6 +125,9 @@ class TradierBroker(Broker):
         return result
 
     async def submit_order(self, order: Order) -> Order:
+        if order.quantity != order.quantity.to_integral_value():
+            raise BrokerError(self.name, "fractional share quantities are not supported",
+                              retryable=False)
         is_option = order.asset_class is AssetClass.OPTION
         data: dict[str, Any] = {
             "class": "option" if is_option else "equity",
@@ -154,13 +157,25 @@ class TradierBroker(Broker):
             data["price"] = str(order.limit_price)
         if order.stop_price is not None:
             data["stop"] = str(order.stop_price)
+        # Tradier's 'tag' is a label, not an enforced idempotency key, so a
+        # submit timeout has an unknown outcome and must not be auto-retried.
         payload = await self._request(
             "POST", f"{self._base}/accounts/{self._account_id}/orders",
-            headers=self._headers, data=data,
+            headers=self._headers, data=data, idempotent=False,
         )
         result = (payload or {}).get("order") or {}
-        if result.get("status") not in ("ok", None) and not result.get("id"):
-            raise BrokerError(self.name, f"order rejected: {payload}", retryable=False)
+        if not result.get("id"):
+            # A successful Tradier order response always carries order.id.
+            # Tradier can answer HTTP 200 with an `errors` element and no
+            # `order` key — a definitive rejection. Any other id-less 2xx has
+            # an UNKNOWN outcome: raise ambiguous so the manager marks it
+            # ERROR and reconciles it against the broker at startup, instead
+            # of persisting a phantom SUBMITTED order with an empty
+            # broker_order_id that can never be polled or canceled.
+            if (payload or {}).get("errors"):
+                raise BrokerError(self.name, f"order rejected: {payload}", retryable=False)
+            raise BrokerError(self.name, f"no order id in submit response: {payload!r}",
+                              retryable=False, ambiguous=True)
         order.broker = self.name
         order.broker_order_id = str(result.get("id", ""))
         order.status = OrderStatus.SUBMITTED
@@ -174,9 +189,18 @@ class TradierBroker(Broker):
             "DELETE", f"{self._base}/accounts/{self._account_id}/orders/{order.broker_order_id}",
             headers=self._headers,
         )
-        order.status = OrderStatus.CANCELED
-        order.updated_at = datetime.now(UTC)
-        return order
+        # Cancel is asynchronous at the broker: the DELETE only queues the
+        # request and in-flight fills can still occur. Adopt the broker's
+        # authoritative state (pending-cancel maps to a non-terminal status)
+        # so the lifecycle poller carries the order to its true terminal
+        # state with any last-moment fills attached.
+        try:
+            return await self.order_status(order)
+        except BrokerError:
+            order.status = OrderStatus.ACCEPTED
+            order.status_reason = "cancel requested — awaiting broker confirmation"
+            order.updated_at = datetime.now(UTC)
+            return order
 
     async def order_status(self, order: Order) -> Order:
         if not order.broker_order_id:

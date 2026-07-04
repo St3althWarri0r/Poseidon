@@ -2,8 +2,11 @@
 
 One database file under the data directory holds durable runtime state:
 orders, fills, AI decisions, approvals, audit chain, equity marks, and a
-small key-value table for crash recovery. WAL mode keeps the dashboard's
-reads from blocking the trading path.
+small key-value table for crash recovery. All in-process access (trading
+and dashboard alike) is serialized through the single aiosqlite
+connection's worker thread; WAL mode is kept for its faster commits and so
+external readers (e.g. the ``poseidon audit``/``doctor`` CLI commands, which
+open their own connections) don't block the trading path's writes.
 
 Filesystem-level encryption of the data directory is documented in
 docs/security.md (the vault covers credentials; position/order history is
@@ -12,8 +15,9 @@ protected by directory permissions plus optional fscrypt/LUKS).
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import json
+import os
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +39,7 @@ CREATE TABLE IF NOT EXISTS orders (
     client_order_id TEXT NOT NULL UNIQUE,
     broker TEXT NOT NULL,
     broker_order_id TEXT,
+    account_scope TEXT NOT NULL DEFAULT '',  -- broker:paper|live; keeps paper and live fills from mixing in reports
     payload TEXT NOT NULL,          -- full Order JSON
     status TEXT NOT NULL,
     decision_id TEXT,
@@ -131,33 +136,61 @@ class Database:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._conn: aiosqlite.Connection | None = None
+        # Serializes writers against each other AND against multi-statement
+        # transactions, so an unrelated execute()/commit() can't interleave
+        # with (and prematurely commit / roll back) an open transaction.
+        self._write_lock = asyncio.Lock()
 
     async def open(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the db 0600 up front (the mode only applies on create): SQLite
+        # copies the db file's mode onto the -wal/-shm sidecars it creates, so
+        # this also keeps them from being briefly world-readable.
+        os.close(os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600))
         self._conn = await aiosqlite.connect(self._path)
         await self._conn.executescript(_SCHEMA)
         # Additive migrations for databases created before a column existed.
-        with contextlib.suppress(aiosqlite.OperationalError):
+        # Checked explicitly (rather than suppressing OperationalError) so a
+        # transient failure such as 'database is locked' cannot silently skip
+        # a migration the broker-scoping safety logic depends on.
+        if not await self._column_exists("algorithms", "sleeve_pct"):
             await self._conn.execute(
                 "ALTER TABLE algorithms ADD COLUMN sleeve_pct REAL NOT NULL DEFAULT 0"
             )
-        with contextlib.suppress(aiosqlite.OperationalError):
+        if not await self._column_exists("equity_marks", "broker"):
             # Equity marks are broker-scoped so a paper account's history can
             # never leak into a real account's drawdown/performance after a
             # broker switch. Legacy rows keep broker='' and are excluded.
             await self._conn.execute(
                 "ALTER TABLE equity_marks ADD COLUMN broker TEXT NOT NULL DEFAULT ''"
             )
-        with contextlib.suppress(aiosqlite.OperationalError):
+        if not await self._column_exists("exit_plans", "broker"):
             # Guardian exit plans are broker-scoped for the same reason: a
             # paper-era stop must never fire against a real account. Legacy
             # rows ('') still match the active broker until re-armed.
             await self._conn.execute(
                 "ALTER TABLE exit_plans ADD COLUMN broker TEXT NOT NULL DEFAULT ''"
             )
+        if not await self._column_exists("orders", "account_scope"):
+            # Orders are account-scoped like equity marks: the same plugin's
+            # paper and live fills must never FIFO-match in the performance
+            # report. Legacy rows keep '' and drop out of scoped reports.
+            await self._conn.execute(
+                "ALTER TABLE orders ADD COLUMN account_scope TEXT NOT NULL DEFAULT ''"
+            )
         await self._conn.commit()
-        # New databases must not be world readable.
+        # Databases (and sidecars) created by older versions must not stay
+        # world readable; os.open's mode does not apply to existing files.
         self._path.chmod(0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = self._path.with_name(self._path.name + suffix)
+            if sidecar.exists():
+                sidecar.chmod(0o600)
+
+    async def _column_exists(self, table: str, column: str) -> bool:
+        cursor = await self.conn.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return any(row[1] == column for row in rows)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -172,17 +205,22 @@ class Database:
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        conn = self.conn
-        try:
-            yield conn
-            await conn.commit()
-        except BaseException:
-            await conn.rollback()
-            raise
+        # Held for the whole block so no other writer commits inside it.
+        # Callers must use only raw ``conn.execute`` here — never db.execute()
+        # or db.transaction() again — or they self-deadlock on this lock.
+        async with self._write_lock:
+            conn = self.conn
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
-        await self.conn.execute(sql, tuple(params))
-        await self.conn.commit()
+        async with self._write_lock:
+            await self.conn.execute(sql, tuple(params))
+            await self.conn.commit()
 
     async def fetch_all(self, sql: str, params: Iterable[Any] = ()) -> list[tuple[Any, ...]]:
         cursor = await self.conn.execute(sql, tuple(params))

@@ -77,10 +77,16 @@ class DataUnavailableError(DataError):
 class BrokerError(PoseidonError):
     retryable = True
 
-    def __init__(self, broker: str, message: str, *, retryable: bool = True) -> None:
+    def __init__(self, broker: str, message: str, *, retryable: bool = True,
+                 ambiguous: bool = False) -> None:
         super().__init__(f"[{broker}] {message}")
         self.broker = broker
         self.retryable = retryable
+        # Ambiguous: the order's outcome is UNKNOWN (e.g. a submit that timed
+        # out after the request was sent to a broker with no idempotency key).
+        # Such an order must never be auto-resubmitted — it is marked ERROR and
+        # reconciled against the broker's open orders at startup.
+        self.ambiguous = ambiguous
 
 
 class BrokerAuthError(BrokerError):

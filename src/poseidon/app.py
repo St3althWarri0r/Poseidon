@@ -128,6 +128,9 @@ class ApplicationKernel:
         )
         self.guardian = PositionGuardian(cfg.guardian, self.db, self)
         self.bus.subscribe(Topics.ORDER_FILLED, self.guardian.on_order_filled)
+        # Unfilled guardian exits (e.g. a DAY limit that expires at the close)
+        # surface as ORDER_UPDATED — the guardian re-arms the plan from these.
+        self.bus.subscribe(Topics.ORDER_UPDATED, self.guardian.on_order_update)
         self.bus.subscribe(Topics.CIRCUIT_OPENED, self._on_circuit_opened)
         self.strategies = StrategyEngine(cfg.strategies, cfg.all_watchlist_symbols())
         self.workshop = AlgorithmWorkshop(
@@ -249,6 +252,14 @@ class ApplicationKernel:
         if isinstance(broker, PaperBroker):
             broker.set_quote_fn(lambda symbol: self.router.quote(symbol, allow_delayed=True))
         await broker.connect()
+        if (broker.rotated_credentials and broker_cfg is not None and broker_cfg.credential
+                and credentials_override is None):
+            # A single-use credential (e.g. a tastytrade remember token) was
+            # consumed and replaced during connect; persist the replacement or
+            # the next vault-based connect fails auth.
+            await asyncio.to_thread(
+                self.vault.set, broker_cfg.credential, json.dumps(broker.rotated_credentials)
+            )
         return broker
 
     async def _on_circuit_opened(self, _topic: str, payload: object) -> None:
@@ -284,8 +295,11 @@ class ApplicationKernel:
                                      credentials: dict[str, str] | None,
                                      options: dict[str, object] | None = None) -> dict[str, object]:
         """Prove a broker connection end-to-end (auth + account fetch) without
-        touching the active broker, the vault, or any config. ``credentials``
-        None means use the credential already stored in the vault."""
+        touching the active broker or config. ``credentials`` None means use the
+        credential already stored in the vault. Note: a connect can consume a
+        single-use credential (e.g. a tastytrade remember token); when testing
+        with the stored credential its rotated replacement is re-persisted so a
+        following Connect still authenticates."""
         cfg = self._broker_config_for(name, paper=paper, options=options)
         if name == "paper":
             # The test instance shares the active paper broker's state file;
@@ -335,8 +349,11 @@ class ApplicationKernel:
             cfg.options.pop("reset", None)
             try:
                 if credentials is not None and cfg.credential:
-                    await asyncio.to_thread(self.vault.set, cfg.credential,
-                                            json.dumps(credentials))
+                    # Persist the post-rotation credential if connect() replaced
+                    # a single-use one, else the typed value.
+                    await asyncio.to_thread(
+                        self.vault.set, cfg.credential,
+                        json.dumps(new_broker.rotated_credentials or credentials))
                 await asyncio.to_thread(self._write_broker_overlay, cfg)
             except Exception as exc:
                 # Persisting failed: nothing was swapped — drop the proven
@@ -364,10 +381,11 @@ class ApplicationKernel:
             self.portfolio.tax_lots = []
             self.portfolio.dividends = []
             self.portfolio.synced_at = None
-            self.portfolio.equity_history = []
             self.portfolio.day_start_equity = None
             self.portfolio.week_start_equity = None
             self.portfolio.peak_equity = None
+            self.portfolio.day_min_equity = None
+            self.portfolio.week_min_equity = None
             self.portfolio.risk_metrics = None
             self.portfolio.risk_metrics_at = None
             await self.db.execute(
@@ -487,18 +505,29 @@ class ApplicationKernel:
                               "chat and review cycles are paused until next month. Raise or "
                               "remove the budget in poseidon.yaml to keep talking."),
                     "tool_calls": [], "usage": {}}
-        result = await self.chat.send(message, context=self._chat_context())
-        usage = result.get("usage")
-        if isinstance(usage, dict) and usage.get("api_calls"):
-            await self.db.execute(
-                "INSERT OR REPLACE INTO ai_usage (cycle_id, at, input_tokens, output_tokens, "
-                "cache_read_tokens, cache_write_tokens, api_calls) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (f"chat-{uuid.uuid4().hex[:8]}", datetime.now(UTC).isoformat(),
-                 usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-                 usage.get("cache_read_tokens", 0), usage.get("cache_write_tokens", 0),
-                 usage.get("api_calls", 0)),
-            )
+        try:
+            result = await self.chat.send(message, context=self._chat_context())
+        except AgentError as exc:
+            # Meter tokens already billed on earlier tool-loop calls before the
+            # failure, so the monthly budget is not silently under-counted.
+            await self._record_ai_usage(getattr(exc, "usage", None), "chat")
+            raise
+        await self._record_ai_usage(result.get("usage"), "chat")
         return result
+
+    async def _record_ai_usage(self, usage: object, prefix: str, *, cycle_id: str | None = None) -> None:
+        """Persist an AI usage record. Safe to call with partial usage from a
+        failed cycle/chat turn; a zero-call usage writes nothing."""
+        if not isinstance(usage, dict) or not usage.get("api_calls"):
+            return
+        await self.db.execute(
+            "INSERT OR REPLACE INTO ai_usage (cycle_id, at, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, api_calls) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cycle_id or f"{prefix}-{uuid.uuid4().hex[:8]}", datetime.now(UTC).isoformat(),
+             usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+             usage.get("cache_read_tokens", 0), usage.get("cache_write_tokens", 0),
+             usage.get("api_calls", 0)),
+        )
 
     def _chat_context(self) -> str:
         acct = self.portfolio.account
@@ -635,6 +664,10 @@ class ApplicationKernel:
                 return
             except (AgentError, DataError) as exc:
                 log.error("review cycle failed", error=str(exc))
+                # Meter tokens spent on completed sub-calls before the failure.
+                await self._record_ai_usage(
+                    self.agent.last_cycle_usage(), "failed",
+                    cycle_id=f"failed-{uuid.uuid4().hex[:8]}")
                 await self.bus.publish(Topics.SYSTEM_ERROR,
                                        {"component": "review_cycle", "error": str(exc)})
                 return
@@ -728,9 +761,10 @@ class ApplicationKernel:
         usage = review.pop("usage", {})
         await self.db.execute(
             "INSERT INTO ai_usage (cycle_id, at, input_tokens, output_tokens, api_calls) "
-            "VALUES (?, ?, ?, ?, 1)",
+            "VALUES (?, ?, ?, ?, ?)",
             (f"algo-review-{uuid.uuid4().hex[:8]}", datetime.now(UTC).isoformat(),
-             int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))),
+             int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)),
+             int(usage.get("api_calls", 1))),
         )
         await self.audit.append("claude", "algorithm.reviewed",
                                 {"convertible": review.get("convertible"),
@@ -793,7 +827,7 @@ class ApplicationKernel:
         from the platform's own filled orders, attributed per strategy."""
         from decimal import Decimal
 
-        from .core.enums import OrderSide, OrderStatus
+        from .core.enums import AssetClass, OrderSide, OrderStatus
         from .core.models import Order
 
         marks = await self.db.fetch_all(
@@ -801,11 +835,14 @@ class ApplicationKernel:
             (self.broker.account_scope,),
         )
         equity_points = [(datetime.fromisoformat(r[0]), float(r[1])) for r in marks]
-        # Fills are broker-scoped too: paper round trips must not inflate a
-        # real account's win rate or per-strategy P&L (and vice versa).
+        # Fills are account-scoped like the equity marks: paper round trips
+        # must not inflate a real account's win rate or per-strategy P&L (and
+        # vice versa). Pre-migration rows (account_scope='') are excluded,
+        # matching the equity_marks convention.
         rows = await self.db.fetch_all(
-            "SELECT payload FROM orders WHERE status = ? AND broker = ? ORDER BY updated_at ASC",
-            (OrderStatus.FILLED.value, self.broker.name),
+            "SELECT payload FROM orders WHERE status = ? AND account_scope = ? "
+            "ORDER BY updated_at ASC",
+            (OrderStatus.FILLED.value, self.broker.account_scope),
         )
         fills: list[FillRecord] = []
         for (payload,) in rows:
@@ -818,6 +855,7 @@ class ApplicationKernel:
                 price=Decimal(str(order.avg_fill_price)),
                 at=order.updated_at or datetime.now(UTC),
                 strategy=order.strategy,
+                multiplier=Decimal(100) if order.asset_class is AssetClass.OPTION else Decimal(1),
             ))
         trips = build_round_trips(fills)
         report = compute_performance(equity_points, trips).as_dict()
@@ -829,9 +867,21 @@ class ApplicationKernel:
         performance = await self.performance_report()
         usage = await self.ai_usage_summary()
         today = self.clock.now_eastern().date().isoformat()
+
+        def _is_today(created_at: str | None) -> bool:
+            # created_at is stored UTC; attribute by its EASTERN date so an
+            # after-hours order (UTC date already rolled) lands in the right
+            # session's digest instead of the next day's.
+            if not created_at:
+                return False
+            try:
+                return datetime.fromisoformat(created_at).astimezone(EASTERN).date().isoformat() == today
+            except ValueError:
+                return False
+
         orders_today = [
             o for o in await self.order_manager.recent_orders(200)
-            if (o.get("created_at") or "").startswith(today)
+            if _is_today(o.get("created_at"))
         ]
         filled = [o for o in orders_today if o.get("status") == "filled"]
         rejected = [o for o in orders_today if str(o.get("status", "")).startswith("rejected")]
@@ -923,6 +973,13 @@ class ApplicationKernel:
         for closer in (
             self.dashboard.stop, self.updates.stop, self.health.stop,
             self.scheduler.stop, self.sync.stop,
+            # After the scheduler stops (no new sweeps), let any in-flight
+            # guardian exit dispatch finish rather than abandoning it.
+            self.guardian.drain,
+            # Then cancel order-status pollers (guardian.drain may have just
+            # spawned one) before the broker/DB they write to are closed;
+            # resume_open_orders() re-attaches pollers on the next boot.
+            self.order_manager.stop,
         ):
             with contextlib.suppress(Exception):
                 await closer()

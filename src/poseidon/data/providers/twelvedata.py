@@ -12,7 +12,7 @@ from typing import Any
 
 from ...core.errors import ProviderError, ProviderRateLimitError
 from ...core.models import Bar, Quote
-from ..base import DataCapability, MarketDataProvider
+from ..base import DataCapability, MarketDataProvider, bar_end
 
 _BASE = "https://api.twelvedata.com"
 
@@ -40,7 +40,11 @@ class TwelveDataProvider(MarketDataProvider):
     async def quote(self, symbol: str) -> Quote:
         payload = await self._get("/quote", symbol=symbol.upper())
         ts = payload.get("timestamp")
-        as_of = self._ts_from_epoch(ts) or self._now()
+        as_of = self._ts_from_epoch(ts)
+        if as_of is None:
+            # No provider timestamp: refuse rather than stamp now() and let a
+            # quote of unknown age pass the freshness gate (no fabricated age).
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
         close = payload.get("close")
         if close is None:
             raise ProviderError(self.name, f"no quote for {symbol}")
@@ -70,10 +74,12 @@ class TwelveDataProvider(MarketDataProvider):
                         open=Decimal(row["open"]), high=Decimal(row["high"]),
                         low=Decimal(row["low"]), close=Decimal(row["close"]),
                         volume=int(float(row.get("volume", 0) or 0)),
-                        start=start, end=start, source=self.name,
+                        start=start, end=bar_end(start, timeframe), source=self.name,
                     )
                 )
             except (KeyError, ValueError):
                 continue
         bars.reverse()
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars

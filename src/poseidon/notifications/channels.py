@@ -52,11 +52,15 @@ class DesktopChannel(Channel):
             log.warning("notify-send not found; desktop notifications disabled")
             return False
         urgency = {"info": "normal", "warning": "normal", "critical": "critical"}[level.value]
-        process = await asyncio.create_subprocess_exec(
-            binary, "--app-name=Poseidon", f"--urgency={urgency}",
-            f"Poseidon: {title}", body[:1000],
-        )
-        await process.wait()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                binary, "--app-name=Poseidon", f"--urgency={urgency}",
+                f"Poseidon: {title}", body[:1000],
+            )
+            await process.wait()
+        except OSError as exc:
+            log.warning("desktop notification failed", error=str(exc))
+            return False
         return process.returncode == 0
 
 
@@ -162,7 +166,11 @@ class WebhookChannel(_HttpChannel):
                     headers={"Content-Type": "application/json",
                              **({"Authorization": f"Bearer {token}"} if token else {})},
                 )
-            return response.status_code < 400
+            if response.status_code >= 400:
+                log.warning("webhook notification failed",
+                            status=response.status_code, body=response.text[:200])
+                return False
+            return True
         except httpx.HTTPError as exc:
             log.warning("webhook notification failed", error=str(exc))
             return False

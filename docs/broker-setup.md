@@ -98,11 +98,17 @@ and a one-time interactive browser consent:
 1. developer.schwab.com → create an "individual developer" app with the
    Trader API product; note the app key + secret and set the callback URL
    to `https://127.0.0.1:8182`.
-2. Run the authorization flow once (any OAuth helper works; the flow is:
-   authorize URL → login+consent → code → token exchange). Retrieve your
-   `refresh_token`, then call `GET /trader/v1/accounts/accountNumbers` for
-   the `hashValue` of your account.
-3. `poseidon vault set schwab_creds` with
+2. **Easiest: the dashboard.** In the Account view pick Charles Schwab,
+   enter the app key + secret, and click **Log in with Schwab** — it opens
+   Schwab's login/consent page. After you approve, your browser lands on a
+   `https://127.0.0.1:8182/?code=…` "can't connect" page; copy that full URL
+   back into the form and click **Get refresh token**. Poseidon exchanges the
+   code and fills in the refresh token and account hash for you; then *Test
+   connection* → *Connect & switch*.
+3. Manual equivalent: run the authorization flow yourself (authorize URL →
+   login+consent → code → token exchange), retrieve the `refresh_token`, call
+   `GET /trader/v1/accounts/accountNumbers` for the account `hashValue`, and
+   `poseidon vault set schwab_creds` with
    `{"app_key": "...", "app_secret": "...", "refresh_token": "...",
      "account_hash": "..."}`
 

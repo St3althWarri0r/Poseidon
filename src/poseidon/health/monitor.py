@@ -87,9 +87,10 @@ class HealthMonitor:
                 latency_ms=round(latency, 1), checked_at=datetime.now(UTC),
             )
             self._results[name] = result
-            if previous is not None and previous.state != result.state:
+            previous_state = previous.state if previous is not None else HealthState.HEALTHY.value
+            if previous_state != result.state:
                 log.info("health transition", component=name,
-                         was=previous.state, now=result.state, detail=detail)
+                         was=previous_state, now=result.state, detail=detail)
                 await self._bus.publish(Topics.HEALTH_CHANGED, result.model_dump(mode="json"))
         return self._results
 

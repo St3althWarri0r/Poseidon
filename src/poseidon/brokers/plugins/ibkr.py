@@ -9,7 +9,13 @@ interface for individuals.
 
 Credentials (vault JSON): {"account_id": "..."} — authentication happens in
 the gateway, not here. Options: {"gateway_url": "https://localhost:5000",
-"verify_ssl": false} (the gateway ships a self-signed certificate).
+"verify_ssl": false, "auto_confirm_message_ids": ["oNNN", ...]}. The gateway
+ships a self-signed certificate, so TLS verification defaults off for
+localhost gateways only and on for any remote gateway_url (an explicit
+``verify_ssl`` wins either way). ``auto_confirm_message_ids`` extends the
+built-in set of informational gateway prompts that submit may auto-confirm;
+an unrecognized prompt raises a BrokerError listing its ids and text so
+operators can extend the list deliberately.
 
 ``paper`` selects the paper account if the gateway is logged into one; IBKR
 paper/live selection is a property of the gateway login session.
@@ -20,6 +26,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -45,6 +52,15 @@ _STATUS_MAP = {
     "Inactive": OrderStatus.REJECTED_BROKER,
 }
 
+# Gateway reply prompts that are informational and safe to auto-confirm.
+# Protective prompts (e.g. o163 "price exceeds the percentage constraint",
+# size/value-limit warnings) are deliberately NOT listed: they exist to stop
+# erroneous orders and must fail loudly instead of being suppressed.
+_BENIGN_REPLY_IDS = frozenset({
+    "o354",  # order without IBKR market data — Poseidon quotes via its own providers
+    "o403",  # "order will most likely trigger and fill immediately"
+})
+
 
 class IBKRBroker(Broker):
     name = "ibkr"
@@ -58,15 +74,22 @@ class IBKRBroker(Broker):
         self._base = f"{gateway}/v1/api"
         # The local gateway uses a self-signed cert; verification is off by
         # default *only* for localhost targets and can be forced on.
-        verify = bool(self._options.get("verify_ssl", False))
+        host = urlsplit(gateway).hostname or ""
+        verify = bool(self._options.get("verify_ssl", host not in ("localhost", "127.0.0.1", "::1")))
+        # Swap in a verify-aware client, keeping the one Broker.__init__ built
+        # (never used for requests) so disconnect() closes it too instead of
+        # orphaning its connection pool.
+        self._default_client = self._client
         self._client = httpx.AsyncClient(timeout=timeout, verify=verify)
         self._conid_cache: dict[str, int] = {}
 
     def capabilities(self) -> frozenset[BrokerCapability]:
+        # No OPTIONS: _conid() resolves plain tickers via /iserver/secdef/search
+        # only; OCC option contracts would need /iserver/secdef/info
+        # (month/strike/right) resolution.
         return frozenset(
             {
                 BrokerCapability.EQUITIES,
-                BrokerCapability.OPTIONS,
                 BrokerCapability.MARGIN,
                 BrokerCapability.EXTENDED_HOURS,
                 BrokerCapability.PAPER_TRADING,
@@ -88,6 +111,12 @@ class IBKRBroker(Broker):
                 raise BrokerAuthError(self.name, "no accounts available on the gateway session")
             self._account_id = ids[0]
         self._connected = True
+
+    async def disconnect(self) -> None:
+        # Close the never-used client Broker.__init__ built (we swapped in a
+        # verify-aware one); super() closes the active client.
+        await self._default_client.aclose()
+        await super().disconnect()
 
     async def ping(self) -> bool:
         try:
@@ -152,6 +181,13 @@ class IBKRBroker(Broker):
         raise BrokerError(self.name, f"no contract found for {symbol}", retryable=False)
 
     async def submit_order(self, order: Order) -> Order:
+        if order.asset_class is AssetClass.OPTION:
+            raise BrokerError(
+                self.name,
+                "options are not supported by the IBKR plugin yet — OCC contract "
+                "resolution via /iserver/secdef/info is not implemented",
+                retryable=False,
+            )
         conid = await self._conid(order.symbol)
         ib_order: dict[str, Any] = {
             "conid": conid,
@@ -176,12 +212,23 @@ class IBKRBroker(Broker):
             json_body={"orders": [ib_order]},
         )
         # The gateway may answer with confirmation questions ("reply" flow);
-        # confirm standard warnings automatically, but never suppress errors.
+        # auto-confirm only known-informational prompts, never protective ones.
+        auto_confirm = _BENIGN_REPLY_IDS | {
+            str(m) for m in (self._options.get("auto_confirm_message_ids") or [])
+        }
         result = (payload or [{}])[0] if isinstance(payload, list) else (payload or {})
         for _ in range(3):
             reply_id = result.get("id")
             if not reply_id or "order_id" in result:
                 break
+            message_ids = [str(m) for m in (result.get("messageIds") or [])]
+            if not message_ids or not all(m in auto_confirm for m in message_ids):
+                raise BrokerError(
+                    self.name,
+                    "gateway confirmation required, not auto-confirming: "
+                    f"{message_ids or ['<no messageIds>']} {result.get('message') or ''}",
+                    retryable=False,
+                )
             answer = await self._request(
                 "POST", f"{self._base}/iserver/reply/{reply_id}", json_body={"confirmed": True}
             )

@@ -13,7 +13,7 @@ from typing import Any
 from ...core.enums import OptionRight
 from ...core.errors import ProviderError
 from ...core.models import Bar, Greeks, OptionChain, OptionContract, Quote
-from ..base import DataCapability, MarketDataProvider
+from ..base import DataCapability, MarketDataProvider, bar_end
 
 _LIVE = "https://api.tradier.com/v1"
 _SANDBOX = "https://sandbox.tradier.com/v1"
@@ -49,7 +49,9 @@ class TradierDataProvider(MarketDataProvider):
         if not quotes:
             raise ProviderError(self.name, f"no quote for {symbol}")
         q = quotes[0]
-        as_of = self._ts_from_epoch(q.get("trade_date"), millis=True) or self._now()
+        as_of = self._ts_from_epoch(q.get("trade_date"), millis=True)
+        if as_of is None:
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
         return Quote(
             symbol=symbol,
             bid=Decimal(str(q["bid"])) if q.get("bid") is not None else None,
@@ -75,11 +77,13 @@ class TradierDataProvider(MarketDataProvider):
                         open=Decimal(str(row["open"])), high=Decimal(str(row["high"])),
                         low=Decimal(str(row["low"])), close=Decimal(str(row["close"])),
                         volume=int(row.get("volume", 0)),
-                        start=start, end=start, source=self.name,
+                        start=start, end=bar_end(start, timeframe), source=self.name,
                     )
                 )
             except (KeyError, ValueError):
                 continue
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None) -> OptionChain:
@@ -99,11 +103,22 @@ class TradierDataProvider(MarketDataProvider):
         if not rows:
             raise ProviderError(self.name, f"empty option chain for {underlying} {expiration}")
         contracts: list[OptionContract] = []
-        now = self._now()
         for row in rows:
             try:
                 right = OptionRight.CALL if row["option_type"] == "call" else OptionRight.PUT
                 greeks_block = row.get("greeks") or {}
+                # Real quote time from the row's bid/ask/trade epochs (`or None`
+                # guards Tradier's 0-for-missing values, which would parse to
+                # 1970). greeks.updated_at is unusable — it is an ORATS batch
+                # time (~hourly, naive ET) and would falsely grade live chains
+                # stale; and receipt time would mask a frozen feed entirely.
+                quote_times = [t for t in (
+                    self._ts_from_epoch(row.get("bid_date") or None, millis=True),
+                    self._ts_from_epoch(row.get("ask_date") or None, millis=True),
+                    self._ts_from_epoch(row.get("trade_date") or None, millis=True),
+                ) if t is not None]
+                if not quote_times:
+                    continue
                 contracts.append(
                     OptionContract(
                         symbol=row["symbol"], underlying=underlying.upper(),
@@ -121,12 +136,18 @@ class TradierDataProvider(MarketDataProvider):
                             rho=greeks_block.get("rho"),
                             implied_volatility=greeks_block.get("mid_iv"),
                         ),
-                        as_of=now, source=self.name,
+                        as_of=max(quote_times),
+                        source=self.name,
                     )
                 )
             except (KeyError, ValueError):
                 continue
+        if not contracts:
+            raise ProviderError(
+                self.name, f"option chain for {underlying} has no contracts with quote timestamps"
+            )
+        chain_as_of = min(c.as_of for c in contracts)
         return OptionChain(
             underlying=underlying.upper(), expirations=[expiration],
-            contracts=contracts, as_of=now, source=self.name,
+            contracts=contracts, as_of=chain_as_of, source=self.name,
         )

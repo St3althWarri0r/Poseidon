@@ -37,7 +37,7 @@ def new_id() -> str:
 
 
 class PoseidonModel(BaseModel):
-    """Base model: immutable-by-default, strict-ish validation."""
+    """Base model: mutable with validated assignment (``frozen=False``), strict-ish validation (``extra="forbid"``)."""
 
     model_config = ConfigDict(frozen=False, extra="forbid", validate_assignment=True)
 
@@ -216,6 +216,16 @@ class Fill(PoseidonModel):
     broker: str = ""
 
 
+class Transfer(PoseidonModel):
+    """External cash movement (deposit, withdrawal, or journal). ``amount``
+    is signed: positive moves cash INTO the account. Not trading P&L — the
+    sync service re-anchors the loss/drawdown baselines by the net flow."""
+
+    id: str
+    at: datetime
+    amount: Money  # signed: +deposit / -withdrawal
+
+
 # --------------------------------------------------------------------------
 # Orders
 # --------------------------------------------------------------------------
@@ -269,12 +279,14 @@ class Order(PoseidonModel):
         return v
 
     def estimated_notional(self, reference_price: Decimal | None = None) -> Decimal | None:
-        """Best-effort notional for risk checks; requires a live reference price
-        for market orders."""
-        price = self.limit_price or reference_price
-        if price is None:
+        """Best-effort notional for risk checks, sized conservatively at the
+        highest known price (limit, stop trigger, or live reference) so a
+        buy-stop entry is checked at its trigger price, not the lower current
+        market. Requires a live reference price for market orders."""
+        candidates = [p for p in (self.limit_price, self.stop_price, reference_price) if p is not None]
+        if not candidates:
             return None
-        return abs(self.quantity) * price
+        return abs(self.quantity) * max(candidates)
 
 
 # --------------------------------------------------------------------------
@@ -311,7 +323,7 @@ class ProposedTrade(PoseidonModel):
     asset_class: AssetClass = AssetClass.EQUITY
     side: OrderSide
     order_type: OrderType = OrderType.LIMIT
-    quantity: Decimal
+    quantity: Decimal = Field(gt=0, allow_inf_nan=False)
     limit_price: Money | None = None
     stop_price: Money | None = None
     time_in_force: TimeInForce = TimeInForce.DAY

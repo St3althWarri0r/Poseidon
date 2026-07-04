@@ -21,6 +21,10 @@ RUN useradd --create-home --shell /usr/sbin/nologin poseidon
 COPY --from=build /install /usr/local
 COPY config/poseidon.example.yaml /usr/share/poseidon/poseidon.example.yaml
 
+# /data backs the named volume; pre-create it poseidon-owned so the empty
+# named volume inherits writable ownership on first mount.
+RUN install -d -o poseidon -g poseidon /data /data/config /data/share
+
 USER poseidon
 ENV XDG_CONFIG_HOME=/data/config \
     XDG_DATA_HOME=/data/share \
@@ -28,9 +32,15 @@ ENV XDG_CONFIG_HOME=/data/config \
 VOLUME ["/data"]
 EXPOSE 8321
 
+# The dashboard requires a bearer token (0.0.0.0 bind), so the health probe
+# authenticates with the same token the container was given.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s \
-  CMD python -c "import urllib.request,sys; \
-  sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8321/api/status', timeout=5).status==200 else 1)"
+  CMD python -c "import urllib.request,os,sys; \
+  f=os.environ.get('POSEIDON_DASHBOARD_TOKEN_FILE'); \
+  t=(open(f).read().strip() if f else os.environ.get('POSEIDON_DASHBOARD_TOKEN','')); \
+  h={'Authorization':'Bearer '+t} if t else {}; \
+  r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8321/api/status',headers=h),timeout=5); \
+  sys.exit(0 if r.status==200 else 1)"
 
 ENTRYPOINT ["poseidon"]
 CMD ["run"]

@@ -10,6 +10,7 @@ first-class report, not a spreadsheet exercise.
 
 from __future__ import annotations
 
+import statistics
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
@@ -74,7 +75,7 @@ def execution_quality(orders: list[dict[str, Any]]) -> dict[str, Any]:
         "fill_rate": round(len(filled) / len(reached_broker), 3) if reached_broker else None,
         "orders_measured": len(measured),
         "avg_slippage_bps": _avg(costs),
-        "median_slippage_bps": round(costs[len(costs) // 2], 2) if costs else None,
+        "median_slippage_bps": round(statistics.median(costs), 2) if costs else None,
         "worst_slippage_bps": round(costs[-1], 2) if costs else None,
         "worst_fill": {
             "symbol": worst.get("symbol"), "side": worst.get("side"),

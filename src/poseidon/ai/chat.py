@@ -15,6 +15,7 @@ review cycles, so the monthly budget covers chat too.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -31,6 +32,12 @@ log = structlog.get_logger(__name__)
 
 _HISTORY_TURNS = 30  # prior messages replayed to the model per send
 _MAX_MESSAGE_CHARS = 8_000
+
+# Case-insensitive and whitespace/attribute-tolerant so a pasted variant
+# (<SESSION_CONTEXT>, <Session_Context>, <session_context id="x">, </ session_context>)
+# cannot forge or close the trusted platform-state block. The \b keeps it
+# from matching unrelated tags like <session_contextual>.
+_SESSION_CONTEXT_TAG = re.compile(r"<\s*(/?)\s*session_context\b[^>]*>", re.IGNORECASE)
 
 
 class ChatBusyError(RuntimeError):
@@ -93,9 +100,8 @@ class ChatService:
         if self._lock.locked():
             raise ChatBusyError("Claude is still answering the previous message")
         # The context block is the platform's word, not the operator's — a
-        # message must not be able to forge or close one.
-        message = (message.replace("<session_context>", "[session_context]")
-                          .replace("</session_context>", "[/session_context]"))
+        # message must not be able to forge or close one (any case/spacing).
+        message = _SESSION_CONTEXT_TAG.sub(lambda m: f"[{m.group(1)}session_context]", message)
         async with self._lock:
             history = await self._history_as_messages(_HISTORY_TURNS)
             await self._persist("user", message)
@@ -113,6 +119,9 @@ class ChatService:
                 # dangling user message would silently merge into the next
                 # send. The marker also tells the operator what happened.
                 await self._persist("assistant", f"(request failed: {exc})")
+                # Carry partial usage (earlier tool-loop calls were billed) so
+                # the caller can still meter it against the monthly budget.
+                exc.usage = dict(usage)  # type: ignore[attr-defined]
                 raise
             if not reply:
                 reply = "(no response)"

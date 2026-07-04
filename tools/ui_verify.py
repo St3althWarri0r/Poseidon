@@ -391,6 +391,36 @@ async def drive() -> None:
         await page.wait_for_timeout(300)
         toasts = await page.text_content("#toasts")
         check("probe: empty credentials blocked", toasts is not None and "credential" in toasts)
+        # -- Schwab in-app OAuth: "Log in with Schwab" reaches Schwab's login --
+        await page.click('[data-broker="schwab"]')
+        await page.wait_for_timeout(300)
+        oauth_visible = await page.locator("#bf-oauth").is_visible()
+        check("schwab oauth block shown", oauth_visible)
+        login_label = await page.text_content("#bf-oauth-login")
+        check("schwab login button", login_label is not None and "Log in with" in login_label,
+              repr(login_label))
+        # Capture the window.open target instead of navigating to the real
+        # Schwab page, so the check is deterministic and offline.
+        await page.evaluate("window.__openedUrl=null; window.open=(u)=>{window.__openedUrl=u;return null;}")
+        await page.fill('#bf-fields [data-cred="app_key"]', "TESTAPPKEY")
+        await page.click("#bf-oauth-login")
+        await page.wait_for_timeout(400)
+        opened = await page.evaluate("window.__openedUrl")
+        check("schwab login opens Schwab OAuth authorize screen",
+              opened is not None
+              and opened.startswith("https://api.schwabapi.com/v1/oauth/authorize")
+              and "client_id=TESTAPPKEY" in opened,
+              repr(opened))
+        toasts = await page.text_content("#toasts")
+        check("schwab login toast", toasts is not None and "login page" in toasts.lower(),
+              repr(toasts))
+        await page.screenshot(path=f"{SHOTS}/v-schwab-oauth.png")
+        # OAuth block must NOT show for a non-OAuth broker
+        await page.click('[data-broker="public"]')
+        await page.wait_for_timeout(300)
+        oauth_hidden = await page.get_attribute("#bf-oauth", "hidden")
+        check("oauth block hidden for non-oauth broker", oauth_hidden is not None)
+
         await page.click("#acct-sync")
         await page.wait_for_timeout(500)
         toasts = await page.text_content("#toasts")

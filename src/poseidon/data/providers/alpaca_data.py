@@ -8,14 +8,14 @@ pass it via ``options`` when constructing (see registry wiring).
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from ...core.enums import OptionRight
 from ...core.errors import ProviderError
 from ...core.models import Bar, Greeks, NewsArticle, OptionChain, OptionContract, Quote
-from ..base import DataCapability, MarketDataProvider
+from ..base import DataCapability, MarketDataProvider, bar_end
 
 _DATA_BASE = "https://data.alpaca.markets"
 
@@ -64,7 +64,9 @@ class AlpacaDataProvider(MarketDataProvider):
         q = payload.get("quote")
         if not q:
             raise ProviderError(self.name, f"no quote for {symbol}")
-        as_of = datetime.fromisoformat(q["t"].replace("Z", "+00:00")) if q.get("t") else self._now()
+        if not q.get("t"):
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
+        as_of = datetime.fromisoformat(q["t"].replace("Z", "+00:00"))
         return Quote(
             symbol=symbol,
             bid=Decimal(str(q["bp"])) if q.get("bp") else None,
@@ -77,9 +79,14 @@ class AlpacaDataProvider(MarketDataProvider):
         tf = _TIMEFRAMES.get(timeframe)
         if tf is None:
             raise ProviderError(self.name, f"unsupported timeframe {timeframe}", retryable=False)
+        # Alpaca defaults `start` to the beginning of the CURRENT day (0-1 daily
+        # bars, none on weekends) — request a real lookback window, newest first.
+        lookback = 730 if timeframe in ("1d", "1w") else 30
+        start_date = (datetime.now(UTC) - timedelta(days=lookback)).date().isoformat()
         payload = await self._get(
             f"/v2/stocks/{symbol.upper()}/bars", timeframe=tf, limit=min(limit, 10000),
             adjustment="split", feed=self._options.get("feed", "iex"),
+            start=start_date, sort="desc",
         )
         bars: list[Bar] = []
         for row in payload.get("bars", []) or []:
@@ -91,11 +98,14 @@ class AlpacaDataProvider(MarketDataProvider):
                         open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
                         low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
                         volume=int(row.get("v", 0)),
-                        start=start, end=start, source=self.name,
+                        start=start, end=bar_end(start, timeframe), source=self.name,
                     )
                 )
             except (KeyError, ValueError):
                 continue
+        bars.reverse()  # requested newest-first; consumers expect chronological
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None) -> OptionChain:
@@ -106,14 +116,19 @@ class AlpacaDataProvider(MarketDataProvider):
         snapshots = payload.get("snapshots") or {}
         contracts: list[OptionContract] = []
         expirations: set[date] = set()
-        now = self._now()
         for occ_symbol, snap in snapshots.items():
             parsed = _parse_occ(occ_symbol)
             if parsed is None:
                 continue
             _, exp, right, strike = parsed
-            expirations.add(exp)
             quote_block = snap.get("latestQuote") or {}
+            # Real per-contract quote time (indicative feeds freeze when the
+            # market is closed); never stamp receipt time — a fabricated
+            # as_of would grade a frozen chain REAL_TIME at the router.
+            ts = self._parse_ts(quote_block.get("t"))
+            if ts is None:
+                continue
+            expirations.add(exp)
             greeks_block = snap.get("greeks") or {}
             contracts.append(
                 OptionContract(
@@ -127,15 +142,27 @@ class AlpacaDataProvider(MarketDataProvider):
                         rho=greeks_block.get("rho"),
                         implied_volatility=snap.get("impliedVolatility"),
                     ),
-                    as_of=now, source=self.name,
+                    as_of=ts, source=self.name,
                 )
             )
         if not contracts:
-            raise ProviderError(self.name, f"empty option chain for {underlying}")
+            raise ProviderError(
+                self.name, f"option chain for {underlying} has no contracts with quote timestamps"
+            )
+        chain_as_of = min(c.as_of for c in contracts)
         return OptionChain(
             underlying=underlying.upper(), expirations=sorted(expirations),
-            contracts=contracts, as_of=now, source=self.name,
+            contracts=contracts, as_of=chain_as_of, source=self.name,
         )
+
+    @staticmethod
+    def _parse_ts(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
 
     async def news(self, symbols: list[str] | None = None, *, limit: int = 25) -> list[NewsArticle]:
         params: dict[str, Any] = {"limit": min(limit, 50), "sort": "desc"}

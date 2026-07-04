@@ -54,6 +54,7 @@ REGULAR_CLOSE = time(16, 0)
 HALF_DAY_CLOSE = time(13, 0)
 PRE_MARKET_OPEN = time(4, 0)
 AFTER_HOURS_CLOSE = time(20, 0)
+HALF_DAY_AFTER_HOURS_CLOSE = time(17, 0)  # post-market ends 17:00 ET on early-close days
 
 
 def utc_now() -> datetime:
@@ -107,7 +108,8 @@ class MarketClock:
             return MarketSession.REGULAR
         if PRE_MARKET_OPEN <= t < REGULAR_OPEN:
             return MarketSession.PRE_MARKET
-        if close <= t < AFTER_HOURS_CLOSE and day not in HALF_DAYS:
+        ah_close = HALF_DAY_AFTER_HOURS_CLOSE if day in HALF_DAYS else AFTER_HOURS_CLOSE
+        if close <= t < ah_close:
             return MarketSession.AFTER_HOURS
         return MarketSession.CLOSED
 

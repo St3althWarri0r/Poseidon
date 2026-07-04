@@ -308,6 +308,12 @@ class PublicBroker(Broker):
                 path = f"{_BASE}/userapigateway/trading/{self._account_id}/preflight/single-leg"
             await self._request("POST", path, headers=await self._auth_headers(),
                                 json_body=payload)
+        except BrokerAuthError:
+            # Auth failure is not a verdict on the order — the check could not
+            # be performed. Return None per the base preflight contract and let
+            # submit_order surface the auth error (which also feeds
+            # note_execution_error / the execution circuit breaker).
+            return None
         except BrokerError as exc:
             if exc.retryable:  # 5xx/timeout: preflight unavailable, not a verdict
                 return None
@@ -392,11 +398,20 @@ class PublicBroker(Broker):
             quantity = _dec(row.get("quantity"))
             if quantity is None or quantity <= 0:
                 quantity = Decimal("1")
+            oid = str(row.get("orderId", ""))
+            # submit sends orderId as the dashed canonical UUID rendering of
+            # our uuid4().hex client_order_id (_client_uuid); invert it here so
+            # crash reconciliation's exact-string coid match (manager.py
+            # _reconcile_ambiguous_orders) finds the local order.
+            try:
+                coid = uuid.UUID(oid).hex
+            except ValueError:
+                coid = oid
             orders.append(
                 Order(
-                    client_order_id=str(row.get("orderId", "")),
+                    client_order_id=coid,
                     broker=self.name,
-                    broker_order_id=str(row.get("orderId", "")),
+                    broker_order_id=oid,
                     symbol=instrument.get("symbol", ""),
                     asset_class={
                         "OPTION": AssetClass.OPTION, "CRYPTO": AssetClass.CRYPTO,

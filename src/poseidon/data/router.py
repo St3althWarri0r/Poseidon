@@ -25,6 +25,7 @@ from ..core.enums import DataFreshness
 from ..core.errors import (
     AllProvidersFailedError,
     DataUnavailableError,
+    ProviderAuthError,
     ProviderError,
     StaleDataError,
 )
@@ -228,11 +229,23 @@ class DataRouter:
                     errors.append(f"{slot.provider.name}: capability not implemented")
                     continue
                 except ProviderError as exc:
+                    if not exc.retryable and not isinstance(exc, ProviderAuthError):
+                        # Permanent request/capability mismatch (e.g. "only 1d
+                        # bars supported"): the provider is healthy — this
+                        # request can just never succeed there. Skip like
+                        # NotImplementedError; the penalty box is per-provider,
+                        # so record_failure would demote its healthy
+                        # capabilities behind lower-priority providers.
+                        errors.append(str(exc))
+                        continue
                     retry_after = getattr(exc, "retry_after", None)
                     slot.record_failure(retry_after=retry_after)
                     errors.append(str(exc))
-                    log.warning("provider failed, failing over",
-                                provider=slot.provider.name, capability=capability, error=str(exc))
+                    # Auth failures disable every capability and never
+                    # self-heal — surface them at error level.
+                    log_fn = log.error if isinstance(exc, ProviderAuthError) else log.warning
+                    log_fn("provider failed, failing over",
+                           provider=slot.provider.name, capability=capability, error=str(exc))
                     continue
                 slot.record_success((time.monotonic() - started) * 1000)
                 return result

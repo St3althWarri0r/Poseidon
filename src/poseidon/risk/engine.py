@@ -9,7 +9,8 @@ broker reference used for submission and calls the engine first.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import structlog
 
@@ -51,6 +52,15 @@ class RiskEngine:
         self.sleeve_attribution: dict[str, set[str]] = {}
         self._orders_today = 0
         self._orders_today_date: str = ""
+        # In-flight exposure: orders validated+submitted this cycle but not yet
+        # reflected in a portfolio sync. Without this, multiple orders in one
+        # decision each validate against the same pre-cycle snapshot and can
+        # stack past the gross/leverage/options/position/sector caps.
+        # order_id -> (client_order_id, SYMBOL, notional, is_option, submitted_at)
+        self._pending: dict[str, tuple[str, str, Decimal, bool, datetime]] = {}
+        # order_id -> (notional, is_option, validated_at); staged at validation,
+        # promoted to _pending on submit (or pruned if never submitted).
+        self._validated_notional: dict[str, tuple[Decimal, bool, datetime]] = {}
 
     # -- accounting ----------------------------------------------------------
 
@@ -71,10 +81,32 @@ class RiskEngine:
         self._orders_today_date = date
         self._orders_today = count
 
-    def note_order_submitted(self, symbol: str) -> None:
+    def note_order_submitted(self, order: Order) -> None:
         self._roll_daily_counter()
         self._orders_today += 1
-        self.cooldowns.record_trade(symbol)
+        self.cooldowns.record_trade(order.symbol)
+        # Reserve this order's validated notional as in-flight exposure until a
+        # later sync reflects it. Risk-reducing orders never increase exposure.
+        validated = self._validated_notional.pop(order.id, None)
+        if validated is not None and not order.side.is_risk_reducing:
+            self._pending[order.id] = (
+                order.client_order_id, order.symbol.upper(),
+                validated[0], validated[1], datetime.now(UTC),
+            )
+
+    def _reconcile_pending(self) -> None:
+        """Release a reservation once a portfolio sync taken after submission
+        shows the order is no longer open at the broker (filled -> now in
+        positions; canceled/rejected -> void). Orders still resting in
+        portfolio.open_orders keep their reservation."""
+        synced_at = self._portfolio.synced_at
+        if synced_at is None or not self._pending:
+            return
+        open_coids = {o.client_order_id for o in self._portfolio.open_orders if o.client_order_id}
+        for oid, (coid, _s, _n, _o, submitted_at) in list(self._pending.items()):
+            # 10s grace covers an order submitted mid-sync-pass.
+            if coid not in open_coids and synced_at > submitted_at + timedelta(seconds=10):
+                del self._pending[oid]
 
     def note_execution_error(self, reason: str) -> None:
         if self.circuit.record_error(reason):
@@ -104,6 +136,7 @@ class RiskEngine:
         if self.circuit.is_open:
             raise CircuitBreakerOpen(self.circuit.reason or "open")
         self._roll_daily_counter()
+        self._reconcile_pending()
 
         # Live inputs. Any failure here aborts the order — deliberately no
         # fallbacks to cached or assumed values.
@@ -122,6 +155,14 @@ class RiskEngine:
                 log.warning("economic calendar unavailable; blackout rule will pass empty")
         order_sector, position_sectors = await self._gather_sectors(order)
 
+        pending_gross = sum((n for _c, _s, n, _o, _t in self._pending.values()), Decimal(0))
+        pending_options = sum(
+            (n for _c, _s, n, is_opt, _t in self._pending.values() if is_opt), Decimal(0)
+        )
+        pending_by_symbol: dict[str, Decimal] = {}
+        for _c, sym, n, _o, _t in self._pending.values():
+            pending_by_symbol[sym] = pending_by_symbol.get(sym, Decimal(0)) + n
+
         ctx = RiskContext(
             order=order,
             quote=quote,
@@ -136,6 +177,9 @@ class RiskEngine:
             position_sectors=position_sectors,
             sleeve_caps=dict(self.sleeve_caps),
             sleeve_attribution={k: set(v) for k, v in self.sleeve_attribution.items()},
+            pending_gross=pending_gross,
+            pending_options=pending_options,
+            pending_by_symbol=pending_by_symbol,
         )
         for rule in self._rules:
             try:
@@ -149,6 +193,17 @@ class RiskEngine:
                      "detail": str(violation), "at": datetime.now(UTC).isoformat()},
                 )
                 raise
+        # All rules passed: stage this order's notional so it counts as
+        # in-flight exposure the moment it is submitted (note_order_submitted
+        # promotes it to _pending). Approval-mode re-validation refreshes it.
+        now = datetime.now(UTC)
+        self._validated_notional[order.id] = (
+            ctx.notional, order.asset_class is AssetClass.OPTION, now,
+        )
+        # Prune stashes validated but never submitted (e.g. rejected downstream).
+        cutoff = now - timedelta(minutes=15)
+        for oid in [o for o, (_n, _is, at) in self._validated_notional.items() if at < cutoff]:
+            del self._validated_notional[oid]
         return quote
 
     async def _gather_sectors(self, order: Order) -> tuple[str | None, dict[str, str]]:

@@ -113,6 +113,7 @@ async def test_stop_breach_executes_exit_in_autonomous(tmp_path) -> None:
     guardian = PositionGuardian(GuardianConfig(), db, kernel)
     await guardian.on_order_filled("order.filled", filled_buy())
     await guardian.check_all()
+    await guardian.drain()  # exit dispatch runs off the detection loop
     assert len(kernel.executed_decisions) == 1
     decision = kernel.executed_decisions[0]
     assert decision.action is DecisionAction.SELL
@@ -133,6 +134,7 @@ async def test_target_breach_triggers(tmp_path) -> None:
     guardian = PositionGuardian(GuardianConfig(), db, kernel)
     await guardian.on_order_filled("order.filled", filled_buy())
     await guardian.check_all()
+    await guardian.drain()  # exit dispatch runs off the detection loop
     assert len(kernel.executed_decisions) == 1
     assert "take profit" in kernel.executed_decisions[0].rationale.thesis
     await db.close()

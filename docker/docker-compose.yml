@@ -13,14 +13,21 @@ services:
     environment:
       # Provide the vault passphrase via an env file or docker secret —
       # NEVER commit it. POSEIDON_* variables override poseidon.yaml values.
-      POSEIDON_VAULT_PASSPHRASE_FILE: /run/secrets/aegis_vault_passphrase
+      POSEIDON_VAULT_PASSPHRASE_FILE: /run/secrets/poseidon_vault_passphrase
+      # The image binds 0.0.0.0 (so the loopback-only host port mapping above
+      # can reach it), which requires a dashboard bearer token. Supplied here
+      # via a secret file so the container boots without pre-seeding the vault.
+      POSEIDON_DASHBOARD_TOKEN_FILE: /run/secrets/poseidon_dashboard_token
     secrets:
-      - aegis_vault_passphrase
+      - poseidon_vault_passphrase
+      - poseidon_dashboard_token
     stop_grace_period: 30s
 
 volumes:
   poseidon-data:
 
 secrets:
-  aegis_vault_passphrase:
+  poseidon_vault_passphrase:
     file: ./secrets/vault_passphrase.txt   # create locally, chmod 600, gitignored
+  poseidon_dashboard_token:
+    file: ./secrets/dashboard_token.txt    # create locally, chmod 600, gitignored

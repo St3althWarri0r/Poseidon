@@ -142,7 +142,6 @@ class AlpacaBroker(Broker):
         body: dict[str, Any] = {
             "symbol": order.symbol.upper(),
             "side": _SIDE_MAP[order.side],
-            "type": order.order_type.value.replace("_", "_"),
             "time_in_force": order.time_in_force.value,
             "client_order_id": order.client_order_id,
             "extended_hours": order.extended_hours,
@@ -152,10 +151,7 @@ class AlpacaBroker(Broker):
             OrderType.MARKET: "market", OrderType.LIMIT: "limit", OrderType.STOP: "stop",
             OrderType.STOP_LIMIT: "stop_limit", OrderType.TRAILING_STOP: "trailing_stop",
         }[order.order_type]
-        if order.quantity == order.quantity.to_integral_value():
-            body["qty"] = str(order.quantity)
-        else:
-            body["qty"] = str(order.quantity)  # fractional supported for market/day
+        body["qty"] = str(order.quantity)  # fractional supported for market/day
         if order.limit_price is not None:
             body["limit_price"] = str(order.limit_price)
         if order.stop_price is not None:
@@ -175,9 +171,18 @@ class AlpacaBroker(Broker):
         await self._request(
             "DELETE", f"{self._base}/v2/orders/{order.broker_order_id}", headers=self._headers
         )
-        order.status = OrderStatus.CANCELED
-        order.updated_at = datetime.now(UTC)
-        return order
+        # Cancel is asynchronous at the broker: the DELETE only queues the
+        # request and in-flight fills can still occur. Adopt the broker's
+        # authoritative state (pending-cancel maps to a non-terminal status)
+        # so the lifecycle poller carries the order to its true terminal
+        # state with any last-moment fills attached.
+        try:
+            return await self.order_status(order)
+        except BrokerError:
+            order.status = OrderStatus.ACCEPTED
+            order.status_reason = "cancel requested — awaiting broker confirmation"
+            order.updated_at = datetime.now(UTC)
+            return order
 
     async def order_status(self, order: Order) -> Order:
         if not order.broker_order_id:

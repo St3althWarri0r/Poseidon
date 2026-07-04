@@ -162,9 +162,11 @@ class BacktestEngine:
     def __init__(self, config: BacktestConfig | None = None) -> None:
         self._config = config or BacktestConfig()
 
-    async def run(self, strategy: Strategy, history: dict[str, list[Bar]]) -> BacktestResult:
+    async def run(self, strategy: Strategy, history: dict[str, list[Bar]],
+                  *, start: date | None = None) -> BacktestResult:
         """Replay `history` (symbol -> chronological daily bars) through the
-        strategy day by day."""
+        strategy day by day. Days before `start` (if given) are warmup: the
+        strategy's visibility advances but no trading or equity marking occurs."""
         config = self._config
         window = _HistoricalWindow({k.upper(): v for k, v in history.items()})
         router = _RouterShim(window)
@@ -174,9 +176,22 @@ class BacktestEngine:
         all_dates = sorted({b.start.date() for bars in history.values() for b in bars})
         cash = config.starting_cash
         open_trades: list[TradeRecord] = []
+        # True next-open execution: a signal/exit decided from day T's close can
+        # only be filled at T+1's open (a live order cannot fill at the same
+        # close that produced its signal). Buffering removes the same-bar fill
+        # bias that otherwise credits breakout entries with the overnight gap.
+        pending_entries: list[Signal] = []          # from yesterday's scan
+        pending_exits: list[tuple[TradeRecord, str]] = []  # from yesterday's close
+        last_close: dict[str, float] = {}
         bars_by_symbol_date: dict[tuple[str, date], Bar] = {
             (s.upper(), b.start.date()): b for s, bars in history.items() for b in bars
         }
+        history_upper = {k.upper(): v for k, v in history.items()}
+
+        def _equity() -> float:
+            return cash + sum(
+                t.quantity * last_close.get(t.symbol.upper(), t.entry_price) for t in open_trades
+            )
 
         for day in all_dates:
             # Advance visibility cursors through today.
@@ -184,67 +199,101 @@ class BacktestEngine:
                 count = sum(1 for b in bars if b.start.date() <= day)
                 window.cursor[symbol.upper()] = count
 
-            # Manage exits at today's close.
-            still_open: list[TradeRecord] = []
-            for trade in open_trades:
+            # Warmup: before `start`, advance visibility and last-known closes
+            # only — no fills, no scans, no equity points.
+            if start is not None and day < start:
+                for symbol in history:
+                    bar = bars_by_symbol_date.get((symbol.upper(), day))
+                    if bar is not None:
+                        last_close[symbol.upper()] = float(bar.close)
+                continue
+
+            # 1. Fill exits decided yesterday, at today's OPEN. If the symbol
+            #    does not print today, carry the exit to the next session.
+            carried_exits: list[tuple[TradeRecord, str]] = []
+            for trade, reason in pending_exits:
                 bar = bars_by_symbol_date.get((trade.symbol, day))
                 if bar is None:
-                    still_open.append(trade)
+                    carried_exits.append((trade, reason))
                     continue
-                close = float(bar.close)
+                price = float(bar.open) * (1 - config.slippage_pct)
+                trade.exit_date, trade.exit_price, trade.reason = day, price, reason
+                cash += trade.quantity * price - config.commission_per_trade
+                result.trades.append(trade)
+                if trade in open_trades:
+                    open_trades.remove(trade)
+            pending_exits = carried_exits
+
+            # 2. Fill entries signalled yesterday, at today's OPEN. A signal that
+            #    cannot fill today (symbol did not print) is stale and dropped.
+            held = {t.symbol for t in open_trades}
+            for signal in sorted(pending_entries, key=lambda s: s.strength, reverse=True):
+                sym = signal.symbol.upper()
+                if sym in held or len(open_trades) >= config.max_positions:
+                    continue
+                bar = bars_by_symbol_date.get((sym, day))
+                if bar is None:
+                    continue
+                price = float(bar.open) * (1 + config.slippage_pct)
+                budget = _equity() * config.position_pct
+                if price <= 0 or budget + config.commission_per_trade > cash:
+                    continue
+                quantity = budget / price
+                cash -= quantity * price + config.commission_per_trade
+                open_trades.append(TradeRecord(symbol=sym, entry_date=day,
+                                               entry_price=price, quantity=quantity))
+                held.add(sym)
+            pending_entries = []
+
+            # 3. Update last-known closes and mark equity at today's CLOSE. A
+            #    held symbol with no bar today is marked at its last close, not
+            #    its entry price (which would fabricate a round-trip in returns).
+            for symbol in history:
+                bar = bars_by_symbol_date.get((symbol.upper(), day))
+                if bar is not None:
+                    last_close[symbol.upper()] = float(bar.close)
+            result.equity_curve.append((day, _equity()))
+
+            # 4. Decide exits from today's bar; fill next open. The stop is
+            #    checked against today's LOW — the live guardian enforces stops
+            #    intraday, so a close-only check would let a position trade far
+            #    through its stop and recover, flattering the results. Targets
+            #    and time stops are checked at the close (conservative).
+            flagged = {id(t) for t, _ in pending_exits}
+            for trade in open_trades:
+                if id(trade) in flagged:
+                    continue
+                close = last_close.get(trade.symbol.upper())
+                if close is None:
+                    continue
+                bar = bars_by_symbol_date.get((trade.symbol.upper(), day))
+                low = float(bar.low) if bar is not None else close
                 held_days = (day - trade.entry_date).days
-                exit_reason = None
-                if close <= trade.entry_price * (1 - config.stop_loss_pct):
+                exit_reason: str | None = None
+                if low <= trade.entry_price * (1 - config.stop_loss_pct):
                     exit_reason = "stop_loss"
                 elif close >= trade.entry_price * (1 + config.take_profit_pct):
                     exit_reason = "take_profit"
                 elif held_days >= config.max_hold_days:
                     exit_reason = "time_stop"
                 if exit_reason:
-                    price = close * (1 - config.slippage_pct)
-                    trade.exit_date, trade.exit_price, trade.reason = day, price, exit_reason
-                    cash += trade.quantity * price - config.commission_per_trade
-                    result.trades.append(trade)
-                else:
-                    still_open.append(trade)
-            open_trades = still_open
+                    pending_exits.append((trade, exit_reason))
 
-            # Mark equity.
-            equity = cash
-            for trade in open_trades:
-                bar = bars_by_symbol_date.get((trade.symbol, day))
-                mark = float(bar.close) if bar else trade.entry_price
-                equity += trade.quantity * mark
-            result.equity_curve.append((day, equity))
-
-            # New entries from today's signals, executed at today's close
-            # with slippage (signals computed on data through today).
-            if len(open_trades) >= config.max_positions:
-                continue
-            signals = await strategy.scan(router, portfolio)  # type: ignore[arg-type]
-            held = {t.symbol for t in open_trades}
-            for signal in sorted(signals, key=lambda s: s.strength, reverse=True):
-                if signal.direction != "long" or signal.symbol in held:
-                    continue
-                if len(open_trades) >= config.max_positions:
-                    break
-                bar = bars_by_symbol_date.get((signal.symbol, day))
-                if bar is None:
-                    continue
-                price = float(bar.close) * (1 + config.slippage_pct)
-                budget = equity * config.position_pct
-                if budget > cash or price <= 0:
-                    continue
-                quantity = budget / price
-                cash -= quantity * price + config.commission_per_trade
-                trade = TradeRecord(symbol=signal.symbol, entry_date=day,
-                                    entry_price=price, quantity=quantity)
-                open_trades.append(trade)
-                held.add(signal.symbol)
+            # 5. Scan today's data; buffer fresh long entries to fill next open.
+            #    Capacity treats pending exits as vacated: they fill at the next
+            #    open (step 1) before entries (step 2), so their slots are free
+            #    by the time these buffered entries could fill. Step 2 still
+            #    re-checks real capacity at fill time, so a carried exit that
+            #    fails to fill cannot cause over-allocation.
+            if len(open_trades) - len(pending_exits) < config.max_positions:
+                signals = await strategy.scan(router, portfolio)  # type: ignore[arg-type]
+                held = {t.symbol for t in open_trades}
+                pending_entries = [s for s in signals
+                                   if s.direction == "long" and s.symbol.upper() not in held]
 
         # Close remaining trades at the final visible price.
         for trade in open_trades:
-            bars = history.get(trade.symbol) or history.get(trade.symbol.upper()) or []
+            bars = history_upper.get(trade.symbol.upper()) or []
             if bars:
                 trade.exit_date = bars[-1].start.date()
                 trade.exit_price = float(bars[-1].close)
@@ -261,6 +310,9 @@ def signals_only_replay(strategy: Strategy, history: dict[str, list[Bar]],
     window = _HistoricalWindow({k.upper(): v for k, v in history.items()})
     for symbol, bars in history.items():
         window.cursor[symbol.upper()] = sum(1 for b in bars if b.start.date() <= on_day)
-    return asyncio.get_event_loop().run_until_complete(
+    # asyncio.run creates and tears down its own loop — robust on modern Python,
+    # unlike get_event_loop() which is deprecated with no running loop and raises
+    # when one is already running.
+    return asyncio.run(
         strategy.scan(_RouterShim(window), _PortfolioShim())  # type: ignore[arg-type]
     )

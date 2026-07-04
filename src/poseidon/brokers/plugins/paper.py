@@ -11,7 +11,10 @@ Fill model:
     to last/mid when the book is one-sided;
   * limit orders fill when marketable against the current quote;
   * non-marketable limit orders rest and are re-evaluated by
-    ``order_status`` / ``open_orders`` polls (the order manager polls).
+    ``order_status`` / ``open_orders`` polls (the order manager polls);
+  * optional adverse slippage on market-style fills via
+    ``options["slippage_bps"]`` (default 0 — fill at the touch); limit and
+    stop-limit fills stay capped at the limit price.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ...core.enums import BrokerCapability, OrderStatus
 from ...core.errors import BrokerError, OrderRejectedError
@@ -31,6 +35,7 @@ from ..base import Broker
 QuoteFn = Callable[[str], Awaitable[Quote]]
 
 _DEFAULT_CASH = Decimal("100000")
+_EASTERN = ZoneInfo("America/New_York")
 
 
 class PaperBroker(Broker):
@@ -48,11 +53,25 @@ class PaperBroker(Broker):
         # snapshot would clobber the ACTIVE paper broker's saved state.
         self._read_only = bool(self._options.get("read_only", False))
         self._cash = Decimal(str(self._options.get("starting_cash", _DEFAULT_CASH)))
+        self._slippage_bps = Decimal(str(self._options.get("slippage_bps", "0")))
         self._positions: dict[str, dict[str, Any]] = {}  # symbol -> {qty, avg_price}
         self._lots: list[dict[str, Any]] = []
         self._open_orders: dict[str, Order] = {}
         self._fills: list[Fill] = []
         self._realized_pnl_today = Decimal(0)
+        # The Eastern trading day the running realized-P&L total belongs to, so
+        # day_pnl resets at the day boundary like every real broker's does.
+        self._pnl_day = self._today_eastern()
+
+    @staticmethod
+    def _today_eastern() -> str:
+        return datetime.now(_EASTERN).date().isoformat()
+
+    def _roll_pnl_day(self) -> None:
+        today = self._today_eastern()
+        if today != self._pnl_day:
+            self._pnl_day = today
+            self._realized_pnl_today = Decimal(0)
 
     def set_quote_fn(self, fn: QuoteFn) -> None:
         """Wired by the kernel after the data router exists."""
@@ -98,6 +117,7 @@ class PaperBroker(Broker):
     # -- account -----------------------------------------------------------------
 
     async def account(self) -> AccountSnapshot:
+        self._roll_pnl_day()
         equity = self._cash
         for symbol, pos in self._positions.items():
             price = await self._mark_price(symbol)
@@ -147,21 +167,40 @@ class PaperBroker(Broker):
         order.status = OrderStatus.ACCEPTED
         order.updated_at = datetime.now(UTC)
         self._open_orders[order.id] = order
-        await self._try_fill(order)
+        try:
+            await self._try_fill(order)
+        except Exception:
+            # A failed quote lookup must not leave a phantom ACCEPTED order in
+            # the book — later open_orders()/order_status polls would fill it
+            # while the manager recorded the submit as failed.
+            self._open_orders.pop(order.id, None)
+            raise
         self._save_state()
         return order
 
     async def cancel_order(self, order: Order) -> Order:
-        tracked = self._open_orders.pop(order.id, None)
+        tracked = self._open_orders.get(order.id)
         if tracked is None or tracked.status.is_terminal:
+            # Do NOT evict a terminal (e.g. just-filled) order here: it must
+            # stay in the book so submit_order's duplicate client_order_id
+            # guard still remembers it.
             raise BrokerError(self.name, f"order {order.id} is not open", retryable=False)
+        del self._open_orders[order.id]
         tracked.status = OrderStatus.CANCELED
         tracked.updated_at = datetime.now(UTC)
         self._save_state()
         return tracked
 
     async def order_status(self, order: Order) -> Order:
-        tracked = self._open_orders.get(order.id, order)
+        tracked = self._open_orders.get(order.id)
+        if tracked is None:
+            # Not in the book (e.g. resumed from the DB after a restart with a
+            # pre-persistence state file, or never accepted): never fill from
+            # a caller-supplied order. A fill must only come from an order
+            # this broker actually tracks, otherwise it bypasses the duplicate
+            # guard, is invisible to open_orders()/cancel_order, and mutates
+            # the account without being saved.
+            return order
         if not tracked.status.is_terminal:
             await self._try_fill(tracked)
         return tracked
@@ -192,20 +231,42 @@ class PaperBroker(Broker):
             )
         return await self._quote_fn(symbol)
 
+    def _slip(self, price: Decimal, buy: bool) -> Decimal:
+        """Adverse slippage for market-style fills (``options["slippage_bps"]``);
+        limit fills are already price-capped."""
+        if self._slippage_bps <= 0:
+            return price
+        adj = price * self._slippage_bps / Decimal(10000)
+        return price + adj if buy else price - adj
+
     async def _try_fill(self, order: Order) -> None:
         quote = await self._require_quote(order.symbol)
         buy = order.side.is_buy
         book_price = (quote.ask if buy else quote.bid) or quote.last or quote.mid
         if book_price is None:
             return  # no price, no fill — try again on next poll
-        if order.order_type.value == "limit" and order.limit_price is not None:
+        order_type = order.order_type.value
+        if order_type in ("stop", "stop_limit") and order.stop_price is not None:
+            # Rest until the stop triggers: a buy stop triggers when the market
+            # rises to/through the stop; a sell stop when it falls to/through.
+            triggered = book_price >= order.stop_price if buy else book_price <= order.stop_price
+            if not triggered:
+                return
+            if order_type == "stop_limit" and order.limit_price is not None:
+                # Once triggered a stop-limit behaves like a limit order.
+                marketable = book_price <= order.limit_price if buy else book_price >= order.limit_price
+                if not marketable:
+                    return
+                fill_price = min(book_price, order.limit_price) if buy else max(book_price, order.limit_price)
+            else:
+                fill_price = self._slip(book_price, buy)  # plain stop -> market once triggered
+        elif order_type == "limit" and order.limit_price is not None:
             marketable = book_price <= order.limit_price if buy else book_price >= order.limit_price
             if not marketable:
                 return
-            fill_price = order.limit_price if buy else max(book_price, order.limit_price)
-            fill_price = min(book_price, order.limit_price) if buy else fill_price
+            fill_price = min(book_price, order.limit_price) if buy else max(book_price, order.limit_price)
         else:
-            fill_price = book_price
+            fill_price = self._slip(book_price, buy)
         cost = order.quantity * fill_price
         if buy and cost > self._cash:
             order.status = OrderStatus.REJECTED_BROKER
@@ -215,6 +276,7 @@ class PaperBroker(Broker):
         self._apply_fill(order, fill_price)
 
     def _apply_fill(self, order: Order, price: Decimal) -> None:
+        self._roll_pnl_day()
         symbol = order.symbol.upper()
         qty = order.quantity
         now = datetime.now(UTC)
@@ -251,6 +313,10 @@ class PaperBroker(Broker):
             Fill(order_id=order.id, broker_order_id=order.broker_order_id, symbol=symbol,
                  side=order.side, quantity=qty, price=price, filled_at=now, broker=self.name)
         )
+        # Fills can arrive via order_status()/open_orders() polls, not just
+        # submit_order — persist immediately so a crash cannot revert the book
+        # while the orders DB keeps the FILLED record.
+        self._save_state()
 
     def _consume_lots(self, symbol: str, qty: Decimal) -> None:
         """FIFO lot consumption."""
@@ -279,6 +345,11 @@ class PaperBroker(Broker):
             "positions": self._positions,
             "lots": self._lots,
             "realized_pnl_today": str(self._realized_pnl_today),
+            "pnl_day": self._pnl_day,
+            # All tracked orders (terminal ones included) so a restart keeps
+            # resting limits AND the duplicate client_order_id guard's memory.
+            "open_orders": [o.model_dump(mode="json") for o in self._open_orders.values()],
+            "fills": [f.model_dump(mode="json") for f in self._fills],
         }
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._state_file.with_suffix(".tmp")
@@ -293,3 +364,11 @@ class PaperBroker(Broker):
         self._positions = state.get("positions", {})
         self._lots = state.get("lots", [])
         self._realized_pnl_today = Decimal(state.get("realized_pnl_today", "0"))
+        # Older state files predate order/fill persistence — default to empty.
+        self._open_orders = {
+            o.id: o for o in (Order.model_validate(d) for d in state.get("open_orders", []))
+        }
+        self._fills = [Fill.model_validate(d) for d in state.get("fills", [])]
+        # A restart on a new trading day must not resurrect yesterday's P&L.
+        self._pnl_day = state.get("pnl_day") or self._today_eastern()
+        self._roll_pnl_day()

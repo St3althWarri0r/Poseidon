@@ -6,7 +6,6 @@ import random
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
 
 from ..core.models import Bar
 from ..strategy.base import Strategy
@@ -63,11 +62,17 @@ def monte_carlo(result: BacktestResult, *, runs: int = 1000,
 
 async def walk_forward(strategy_factory: Callable[[], Strategy],
                        history: dict[str, list[Bar]], *,
-                       folds: int = 4, config: BacktestConfig | None = None
+                       folds: int = 4, warmup_days: int = 210,
+                       config: BacktestConfig | None = None
                        ) -> list[dict[str, object]]:
     """Split the history into sequential folds and evaluate each out-of-sample
     segment with a strategy built fresh per fold (factory gets no data — the
-    engine's visibility window prevents lookahead within the fold)."""
+    engine's visibility window prevents lookahead within the fold). Each fold's
+    segment carries up to `warmup_days` of preceding bars so indicator lookbacks
+    are warm at the fold start (the engine only trades from the fold's first
+    day). Fold 1 gets only whatever history precedes it — callers wanting a
+    fully warmed first fold should supply `warmup_days` of extra leading
+    history."""
     all_dates = sorted({b.start.date() for bars in history.values() for b in bars})
     if len(all_dates) < folds * 40:
         raise ValueError("not enough history for the requested number of folds")
@@ -76,16 +81,22 @@ async def walk_forward(strategy_factory: Callable[[], Strategy],
     reports: list[dict[str, object]] = []
     for i in range(folds):
         start = all_dates[i * fold_size]
-        end = all_dates[min((i + 1) * fold_size, len(all_dates)) - 1]
+        # Last fold absorbs the len(all_dates) % folds remainder so the most
+        # recent trading days are evaluated.
+        end = all_dates[-1] if i == folds - 1 else all_dates[(i + 1) * fold_size - 1]
+        warmup_start = all_dates[max(0, i * fold_size - warmup_days)]
         segment = {
-            symbol: [b for b in bars if start <= b.start.date() <= end]
+            symbol: [b for b in bars if warmup_start <= b.start.date() <= end]
             for symbol, bars in history.items()
         }
-        segment = {s: b for s, b in segment.items() if len(b) >= 30}
+        # Count only in-fold bars toward the minimum — warmup bars alone must
+        # not qualify a symbol for evaluation.
+        segment = {s: b for s, b in segment.items()
+                   if sum(1 for bar in b if bar.start.date() >= start) >= 30}
         if not segment:
             continue
         strategy: Strategy = strategy_factory()
-        result = await engine.run(strategy, segment)
+        result = await engine.run(strategy, segment, start=start)
         reports.append({"fold": i + 1, "start": start.isoformat(),
                         "end": end.isoformat(), **result.summary()})
     return reports
@@ -103,8 +114,11 @@ STRESS_SCENARIOS: list[tuple[str, float, float, int]] = [
 
 
 def stress_test(result: BacktestResult) -> list[dict[str, object]]:
-    """Overlay crisis shocks on the strategy's realized exposure profile and
-    report the hypothetical drawdowns against the configured risk limits."""
+    """Apply crisis-shaped shocks to the strategy's FINAL total equity, assuming
+    full market exposure (beta 1, 100% net long), and report the hypothetical
+    drawdown of each scenario. Note: this does not scale by the strategy's
+    realized average exposure (a cash-heavy book is over-stated, a leveraged one
+    under-stated) and does not compare against configured risk limits."""
     if not result.equity_curve:
         raise ValueError("empty backtest result")
     base_equity = result.equity_curve[-1][1]
@@ -128,4 +142,4 @@ def replay_dates(history: dict[str, list[Bar]]) -> tuple[str, str]:
     dates = sorted({b.start.date() for bars in history.values() for b in bars})
     if not dates:
         return "", ""
-    return dates[0].isoformat(), (dates[-1] + timedelta(days=0)).isoformat()
+    return dates[0].isoformat(), dates[-1].isoformat()

@@ -207,7 +207,7 @@ class AppConfig(StrictModel):
         primaries = [b for b in enabled if b.primary]
         if len(primaries) > 1:
             raise ValueError("only one broker may be marked primary")
-        if self.mode is not TradingMode.RESEARCH and enabled and not primaries:
+        if self.mode is not TradingMode.RESEARCH and not primaries:
             raise ValueError("a primary broker is required outside research mode")
         names = [b.name for b in enabled]
         if len(names) != len(set(names)):
@@ -216,10 +216,13 @@ class AppConfig(StrictModel):
 
     @model_validator(mode="after")
     def _validate_dashboard_exposure(self) -> AppConfig:
-        if self.dashboard.host not in _LOOPBACK_HOSTS and not self.dashboard.auth_token_credential:
+        if (self.dashboard.host not in _LOOPBACK_HOSTS
+                and not self.dashboard.auth_token_credential
+                and not dashboard_token_from_env()):
             raise ValueError(
                 "dashboard.host is not loopback — set dashboard.auth_token_credential "
-                "(a vault entry with a bearer token) before exposing the dashboard"
+                "(a vault entry) or provide POSEIDON_DASHBOARD_TOKEN[_FILE] before "
+                "exposing the dashboard"
             )
         return self
 
@@ -237,16 +240,56 @@ class AppConfig(StrictModel):
         return list(seen)
 
 
+# Reserved POSEIDON_* env vars consumed directly by other modules (the vault
+# reads these for its passphrase; the dashboard reads a bearer token) — they
+# are NOT config fields, so folding them into the AppConfig override dict would
+# trip extra="forbid" and abort every command. Excluded from the override scan.
+_RESERVED_ENV = {
+    "POSEIDON_VAULT_PASSPHRASE", "POSEIDON_VAULT_PASSPHRASE_FILE",
+    "POSEIDON_DASHBOARD_TOKEN", "POSEIDON_DASHBOARD_TOKEN_FILE",
+}
+
+
+def dashboard_token_from_env() -> str | None:
+    """Bearer token supplied directly via env or a secret file, as an
+    alternative to a vault entry (auth_token_credential). This lets a
+    container/secret deployment satisfy the exposed-dashboard auth requirement
+    without pre-seeding the vault (a chicken-and-egg at first boot). Mirrors the
+    vault-passphrase env convention."""
+    direct = os.environ.get("POSEIDON_DASHBOARD_TOKEN")
+    if direct and direct.strip():
+        return direct.strip()
+    path = os.environ.get("POSEIDON_DASHBOARD_TOKEN_FILE")
+    if path:
+        try:
+            token = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return token or None
+    return None
+
+
 def _deep_env_overrides() -> dict[str, Any]:
     """Build a nested override dict from POSEIDON_* environment variables."""
     result: dict[str, Any] = {}
     for key, value in os.environ.items():
-        if not key.startswith("POSEIDON_"):
+        if not key.startswith("POSEIDON_") or key in _RESERVED_ENV:
             continue
         path = key[len("POSEIDON_"):].lower().split("__")
         node = result
-        for part in path[:-1]:
-            node = node.setdefault(part, {})
+        for i, part in enumerate(path[:-1]):
+            nxt = node.setdefault(part, {})
+            if not isinstance(nxt, dict):
+                raise ConfigError(
+                    f"conflicting environment overrides: {key} nests under "
+                    f"POSEIDON_{'__'.join(path[: i + 1]).upper()}, which is also set"
+                )
+            node = nxt
+        if isinstance(node.get(path[-1]), dict):
+            raise ConfigError(
+                f"conflicting environment overrides: {key} would overwrite "
+                f"nested {key}__* variables"
+            )
         node[path[-1]] = value
     return result
 

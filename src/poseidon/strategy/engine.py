@@ -48,8 +48,12 @@ class StrategyEngine:
         return len(self._strategies) != before
 
     async def scan_all(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
-        """Run every enabled strategy concurrently. One strategy failing (or
-        hanging) never blocks the others."""
+        """Run every enabled strategy concurrently. A strategy that FAILS, or
+        that hangs on an await, never blocks the others — each is bounded by
+        asyncio.wait_for. Caveat: wait_for can only cancel at an await point, so
+        genuinely CPU-bound or non-awaiting code (a tight sync loop) blocks the
+        single event loop and cannot be timed out here; workshop algorithm
+        source is sandboxed but not run out-of-process."""
         if not self._strategies:
             return []
 

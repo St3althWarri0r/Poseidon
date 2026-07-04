@@ -33,7 +33,7 @@ class MomentumStrategy(Strategy):
                 signals.append(
                     Signal(
                         strategy=self.name, symbol=symbol, direction="long",
-                        strength=min(r20 / (min_return * 4), 1.0),
+                        strength=min(r20 / (max(min_return, 1e-9) * 4), 1.0),
                         evidence={
                             "return_20d": round(r20, 4),
                             "return_60d": round(r60, 4) if r60 is not None else None,

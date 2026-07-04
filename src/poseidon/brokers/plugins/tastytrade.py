@@ -118,6 +118,12 @@ class TastytradeBroker(Broker):
         if not token:
             raise BrokerAuthError(self.name, "no session token returned")
         self._session_token = token
+        new_remember = data.get("remember-token")
+        if new_remember and self._credentials.get("remember_token"):
+            # Remember tokens are single-use: the one just spent is now invalid
+            # and the response carries its replacement.
+            self._credentials["remember_token"] = new_remember
+            self.rotated_credentials = dict(self._credentials)
         if not self._account_number:
             accounts = await self._get("/customers/me/accounts")
             items = ((accounts.get("data") or {}).get("items")) or []
@@ -164,6 +170,9 @@ class TastytradeBroker(Broker):
         return result
 
     async def submit_order(self, order: Order) -> Order:
+        if order.quantity != order.quantity.to_integral_value():
+            raise BrokerError(self.name, "fractional share quantities are not supported",
+                              retryable=False)
         is_option = order.asset_class is AssetClass.OPTION
         leg = {
             "instrument-type": "Equity Option" if is_option else "Equity",
@@ -184,9 +193,12 @@ class TastytradeBroker(Broker):
             body["price-effect"] = "Debit" if order.side.is_buy else "Credit"
         if order.stop_price is not None:
             body["stop-trigger"] = str(order.stop_price)
+        # tastytrade's order POST has no client-order-id/idempotency key, so a
+        # submit timeout has an unknown outcome and must not be auto-retried
+        # (a resubmit could double-fill).
         payload = await self._request(
             "POST", f"{self._base}/accounts/{self._account_number}/orders",
-            headers=self._headers, json_body=body,
+            headers=self._headers, json_body=body, idempotent=False,
         )
         data = ((payload or {}).get("data") or {}).get("order") or {}
         if not data.get("id"):
@@ -204,9 +216,18 @@ class TastytradeBroker(Broker):
             "DELETE", f"{self._base}/accounts/{self._account_number}/orders/{order.broker_order_id}",
             headers=self._headers,
         )
-        order.status = OrderStatus.CANCELED
-        order.updated_at = datetime.now(UTC)
-        return order
+        # Cancel is asynchronous at the broker: the DELETE only queues the
+        # request and in-flight fills can still occur. Adopt the broker's
+        # authoritative state (pending-cancel maps to a non-terminal status)
+        # so the lifecycle poller carries the order to its true terminal
+        # state with any last-moment fills attached.
+        try:
+            return await self.order_status(order)
+        except BrokerError:
+            order.status = OrderStatus.ACCEPTED
+            order.status_reason = "cancel requested — awaiting broker confirmation"
+            order.updated_at = datetime.now(UTC)
+            return order
 
     async def order_status(self, order: Order) -> Order:
         if not order.broker_order_id:

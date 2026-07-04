@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poseidon"
-version = "2.3.0"
+version = "2.4.0"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -70,6 +70,7 @@ packages = ["src/poseidon"]
 # poseidon/examples/algorithms, which app.py resolves relative to __file__.
 [tool.hatch.build.targets.wheel.force-include]
 "examples/algorithms" = "poseidon/examples/algorithms"
+"config/poseidon.example.yaml" = "poseidon/config/poseidon.example.yaml"
 
 [tool.ruff]
 line-length = 100

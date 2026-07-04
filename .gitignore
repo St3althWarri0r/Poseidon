@@ -29,6 +29,7 @@ htmlcov/
 vault.bin
 credentials*.json
 config/poseidon.yaml
+docker/secrets/
 
 # Editors
 .idea/

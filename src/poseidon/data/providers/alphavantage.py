@@ -1,9 +1,14 @@
 """Alpha Vantage provider (https://www.alphavantage.co/documentation).
 
-Capabilities: quotes (GLOBAL_QUOTE — end-of-day/delayed on free tiers),
-daily bars, and news with provider-computed sentiment. Alpha Vantage data
-is graded DELAYED/STALE by the freshness policy and therefore serves as a
+Capabilities: quotes (GLOBAL_QUOTE — end-of-day/delayed on free tiers) and
+news with provider-computed sentiment. Alpha Vantage data is graded
+DELAYED/STALE by the freshness policy and therefore serves as a
 research/backfill source, never an execution source.
+
+Bars are deliberately NOT offered: the free TIME_SERIES_DAILY series is
+split-UNadjusted (the adjusted series is premium-only), so serving it on
+failover would silently change the price basis versus the split-adjusted
+bars from Polygon/Alpaca/Twelvedata.
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 from ...core.errors import ProviderError, ProviderRateLimitError
-from ...core.models import Bar, NewsArticle, Quote
+from ...core.models import NewsArticle, Quote
 from ..base import DataCapability, MarketDataProvider
 
 _BASE = "https://www.alphavantage.co/query"
@@ -23,7 +28,7 @@ class AlphaVantageProvider(MarketDataProvider):
     name = "alphavantage"
 
     def capabilities(self) -> frozenset[DataCapability]:
-        return frozenset({DataCapability.QUOTES, DataCapability.BARS, DataCapability.NEWS})
+        return frozenset({DataCapability.QUOTES, DataCapability.NEWS})
 
     async def _get(self, **params: Any) -> Any:
         params["apikey"] = self._api_key
@@ -52,31 +57,6 @@ class AlphaVantageProvider(MarketDataProvider):
             as_of=as_of,
             source=self.name,
         )
-
-    async def bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
-        if timeframe != "1d":
-            raise ProviderError(self.name, "only 1d bars supported", retryable=False)
-        payload = await self._get(
-            function="TIME_SERIES_DAILY", symbol=symbol.upper(),
-            outputsize="compact" if limit <= 100 else "full",
-        )
-        series = payload.get("Time Series (Daily)") or {}
-        bars: list[Bar] = []
-        for day, row in sorted(series.items())[-limit:]:
-            try:
-                start = datetime.fromisoformat(day).replace(tzinfo=UTC)
-                bars.append(
-                    Bar(
-                        symbol=symbol.upper(),
-                        open=Decimal(row["1. open"]), high=Decimal(row["2. high"]),
-                        low=Decimal(row["3. low"]), close=Decimal(row["4. close"]),
-                        volume=int(row.get("5. volume", 0)),
-                        start=start, end=start, source=self.name,
-                    )
-                )
-            except (KeyError, ValueError):
-                continue
-        return bars
 
     async def news(self, symbols: list[str] | None = None, *, limit: int = 25) -> list[NewsArticle]:
         params: dict[str, Any] = {"function": "NEWS_SENTIMENT", "limit": min(limit, 50)}

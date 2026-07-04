@@ -34,9 +34,10 @@ class TestMarketClock:
         at = datetime(2026, 7, 3, 11, 0, tzinfo=EASTERN)  # July 4th observed
         assert self.clock.session(at) is MarketSession.CLOSED
 
-    def test_half_day_afternoon_closed(self) -> None:
+    def test_half_day_afternoon_extended_then_closed(self) -> None:
         at = datetime(2026, 11, 27, 14, 0, tzinfo=EASTERN)  # day after Thanksgiving
-        assert self.clock.session(at) is MarketSession.CLOSED
+        assert self.clock.session(at) is MarketSession.AFTER_HOURS
+        assert self.clock.session(datetime(2026, 11, 27, 17, 30, tzinfo=EASTERN)) is MarketSession.CLOSED
 
     def test_pre_and_after_hours(self) -> None:
         assert self.clock.session(datetime(2026, 7, 6, 8, 0, tzinfo=EASTERN)) is MarketSession.PRE_MARKET

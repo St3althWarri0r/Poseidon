@@ -97,7 +97,7 @@ async def review_algorithm(client: anthropic.AsyncAnthropic, model: str, *,
         + f"\n--- pasted algorithm ---\n{source[:40_000]}\n--- end ---"
     )
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    usage = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
 
     for attempt in (1, 2):
         try:
@@ -110,6 +110,7 @@ async def review_algorithm(client: anthropic.AsyncAnthropic, model: str, *,
             )
         except anthropic.APIError as exc:
             raise AgentError(f"algorithm review failed: {exc}") from exc
+        usage["api_calls"] += 1
         block_usage = getattr(response, "usage", None)
         if block_usage is not None:
             usage["input_tokens"] += getattr(block_usage, "input_tokens", 0) or 0
