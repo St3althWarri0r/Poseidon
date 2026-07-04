@@ -152,6 +152,23 @@ A word on trust: algorithms run in-process, like installed plugins. The
 static screen is a guardrail against accidents, not a sandbox — read
 anything you paste from the internet before activating it.
 
+## Small accounts (starting with ~$100)
+
+A deliberately small first deposit works, with three adjustments:
+
+- Use a **fractional-shares broker** (Public.com or Alpaca). With a 10%
+  position cap a $100 account trades $10 slices — impossible in whole
+  shares of most ETFs.
+- Leave `min_order_notional` at its $1 default and consider lowering
+  `max_orders_per_day`; more importantly, know that **PDT rules** allow
+  only 3 day trades per rolling 5 sessions in a margin account under
+  $25k (cash accounts are exempt but settle T+1). The intraday
+  algorithm is the one this constrains.
+- Expect metrics noise: at $100, commissions/slippage of cents are
+  whole percentage points. Treat the run as a *behavioral* test — did
+  the platform do exactly what it said, with a perfect audit trail —
+  not a returns test.
+
 ## Approvals (Mode 2)
 
 A proposed trade generates a warning-level notification and appears on the
