@@ -8,6 +8,7 @@ broker reference used for submission and calls the engine first.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -45,10 +46,30 @@ class RiskEngine:
         # positions may occupy (overrides max_position_pct for that
         # strategy only). Maintained by the algorithm workshop.
         self.sleeve_caps: dict[str, float] = {}
+        # strategy name -> symbols it signalled this cycle (trusted attribution
+        # for sleeve caps; see PositionSizeRule).
+        self.sleeve_attribution: dict[str, set[str]] = {}
         self._orders_today = 0
         self._orders_today_date: str = ""
 
     # -- accounting ----------------------------------------------------------
+
+    def set_cycle_attribution(self, signals: list[object]) -> None:
+        """Record which strategy signalled which symbols this cycle, so a
+        sleeve cap can only apply to symbols its strategy actually surfaced."""
+        attribution: dict[str, set[str]] = {}
+        for sig in signals:
+            name = getattr(sig, "strategy", None)
+            symbol = getattr(sig, "symbol", None)
+            if name and symbol:
+                attribution.setdefault(str(name), set()).add(str(symbol).upper())
+        self.sleeve_attribution = attribution
+
+    def seed_orders_today(self, count: int, date: str) -> None:
+        """Rehydrate the daily order counter from persisted history so a
+        restart cannot silently reset max_orders_per_day."""
+        self._orders_today_date = date
+        self._orders_today = count
 
     def note_order_submitted(self, symbol: str) -> None:
         self._roll_daily_counter()
@@ -57,9 +78,8 @@ class RiskEngine:
 
     def note_execution_error(self, reason: str) -> None:
         if self.circuit.record_error(reason):
-            # publish is fire-and-forget; engine methods stay sync-friendly
-            import asyncio
-
+            # publish is fire-and-forget; engine methods stay sync-friendly.
+            # The kernel subscribes CIRCUIT_OPENED to the audit log (app.py).
             asyncio.get_running_loop().create_task(
                 self._bus.publish(Topics.CIRCUIT_OPENED, {"reason": reason})
             )
@@ -115,6 +135,7 @@ class RiskEngine:
             order_sector=order_sector,
             position_sectors=position_sectors,
             sleeve_caps=dict(self.sleeve_caps),
+            sleeve_attribution={k: set(v) for k, v in self.sleeve_attribution.items()},
         )
         for rule in self._rules:
             try:
@@ -133,19 +154,23 @@ class RiskEngine:
     async def _gather_sectors(self, order: Order) -> tuple[str | None, dict[str, str]]:
         """Sector classifications for the concentration rule. Router results
         are week-cached, so steady-state cost is zero API calls. Only
-        gathered for equity buys — the only orders the rule constrains."""
-        if not order.side.is_buy or order.asset_class is not AssetClass.EQUITY:
+        gathered for risk-increasing equity orders — the ones the rule
+        constrains. Position lookups run concurrently to bound the cold-path
+        latency to one round-trip instead of N."""
+        if order.side.is_risk_reducing or order.asset_class is not AssetClass.EQUITY:
             return None, {}
         order_sector = await self._router.sector(order.symbol)
         if order_sector is None:
             return None, {}
-        position_sectors: dict[str, str] = {}
-        for position in self._portfolio.positions:
-            if position.asset_class is not AssetClass.EQUITY:
-                continue
-            sector = await self._router.sector(position.symbol)
-            if sector is not None:
-                position_sectors[position.symbol.upper()] = sector
+        equity_positions = [p for p in self._portfolio.positions
+                            if p.asset_class is AssetClass.EQUITY]
+        sectors = await asyncio.gather(
+            *(self._router.sector(p.symbol) for p in equity_positions)
+        )
+        position_sectors = {
+            p.symbol.upper(): s
+            for p, s in zip(equity_positions, sectors, strict=True) if s is not None
+        }
         return order_sector, position_sectors
 
     def status(self) -> dict[str, object]:

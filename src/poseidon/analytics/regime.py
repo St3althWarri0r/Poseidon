@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from ..strategy.indicators import sma
+
 TRADING_DAYS = 252
 _VOL_WINDOW = 20
 _MIN_BARS = 60
@@ -73,12 +75,6 @@ class RegimeReport:
         return ", ".join(bits)
 
 
-def _sma(closes: list[float], window: int) -> float | None:
-    if len(closes) < window:
-        return None
-    return sum(closes[-window:]) / window
-
-
 def _rolling_vols(closes: list[float], window: int = _VOL_WINDOW) -> list[float]:
     """Trailing series of annualized close-to-close vol readings."""
     rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes)) if closes[i - 1] > 0]
@@ -99,8 +95,8 @@ def compute_regime(closes: list[float], *, benchmark: str) -> RegimeReport:
             detail=f"only {len(closes)} daily closes available (need {_MIN_BARS})",
         )
     close = closes[-1]
-    sma_50 = _sma(closes, 50)
-    sma_200 = _sma(closes, 200)
+    sma_50 = sma(closes, 50)
+    sma_200 = sma(closes, 200)
     year = closes[-TRADING_DAYS:]
     drawdown = max(0.0, (max(year) - close) / max(year)) if max(year) > 0 else 0.0
 

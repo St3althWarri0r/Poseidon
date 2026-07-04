@@ -15,11 +15,15 @@ order by itself.
 from __future__ import annotations
 
 import abc
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.errors import DataError
+from ..core.models import Bar
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
+from . import indicators
 
 
 @dataclass
@@ -54,10 +58,29 @@ class Strategy(abc.ABC):
         for one symbol must not abort the scan for the rest."""
 
 
+async def gather_bars(router: DataRouter, symbols: list[str], *,
+                      timeframe: str = "1d", limit: int = 120) -> dict[str, list[Bar]]:
+    """Fetch daily bars for many symbols concurrently.
+
+    Returns ``{symbol: bars}`` in the input order. A per-symbol data failure
+    yields an empty list for that symbol so one bad ticker never aborts the
+    batch — the caller's None-guards then skip it, exactly as the old
+    per-symbol try/except did, but the whole universe is fetched in one
+    round-trip's latency instead of N sequential ones.
+    """
+    async def _one(sym: str) -> list[Bar]:
+        try:
+            return await router.bars(sym, timeframe=timeframe, limit=limit)
+        except DataError:
+            return []
+
+    results = await asyncio.gather(*(_one(s) for s in symbols))
+    return dict(zip(symbols, results, strict=True))
+
+
 def sma(values: list[float], window: int) -> float | None:
-    if len(values) < window:
-        return None
-    return sum(values[-window:]) / window
+    # Single source of truth in indicators.py (also guards window <= 0).
+    return indicators.sma(values, window)
 
 
 def pct_return(closes: list[float], periods: int) -> float | None:

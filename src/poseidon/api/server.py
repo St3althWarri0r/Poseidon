@@ -43,7 +43,9 @@ class WebsocketHub:
             return
         message = json.dumps({"topic": topic, "payload": payload}, default=str)
         dead: list[WebSocket] = []
-        for ws in self._clients:
+        # Snapshot: send_text awaits, and a client connecting/disconnecting
+        # during that await would otherwise mutate the set mid-iteration.
+        for ws in list(self._clients):
             try:
                 await ws.send_text(message)
             except Exception:

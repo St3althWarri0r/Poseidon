@@ -74,9 +74,17 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
     equity_curve: list[tuple[Any, float]] = []
     rebalances = trades = 0
     position_days: list[int] = []
+    # Most recent close seen per symbol, updated as we walk days forward. Used
+    # to mark held positions on days a symbol didn't print (holiday, halt, data
+    # gap). Marking such a day at 0.0 would crater then rebound the equity
+    # curve, fabricating drawdown and destroying the Sharpe/max-dd metrics.
+    last_close: dict[str, float] = {}
 
     def price(symbol: str, day: Any) -> float | None:
         return closes_by_day.get(symbol, {}).get(day)
+
+    def mark(symbol: str) -> float:
+        return last_close.get(symbol, 0.0)
 
     for day_index, day in enumerate(all_dates):
         for symbol, bars in history.items():
@@ -84,12 +92,15 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
             while cursor < len(bars) and bars[cursor].start.date() <= day:
                 cursor += 1
             window.cursor[symbol] = cursor
+            px_today = price(symbol, day)
+            if px_today is not None:
+                last_close[symbol] = px_today
         if day_index < eval_from:
             continue
         if end is not None and day > end:
             break
 
-        marked = cash + sum(qty * (price(s, day) or 0.0) for s, qty in holdings.items())
+        marked = cash + sum(qty * mark(s) for s, qty in holdings.items())
         try:
             signals = await strategy.scan(router, PortfolioState())  # type: ignore[arg-type]
         except Exception as exc:
@@ -135,8 +146,7 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         if changed:
             rebalances += 1
         position_days.append(len(holdings))
-        equity_curve.append((day, cash + sum(q * (price(s, day) or 0.0)
-                                             for s, q in holdings.items())))
+        equity_curve.append((day, cash + sum(q * mark(s) for s, q in holdings.items())))
 
     if len(equity_curve) < 2:
         raise ValueError("backtest produced no evaluable days")

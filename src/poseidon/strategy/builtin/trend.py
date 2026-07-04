@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import structlog
 
-from ...core.errors import DataError
 from ...data.router import DataRouter
 from ...portfolio.state import PortfolioState
-from ..base import Signal, Strategy, pct_return, sma
+from ..base import Signal, Strategy, gather_bars, pct_return, sma
 
 log = structlog.get_logger(__name__)
 
@@ -19,12 +18,8 @@ class MomentumStrategy(Strategy):
     async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
         signals: list[Signal] = []
         min_return = float(self.options.get("min_20d_return", 0.05))
-        for symbol in self.symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=90)
-            except DataError as exc:
-                log.debug("momentum scan skip", symbol=symbol, error=str(exc))
-                continue
+        bars_by_symbol = await gather_bars(router, self.symbols, limit=90)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             r20 = pct_return(closes, 20)
             r60 = pct_return(closes, 60)
@@ -58,11 +53,8 @@ class BreakoutStrategy(Strategy):
         signals: list[Signal] = []
         lookback = int(self.options.get("lookback_days", 55))
         vol_multiple = float(self.options.get("min_volume_multiple", 1.5))
-        for symbol in self.symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=lookback + 10)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, self.symbols, limit=lookback + 10)
+        for symbol, bars in bars_by_symbol.items():
             if len(bars) < lookback + 1:
                 continue
             closes = [float(b.close) for b in bars]
@@ -91,11 +83,8 @@ class SwingStrategy(Strategy):
 
     async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
         signals: list[Signal] = []
-        for symbol in self.symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=80)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, self.symbols, limit=80)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             ma20, ma50 = sma(closes, 20), sma(closes, 50)
             if ma20 is None or ma50 is None:

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from ...core.errors import DataError
 from ...data.router import DataRouter
 from ...portfolio.state import PortfolioState
-from ..base import Signal, Strategy, realized_vol
+from ..base import Signal, Strategy, gather_bars, realized_vol
 
 
 class VolatilityRegimeStrategy(Strategy):
@@ -17,11 +16,8 @@ class VolatilityRegimeStrategy(Strategy):
         signals: list[Signal] = []
         expansion_ratio = float(self.options.get("expansion_ratio", 1.5))
         symbols = self.symbols or ["SPY"]
-        for symbol in symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=90)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, symbols, limit=90)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             short_vol = realized_vol(closes, 10)
             long_vol = realized_vol(closes, 60)

@@ -107,6 +107,14 @@ class TestRules:
         with pytest.raises(RiskViolation):
             PositionSizeRule().check(ctx(buy("50"), portfolio=state))  # 8k + 5k > 10k
 
+    def test_sell_to_open_goes_through_position_cap(self) -> None:
+        # B1 regression: SELL_TO_OPEN increases (short) risk and must be capped
+        # like a buy. The old `if not is_buy: return` guard exempted it.
+        sto = Order(symbol="AAPL", side=OrderSide.SELL_TO_OPEN, order_type=OrderType.LIMIT,
+                    quantity=Decimal("150"), limit_price=Decimal("100"))  # 15k > 10k cap
+        with pytest.raises(RiskViolation, match="max_position_size"):
+            PositionSizeRule().check(ctx(sto))
+
     def test_order_notional_bounds(self) -> None:
         big = Order(symbol="AAPL", side=OrderSide.BUY, quantity=Decimal("1000"),
                     limit_price=Decimal("100"))
@@ -317,9 +325,19 @@ class TestSleeveOverride:
 
     def test_sleeve_raises_cap_for_its_strategy_only(self) -> None:
         # 100k equity; default cap 10% blocks a 40k order, a 50% sleeve allows it.
+        # The sleeve only applies to a symbol the strategy actually signalled
+        # this cycle (trusted attribution), never the AI-supplied strategy tag.
         context = ctx(self._order("algo:rot", "400"))
         context.sleeve_caps = {"algo:rot": 0.5}
+        context.sleeve_attribution = {"algo:rot": {"TQQQ"}}
         PositionSizeRule().check(context)
+        # Same order tag but the symbol was NOT attributed to the sleeve: the
+        # spoof-proof path falls back to the default cap and blocks it.
+        spoofed = ctx(self._order("algo:rot", "400"))
+        spoofed.sleeve_caps = {"algo:rot": 0.5}
+        spoofed.sleeve_attribution = {"algo:rot": set()}
+        with pytest.raises(RiskViolation, match="max_position_pct"):
+            PositionSizeRule().check(spoofed)
         blocked = ctx(self._order("momentum", "400"))
         blocked.sleeve_caps = {"algo:rot": 0.5}
         with pytest.raises(RiskViolation, match="max_position_pct"):
@@ -328,6 +346,7 @@ class TestSleeveOverride:
     def test_sleeve_is_still_a_ceiling(self) -> None:
         context = ctx(self._order("algo:rot", "600"))  # 60k > 50% sleeve
         context.sleeve_caps = {"algo:rot": 0.5}
+        context.sleeve_attribution = {"algo:rot": {"TQQQ"}}
         with pytest.raises(RiskViolation, match="sleeve"):
             PositionSizeRule().check(context)
 

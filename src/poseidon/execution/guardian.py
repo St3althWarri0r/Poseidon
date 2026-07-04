@@ -70,12 +70,32 @@ class PositionGuardian:
         import json
 
         decision = json.loads(row[0])
+        trades = decision.get("trades") or []
         rationale = decision.get("rationale") or {}
-        exit_plan = rationale.get("exit_plan") or {}
-        stop = exit_plan.get("stop_loss")
-        target = exit_plan.get("take_profit")
+        decision_exit = rationale.get("exit_plan") or {}
+        symbol_up = order.symbol.upper()
+
+        # Attribute exit levels to THIS symbol only. Prefer the matching
+        # trade's own stop/target; fall back to the decision-level exit plan
+        # ONLY when the decision opened a single position (so there is no
+        # ambiguity about whose stop it is). A multi-symbol decision with no
+        # per-trade levels arms nothing rather than risk applying one
+        # symbol's stop to another (which would force-sell a fresh position).
+        matching = next((t for t in trades if str(t.get("symbol", "")).upper() == symbol_up), None)
+        stop = target = None
+        if matching is not None and (matching.get("stop_loss") or matching.get("take_profit")):
+            stop = matching.get("stop_loss")
+            target = matching.get("take_profit")
+        elif len([t for t in trades if str(t.get("side", "")).startswith("buy")]) <= 1:
+            stop = decision_exit.get("stop_loss")
+            target = decision_exit.get("take_profit")
+        else:
+            log.warning("multi-symbol decision without per-trade exit levels; not arming",
+                        symbol=order.symbol, decision_id=order.decision_id)
+            return
         if stop is None and target is None:
             return  # nothing enforceable
+        exit_plan = decision_exit  # time_stop (free text) is decision-level
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "INSERT INTO exit_plans (symbol, decision_id, stop_loss, take_profit, time_stop, "

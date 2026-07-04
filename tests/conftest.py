@@ -20,7 +20,8 @@ class FakeProvider(MarketDataProvider):
     name = "fake"
 
     def __init__(self, *, name: str = "fake", price: str = "100.00", fail: bool = False,
-                 stale: bool = False, bars_count: int = 60, volume: int = 500_000) -> None:
+                 stale: bool = False, bars_count: int = 60, volume: int = 500_000,
+                 frozen_days: int = 0) -> None:
         super().__init__(api_key="test")
         self.name = name
         self._price = Decimal(price)
@@ -28,6 +29,7 @@ class FakeProvider(MarketDataProvider):
         self._stale = stale
         self._bars_count = bars_count
         self._volume = volume
+        self._frozen_days = frozen_days  # shift all bars this many days into the past
         self.calls = 0
 
     def capabilities(self) -> frozenset[DataCapability]:
@@ -54,8 +56,12 @@ class FakeProvider(MarketDataProvider):
         now = datetime.now(UTC)
         bars = []
         price = float(self._price)
-        for i in range(min(limit, self._bars_count)):
-            day = now - timedelta(days=self._bars_count - i)
+        # Return the most recent `count` daily bars, ending yesterday — like a
+        # real feed. (Offsetting by bars_count would leave the newest bar days
+        # old whenever limit < bars_count, which the freshness gate rejects.)
+        count = min(limit, self._bars_count)
+        for i in range(count):
+            day = now - timedelta(days=count - i + self._frozen_days)
             bars.append(
                 Bar(symbol=symbol.upper(), open=Decimal(str(price)), high=Decimal(str(price * 1.01)),
                     low=Decimal(str(price * 0.99)), close=Decimal(str(price)),

@@ -45,9 +45,12 @@ _FORBIDDEN_IMPORTS = {
     "os", "sys", "subprocess", "shutil", "socket", "ctypes", "importlib",
     "multiprocessing", "threading", "pickle", "marshal", "signal", "pty",
     "http", "urllib", "requests", "httpx", "aiohttp", "ftplib", "smtplib",
-    "pathlib", "tempfile", "webbrowser",
+    "pathlib", "tempfile", "webbrowser", "builtins", "gc", "inspect",
+    "code", "codeop", "runpy",
 }
-_FORBIDDEN_CALLS = {"open", "exec", "eval", "compile", "__import__", "input", "breakpoint", "exit", "quit"}
+_FORBIDDEN_CALLS = {"open", "exec", "eval", "compile", "__import__", "input",
+                    "breakpoint", "exit", "quit", "getattr", "setattr", "globals",
+                    "vars", "memoryview"}
 _ALLOWED_DIRECTIONS = {"long", "short", "exit", "hedge", "income"}
 MAX_SOURCE_BYTES = 64_000
 
@@ -89,8 +92,13 @@ def validate_algorithm(source: str) -> list[str]:
                 problems.append(f"import from '{node.module}' is not allowed in an algorithm")
         elif isinstance(node, ast.Call):
             fn = node.func
+            # Bare name call: eval(...), open(...)
             if isinstance(fn, ast.Name) and fn.id in _FORBIDDEN_CALLS:
                 problems.append(f"call to '{fn.id}()' is not allowed in an algorithm")
+            # Attribute-form call: builtins.eval(...), x.getattr(...) — the
+            # attribute name itself must not be a forbidden builtin.
+            elif isinstance(fn, ast.Attribute) and fn.attr in _FORBIDDEN_CALLS:
+                problems.append(f"call to '.{fn.attr}()' is not allowed in an algorithm")
         elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
             problems.append(f"dunder attribute access ('{node.attr}') is not allowed")
     return sorted(set(problems))

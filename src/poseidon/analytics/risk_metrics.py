@@ -18,6 +18,7 @@ as *uncovered* rather than silently filled in.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -183,18 +184,36 @@ async def gather_risk_metrics(router: DataRouter, portfolio: PortfolioState,
     uncovered: list[str] = []
     returns_by_symbol: dict[str, list[float]] = {}
     positions = list(portfolio.positions)
-    for position in positions:
+
+    eligible = [
+        p for p in positions
+        if p.asset_class in (AssetClass.EQUITY, AssetClass.ETF) and equity > 0
+    ]
+    uncovered.extend(
+        p.symbol.upper() for p in positions
+        if p.asset_class not in (AssetClass.EQUITY, AssetClass.ETF) or equity <= 0
+    )
+
+    async def _bars(symbol: str, limit: int) -> list[Any]:
+        try:
+            return await router.bars(symbol, timeframe="1d", limit=limit)
+        except DataError:
+            return []
+
+    # Fetch every position's history AND the benchmark concurrently — one
+    # round-trip's latency for the whole book instead of N sequential ones.
+    # 300 benchmark bars: enough for the regime's 200-day average AND the
+    # ~6-month return window used for beta.
+    bench_bars, *per_position_bars = await asyncio.gather(
+        _bars(benchmark, 300),
+        *(_bars(p.symbol.upper(), _WINDOW_BARS) for p in eligible),
+    )
+
+    for position, bars in zip(eligible, per_position_bars, strict=True):
         symbol = position.symbol.upper()
-        if position.asset_class not in (AssetClass.EQUITY, AssetClass.ETF) or equity <= 0:
-            uncovered.append(symbol)
-            continue
         value = position.market_value
         if value is None:
             value = position.quantity * position.avg_entry_price
-        try:
-            bars = await router.bars(symbol, timeframe="1d", limit=_WINDOW_BARS)
-        except DataError:
-            bars = []
         closes = [float(b.close) for b in bars]
         rets = _returns(closes)
         if len(rets) < _MIN_OBSERVATIONS:
@@ -204,14 +223,10 @@ async def gather_risk_metrics(router: DataRouter, portfolio: PortfolioState,
         returns_by_symbol[symbol] = rets
 
     benchmark_returns: list[float] | None = None
-    benchmark_closes: list[float] = []
-    try:
-        # 300 bars: enough for the regime's 200-day average AND the ~6-month
-        # return window used for beta.
-        bench_bars = await router.bars(benchmark, timeframe="1d", limit=300)
-        benchmark_closes = [float(b.close) for b in bench_bars]
+    benchmark_closes = [float(b.close) for b in bench_bars]
+    if benchmark_closes:
         benchmark_returns = _returns(benchmark_closes[-_WINDOW_BARS:])
-    except DataError:
+    else:
         log.warning("benchmark history unavailable; beta will be null", benchmark=benchmark)
 
     report = compute_risk_metrics(

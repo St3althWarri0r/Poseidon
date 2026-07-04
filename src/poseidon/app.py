@@ -12,7 +12,7 @@ import contextlib
 import json
 import signal
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import structlog
@@ -26,7 +26,7 @@ from .api.server import DashboardServer
 from .brokers.base import Broker
 from .brokers.plugins.paper import PaperBroker
 from .brokers.registry import create_broker
-from .core.clock import FreshnessPolicy, MarketClock, calendar_covers
+from .core.clock import EASTERN, FreshnessPolicy, MarketClock, calendar_covers
 from .core.config import AppConfig, ScheduleConfig
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
@@ -107,15 +107,31 @@ class ApplicationKernel:
         self.order_manager = OrderManager(
             self.broker, self.risk, self.approvals, self.db, self.audit, self.bus, mode=cfg.mode
         )
+        # Rehydrate the daily order counter so a mid-session restart cannot
+        # silently reset max_orders_per_day. Count from the Eastern day start
+        # (in UTC) to match the engine's Eastern-midnight roll.
+        eastern_day_start = datetime.combine(
+            self.clock.now_eastern().date(), time.min, tzinfo=EASTERN
+        ).astimezone(UTC).isoformat()
+        self.risk.seed_orders_today(
+            await self.order_manager.orders_today_count(eastern_day_start),
+            self.clock.now_eastern().date().isoformat(),
+        )
         self.guardian = PositionGuardian(cfg.guardian, self.db, self)
         self.bus.subscribe(Topics.ORDER_FILLED, self.guardian.on_order_filled)
+        self.bus.subscribe(Topics.CIRCUIT_OPENED, self._on_circuit_opened)
         self.strategies = StrategyEngine(cfg.strategies, cfg.all_watchlist_symbols())
         self.workshop = AlgorithmWorkshop(
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
             sleeve_caps=self.risk.sleeve_caps,
         )
-        bundled = Path(__file__).resolve().parents[2] / "examples" / "algorithms"
+        # Bundled example algorithms: packaged inside poseidon for installed
+        # builds (wheel force-include), or the repo-root examples/ for a
+        # source/editable checkout.
+        bundled = Path(__file__).resolve().parent / "examples" / "algorithms"
+        if not bundled.is_dir():
+            bundled = Path(__file__).resolve().parents[2] / "examples" / "algorithms"
         await self.workshop.seed_bundled(bundled)
         await self.workshop.load_active()
         dispatcher = ToolDispatcher(
@@ -206,6 +222,13 @@ class ApplicationKernel:
             broker.set_quote_fn(lambda symbol: self.router.quote(symbol, allow_delayed=True))
         await broker.connect()
         return broker
+
+    async def _on_circuit_opened(self, _topic: str, payload: object) -> None:
+        """Record automatic circuit-breaker trips in the tamper-evident audit
+        chain (the error-rate breaker opens itself; the manual HALT path
+        audits separately)."""
+        await self.audit.append("system", "circuit.opened",
+                                payload if isinstance(payload, dict) else {})
 
     def _register_jobs(self) -> None:
         self.scheduler.register_job("review_cycle", self.run_review_cycle)
@@ -308,6 +331,9 @@ class ApplicationKernel:
             started = datetime.now(UTC)
             try:
                 signals = await self.strategies.scan_all(self.router, self.portfolio)
+                # Trusted attribution for sleeve caps: only symbols a sleeved
+                # strategy actually signalled this cycle get its cap.
+                self.risk.set_cycle_attribution(list(signals))
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -547,6 +573,11 @@ class ApplicationKernel:
     async def _audit_verify_job(self) -> None:
         ok, bad_seq = await self.audit.verify_chain()
         if not ok:
+            # force_open() does not publish CIRCUIT_OPENED (unlike the
+            # error-rate auto-trip), so record this halt in the chain directly.
+            await self.audit.append("system", "circuit.opened",
+                                    {"reason": "audit chain corrupt", "bad_seq": bad_seq,
+                                     "source": "audit_verify"})
             self.risk.circuit.force_open(f"audit chain corrupt at seq {bad_seq}")
             await self.bus.publish(Topics.NOTIFY, {
                 "level": "critical", "title": "Audit chain verification failed",

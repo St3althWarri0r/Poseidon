@@ -41,8 +41,31 @@ _STATUS_MAP = {
     "Expired": OrderStatus.EXPIRED,
     "Rejected": OrderStatus.REJECTED_BROKER,
     "Removed": OrderStatus.CANCELED,
-    "Partially Removed": OrderStatus.PARTIALLY_FILLED,
+    # "Partially Removed" is terminal: some quantity filled, the rest was
+    # cancelled. Mapping it to PARTIALLY_FILLED (a non-terminal status) would
+    # make the poll loop spin forever and keep the order in open_orders; the
+    # quantity that did fill is captured via filled_quantity instead.
+    "Partially Removed": OrderStatus.CANCELED,
 }
+
+
+def _extract_fills(row: dict[str, Any]) -> tuple[Decimal, Decimal | None]:
+    """Aggregate fills across an order's legs into (filled_quantity,
+    quantity-weighted avg_fill_price). Returns (0, None) when nothing filled."""
+    total_qty = Decimal(0)
+    notional = Decimal(0)
+    for leg in row.get("legs") or []:
+        for fill in leg.get("fills") or []:
+            try:
+                qty = Decimal(str(fill.get("quantity", 0)))
+                price = Decimal(str(fill.get("fill-price", fill.get("price", 0))))
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+            total_qty += qty
+            notional += qty * price
+    if total_qty <= 0:
+        return Decimal(0), None
+    return total_qty, notional / total_qty
 
 _ACTION_MAP = {
     OrderSide.BUY: "Buy to Open", OrderSide.SELL: "Sell to Close",
@@ -191,6 +214,11 @@ class TastytradeBroker(Broker):
         payload = await self._get(f"/accounts/{self._account_number}/orders/{order.broker_order_id}")
         row = (payload.get("data") or {})
         order.status = _STATUS_MAP.get(row.get("status", ""), order.status)
+        filled_qty, avg_price = _extract_fills(row)
+        if filled_qty > 0:
+            order.filled_quantity = filled_qty
+            if avg_price is not None:
+                order.avg_fill_price = avg_price
         order.updated_at = datetime.now(UTC)
         return order
 

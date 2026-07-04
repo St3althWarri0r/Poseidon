@@ -7,10 +7,9 @@ the user has designated, plus periodic position reviews.
 
 from __future__ import annotations
 
-from ...core.errors import DataError
 from ...data.router import DataRouter
 from ...portfolio.state import PortfolioState
-from ..base import Signal, Strategy, pct_return, sma
+from ..base import Signal, Strategy, gather_bars, pct_return, sma
 
 
 class _WatchBase(Strategy):
@@ -21,11 +20,8 @@ class _WatchBase(Strategy):
     async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
         signals: list[Signal] = []
         dip = float(self.options.get(self.dip_key, self.default_dip))
-        for symbol in self.symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=260)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, self.symbols, limit=260)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             if len(closes) < 60:
                 continue

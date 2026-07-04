@@ -317,6 +317,11 @@ class ProposedTrade(PoseidonModel):
     time_in_force: TimeInForce = TimeInForce.DAY
     legs: list[OptionLeg] = Field(default_factory=list)
     strategy: str = ""  # name of the strategy this trade belongs to
+    # Per-trade exit levels for the position guardian. A decision may open
+    # several positions; each carries its OWN stop/target so the guardian
+    # never arms one symbol's stop against another's price.
+    stop_loss: Money | None = None
+    take_profit: Money | None = None
 
 
 class Decision(PoseidonModel):
@@ -327,6 +332,8 @@ class Decision(PoseidonModel):
     trades: list[ProposedTrade] = Field(default_factory=list)
     rationale: TradeRationale | None = None  # required whenever trades are proposed
     data_sources: list[str] = Field(default_factory=list)  # provenance of inputs used
+    data_gaps: list[str] = Field(default_factory=list)  # data needed but unavailable this cycle
+    summary: str = ""  # one-paragraph cycle summary for the log/dashboard
     model: str = ""
     cycle_id: str = ""
     usage: dict[str, int] = Field(default_factory=dict)  # tokens used this cycle

@@ -66,9 +66,16 @@ TRADE_SCHEMA: dict[str, Any] = {
         "stop_price": {"type": ["string", "null"]},
         "time_in_force": {"type": "string", "enum": ["day", "gtc"]},
         "strategy": {"type": "string", "description": "Which enabled strategy this belongs to"},
+        "stop_loss": {"type": ["string", "null"],
+                      "description": "This trade's OWN stop-loss price (decimal string). The "
+                                     "guardian enforces it against THIS symbol only, so set it "
+                                     "per trade. Null for exit/closing trades."},
+        "take_profit": {"type": ["string", "null"],
+                        "description": "This trade's OWN take-profit price (decimal string)."},
     },
     "required": ["symbol", "asset_class", "side", "order_type", "quantity",
-                 "limit_price", "stop_price", "time_in_force", "strategy"],
+                 "limit_price", "stop_price", "time_in_force", "strategy",
+                 "stop_loss", "take_profit"],
     "additionalProperties": False,
 }
 

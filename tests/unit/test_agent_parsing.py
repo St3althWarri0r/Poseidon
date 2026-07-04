@@ -51,6 +51,32 @@ def test_parse_full_decision() -> None:
     assert decision.data_sources == ["polygon"]
 
 
+def test_decision_captures_data_gaps_summary_and_per_trade_exits() -> None:
+    # C2 + A1 regression: data_gaps/summary must survive parsing (not be
+    # silently dropped), and per-trade stop_loss/take_profit must land on the
+    # ProposedTrade so the guardian can arm each symbol's own levels.
+    agent = make_agent()
+    decision = agent._parse_decision(
+        {
+            "action": "buy",
+            "trades": [{
+                "symbol": "AAPL", "asset_class": "equity", "side": "buy",
+                "order_type": "limit", "quantity": "10", "limit_price": "100.50",
+                "stop_price": None, "time_in_force": "day", "strategy": "momentum",
+                "stop_loss": "95.00", "take_profit": "120.00",
+            }],
+            "rationale": RATIONALE,
+            "data_gaps": ["no fresh options chain for AAPL"],
+            "summary": "Opening a momentum long in AAPL.",
+        },
+        "cycle_c2", "claude-opus-4-8",
+    )
+    assert decision.data_gaps == ["no fresh options chain for AAPL"]
+    assert decision.summary == "Opening a momentum long in AAPL."
+    assert decision.trades[0].stop_loss == Decimal("95.00")
+    assert decision.trades[0].take_profit == Decimal("120.00")
+
+
 def test_trades_without_rationale_are_voided() -> None:
     agent = make_agent()
     decision = agent._parse_decision(

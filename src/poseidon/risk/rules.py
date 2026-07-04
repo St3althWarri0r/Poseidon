@@ -38,6 +38,11 @@ class RiskContext:
     position_sectors: dict[str, str] = field(default_factory=dict)
     # Dedicated sleeves: strategy -> per-position equity fraction override.
     sleeve_caps: dict[str, float] = field(default_factory=dict)
+    # Trusted attribution built by the engine from this cycle's real signals:
+    # strategy name -> the symbols it actually signalled. A sleeve applies to
+    # an order only if the order's symbol is in its strategy's set, so the AI
+    # cannot claim a sleeved strategy's larger cap for an arbitrary symbol.
+    sleeve_attribution: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def reference_price(self) -> Decimal:
@@ -95,8 +100,8 @@ class BuyingPowerRule(RiskRule):
     name = "buying_power"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy:
-            return
+        if ctx.order.side.is_risk_reducing:
+            return  # only exits are exempt; risk-INCREASING sides (incl. sell_to_open) pass
         account = ctx.portfolio.account
         if account is None:
             raise RiskViolation(self.name, "no account snapshot")
@@ -118,8 +123,8 @@ class PositionSizeRule(RiskRule):
     name = "max_position_size"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy:
-            return
+        if ctx.order.side.is_risk_reducing:
+            return  # only exits are exempt; risk-INCREASING sides (incl. sell_to_open) pass
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
@@ -127,7 +132,13 @@ class PositionSizeRule(RiskRule):
         position = ctx.portfolio.position_for(ctx.order.symbol)
         if position is not None and position.market_value is not None:
             existing = abs(position.market_value)
-        sleeve = ctx.sleeve_caps.get(ctx.order.strategy)
+        # A sleeve applies only if this order's symbol was actually signalled
+        # by the sleeved strategy this cycle — the order's self-declared
+        # `strategy` string (AI-controlled) is not trusted on its own.
+        strategy = ctx.order.strategy
+        sleeve = ctx.sleeve_caps.get(strategy)
+        if sleeve is not None and ctx.order.symbol.upper() not in ctx.sleeve_attribution.get(strategy, set()):
+            sleeve = None
         cap_pct = sleeve if sleeve is not None else ctx.config.max_position_pct
         limit = equity * Decimal(str(cap_pct))
         if existing + ctx.notional > limit:
@@ -143,8 +154,8 @@ class PortfolioExposureRule(RiskRule):
     name = "max_portfolio_exposure"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy:
-            return
+        if ctx.order.side.is_risk_reducing:
+            return  # only exits are exempt; risk-INCREASING sides (incl. sell_to_open) pass
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
@@ -158,8 +169,8 @@ class LeverageRule(RiskRule):
     name = "max_leverage"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy:
-            return
+        if ctx.order.side.is_risk_reducing:
+            return  # only exits are exempt; risk-INCREASING sides (incl. sell_to_open) pass
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
             raise RiskViolation(self.name, "no equity snapshot")
@@ -173,7 +184,7 @@ class OptionsExposureRule(RiskRule):
     name = "max_options_exposure"
 
     def check(self, ctx: RiskContext) -> None:
-        if ctx.order.asset_class is not AssetClass.OPTION or not ctx.order.side.is_buy:
+        if ctx.order.asset_class is not AssetClass.OPTION or ctx.order.side.is_risk_reducing:
             return
         equity = ctx.portfolio.equity
         if equity is None or equity <= 0:
@@ -194,7 +205,7 @@ class SectorConcentrationRule(RiskRule):
     name = "max_sector_concentration"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy or ctx.order.asset_class is not AssetClass.EQUITY:
+        if ctx.order.side.is_risk_reducing or ctx.order.asset_class is not AssetClass.EQUITY:
             return
         sector = ctx.order_sector
         if not sector:
@@ -233,7 +244,7 @@ class PortfolioVaRRule(RiskRule):
 
     def check(self, ctx: RiskContext) -> None:
         cap = ctx.config.max_portfolio_var_pct
-        if cap <= 0 or not ctx.order.side.is_buy:
+        if cap <= 0 or ctx.order.side.is_risk_reducing:
             return
         metrics = ctx.portfolio.risk_metrics
         age = ctx.portfolio.risk_metrics_age_seconds()
@@ -368,7 +379,7 @@ class VolatilityHaltRule(RiskRule):
     name = "volatility_halt"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy or not ctx.recent_bars:
+        if ctx.order.side.is_risk_reducing or not ctx.recent_bars:
             return
         last = ctx.recent_bars[-1]
         if last.open <= 0:
@@ -388,7 +399,7 @@ class EconBlackoutRule(RiskRule):
     name = "news_blackout"
 
     def check(self, ctx: RiskContext) -> None:
-        if not ctx.order.side.is_buy or ctx.config.news_blackout_minutes_before_econ <= 0:
+        if ctx.order.side.is_risk_reducing or ctx.config.news_blackout_minutes_before_econ <= 0:
             return
         now = datetime.now(UTC)
         window = ctx.config.news_blackout_minutes_before_econ * 60

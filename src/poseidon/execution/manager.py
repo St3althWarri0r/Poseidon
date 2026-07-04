@@ -23,7 +23,7 @@ import structlog
 
 from ..analytics.execution import slippage_bps
 from ..brokers.base import Broker
-from ..core.enums import OrderStatus, TradingMode
+from ..core.enums import OrderStatus, TimeInForce, TradingMode
 from ..core.errors import (
     BrokerError,
     CircuitBreakerOpen,
@@ -42,7 +42,13 @@ log = structlog.get_logger(__name__)
 
 _SUBMIT_RETRIES = 3
 _POLL_INTERVAL = 5.0
-_POLL_TIMEOUT = 8 * 60 * 60  # give a DAY order the whole session
+_POLL_INTERVAL_MAX = 300.0  # long-lived GTC polls back off to every 5 min
+# A DAY order dies at session end, so 8h covers it. A GTC order can rest for
+# days; capping its poller at 8h would stop watching a still-open order and
+# silently miss a later fill. Watch GTC orders for days; if the process is up
+# longer, resume_open_orders() re-attaches a fresh poller on the next restart.
+_POLL_TIMEOUT_DAY = 8 * 60 * 60
+_POLL_TIMEOUT_GTC = 5 * 24 * 60 * 60
 
 
 class OrderManager:
@@ -262,9 +268,14 @@ class OrderManager:
         task.add_done_callback(self._poll_tasks.discard)
 
     async def _poll_to_terminal(self, order: Order) -> None:
-        deadline = asyncio.get_running_loop().time() + _POLL_TIMEOUT
+        is_gtc = order.time_in_force is TimeInForce.GTC
+        timeout = _POLL_TIMEOUT_GTC if is_gtc else _POLL_TIMEOUT_DAY
+        deadline = asyncio.get_running_loop().time() + timeout
+        interval = _POLL_INTERVAL
         while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(_POLL_INTERVAL)
+            await asyncio.sleep(interval)
+            if is_gtc:  # a resting order rarely fills in the first seconds; ease off
+                interval = min(interval * 1.5, _POLL_INTERVAL_MAX)
             try:
                 order = await self._broker.order_status(order)
             except BrokerError as exc:
@@ -338,11 +349,15 @@ class OrderManager:
         )
         return [json.loads(r[0]) for r in rows]
 
-    async def orders_today_count(self) -> int:
-        today = datetime.now(UTC).date().isoformat()
+    async def orders_today_count(self, since_iso: str | None = None) -> int:
+        """Count orders that consumed the daily budget since ``since_iso``
+        (the day boundary; the caller supplies the Eastern day-start in UTC
+        so this aligns with the risk engine's Eastern-midnight counter reset).
+        """
+        since = since_iso or datetime.now(UTC).date().isoformat()
         row = await self._db.fetch_one(
             "SELECT COUNT(*) FROM orders WHERE created_at >= ? AND status NOT IN (?, ?, ?)",
-            (today, OrderStatus.REJECTED_RISK.value, OrderStatus.REJECTED_HUMAN.value,
+            (since, OrderStatus.REJECTED_RISK.value, OrderStatus.REJECTED_HUMAN.value,
              OrderStatus.PROPOSED.value),
         )
         return int(row[0]) if row else 0

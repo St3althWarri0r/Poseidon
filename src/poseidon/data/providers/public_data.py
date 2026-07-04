@@ -44,6 +44,18 @@ _TIMEFRAME_MAP: dict[str, tuple[str, str]] = {
     "1d": ("YEAR", "ONE_DAY"),
 }
 
+# Per-timeframe (period, approx bars that window holds) ladders. bars() picks
+# the smallest window whose capacity covers the requested limit so a large
+# intraday request is not silently truncated to one day/week of data. Counts
+# assume a ~390-minute regular session.
+_WINDOW_LADDER: dict[str, list[tuple[str, int]]] = {
+    "1m": [("DAY", 390), ("WEEK", 1950), ("MONTH", 8000)],
+    "5m": [("DAY", 78), ("WEEK", 390), ("MONTH", 1640), ("QUARTER", 4900)],
+    "15m": [("DAY", 26), ("WEEK", 130), ("MONTH", 550), ("QUARTER", 1650)],
+    "1h": [("WEEK", 35), ("MONTH", 147), ("QUARTER", 440), ("HALF_YEAR", 880), ("YEAR", 1750)],
+    "1d": [("YEAR", 252), ("FIVE_YEARS", 1260), ("TEN_YEARS", 2520)],
+}
+
 
 def _dec(value: Any) -> Decimal | None:
     if value is None:
@@ -135,10 +147,16 @@ class PublicDataProvider(MarketDataProvider):
         if not rows or rows[0].get("outcome") != "SUCCESS":
             raise ProviderError(self.name, f"no quote for {symbol}")
         q = rows[0]
+        # Never manufacture a timestamp: if the provider gives no time for
+        # any field, it cannot vouch for freshness, so fail rather than stamp
+        # possibly-stale data as "now" (which would slip past the router's
+        # staleness gate). The router then fails over or refuses to trade.
         as_of = (
             _ts(q.get("lastTimestamp")) or _ts(q.get("askTimestamp"))
-            or _ts(q.get("bidTimestamp")) or self._now()
+            or _ts(q.get("bidTimestamp"))
         )
+        if as_of is None:
+            raise ProviderError(self.name, f"quote for {symbol} has no timestamp")
         return Quote(
             symbol=symbol.upper(),
             bid=_dec(q.get("bid")), ask=_dec(q.get("ask")), last=_dec(q.get("last")),
@@ -156,13 +174,12 @@ class PublicDataProvider(MarketDataProvider):
             raise ProviderError(
                 self.name, f"unsupported timeframe {timeframe}", retryable=False
             ) from None
-        if timeframe == "1d":
-            # Deep history for backtests: pick the smallest window that
-            # covers the request (~252 trading days per year).
-            if limit > 1250:
-                period = "TEN_YEARS"
-            elif limit > 250:
-                period = "FIVE_YEARS"
+        # Widen the fetch window to the smallest that can hold `limit` bars,
+        # so intraday and deep-history requests are not silently truncated.
+        for candidate_period, capacity in _WINDOW_LADDER.get(timeframe, []):
+            period = candidate_period
+            if capacity >= limit:
+                break
         instrument_type = self._instrument(symbol)["type"]
         payload = await self._get_json(
             f"{_BASE}/userapigateway/historicdata/{instrument_type}"

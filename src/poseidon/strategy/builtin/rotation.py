@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from ...core.errors import DataError
 from ...data.router import DataRouter
 from ...portfolio.state import PortfolioState
-from ..base import Signal, Strategy, pct_return
+from ..base import Signal, Strategy, gather_bars, pct_return
 
 _DEFAULT_UNIVERSE = ["XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC"]
 
@@ -18,11 +17,8 @@ class EtfRotationStrategy(Strategy):
         universe = [s.upper() for s in (self.symbols or _DEFAULT_UNIVERSE)]
         top_n = int(self.options.get("top_n", 3))
         scores: list[tuple[str, float, dict[str, float | None]]] = []
-        for symbol in universe:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=140)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, universe, limit=140)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             r21, r63, r126 = pct_return(closes, 21), pct_return(closes, 63), pct_return(closes, 126)
             if r21 is None or r63 is None:

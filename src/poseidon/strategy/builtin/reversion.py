@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from ...core.errors import DataError
 from ...data.router import DataRouter
 from ...portfolio.state import PortfolioState
-from ..base import Signal, Strategy, sma
+from ..base import Signal, Strategy, gather_bars, sma
 
 
 def _zscore(closes: list[float], window: int = 20) -> float | None:
@@ -27,11 +26,8 @@ class MeanReversionStrategy(Strategy):
     async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
         signals: list[Signal] = []
         entry_z = float(self.options.get("entry_zscore", -2.0))
-        for symbol in self.symbols:
-            try:
-                bars = await router.bars(symbol, timeframe="1d", limit=120)
-            except DataError:
-                continue
+        bars_by_symbol = await gather_bars(router, self.symbols, limit=120)
+        for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             z = _zscore(closes)
             ma100 = sma(closes, 100)
@@ -65,17 +61,12 @@ class PairsStrategy(Strategy):
         signals: list[Signal] = []
         pairs: list[list[str]] = self.options.get("pairs", [])
         threshold = float(self.options.get("entry_zscore", 2.0))
-        for pair in pairs:
-            if len(pair) != 2:
-                continue
-            a, b = pair[0].upper(), pair[1].upper()
-            try:
-                bars_a = await router.bars(a, timeframe="1d", limit=90)
-                bars_b = await router.bars(b, timeframe="1d", limit=90)
-            except DataError:
-                continue
-            closes_a = [float(x.close) for x in bars_a]
-            closes_b = [float(x.close) for x in bars_b]
+        valid_pairs = [(p[0].upper(), p[1].upper()) for p in pairs if len(p) == 2]
+        legs = sorted({s for pair in valid_pairs for s in pair})
+        bars_by_symbol = await gather_bars(router, legs, limit=90)
+        for a, b in valid_pairs:
+            closes_a = [float(x.close) for x in bars_by_symbol.get(a, [])]
+            closes_b = [float(x.close) for x in bars_by_symbol.get(b, [])]
             n = min(len(closes_a), len(closes_b))
             if n < 40:
                 continue

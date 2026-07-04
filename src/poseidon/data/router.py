@@ -38,6 +38,16 @@ T = TypeVar("T")
 _PENALTY_BASE = 15.0  # seconds
 _PENALTY_MAX = 600.0
 
+# Bars are historical by nature, so real-time freshness does not apply — but a
+# feed that has frozen (returning weeks-old bars for a live symbol) still
+# violates the live-data contract. These per-timeframe ceilings are deliberately
+# generous: they never trip on a normal weekend or a long holiday gap, only on a
+# clearly stalled feed. Seconds.
+_MAX_BAR_AGE = {
+    "1m": 2 * 86400.0, "5m": 3 * 86400.0, "15m": 3 * 86400.0,
+    "1h": 5 * 86400.0, "1d": 8 * 86400.0, "1w": 45 * 86400.0,
+}
+
 
 class _ProviderSlot:
     def __init__(self, provider: MarketDataProvider, priority: int) -> None:
@@ -113,7 +123,22 @@ class DataRouter:
         return quote
 
     async def bars(self, symbol: str, *, timeframe: str = "1d", limit: int = 100) -> list[Bar]:
-        return await self._route(DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit))
+        bars = await self._route(
+            DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit)
+        )
+        # Reject a clearly-frozen feed (not normal weekend/holiday gaps).
+        max_age = _MAX_BAR_AGE.get(timeframe)
+        if bars and max_age is not None:
+            from datetime import UTC as _UTC
+            from datetime import datetime as _dt
+
+            age = (_dt.now(_UTC) - bars[-1].end).total_seconds()
+            if age > max_age:
+                raise StaleDataError(
+                    f"bars for {symbol} ({timeframe}) from {bars[-1].source} end "
+                    f"{bars[-1].end.isoformat()} — {age / 86400:.1f}d old, feed looks frozen"
+                )
+        return bars
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None,
                            allow_delayed: bool = False) -> OptionChain:
@@ -172,16 +197,17 @@ class DataRouter:
                 f"no configured provider supports '{capability}' — cannot proceed without live data"
             )
         errors: list[str] = []
-        # First pass: available providers; second pass: penalized ones as a
-        # last resort (better a retry than no data at all).
+        # Snapshot availability ONCE up front. A provider that fails in the
+        # first pass gets penalized (record_failure sets penalized_until), but
+        # that must not make it re-selected in the second pass within the same
+        # request — otherwise a just-failed/rate-limited provider is re-hit and
+        # its backoff double-counts. First pass: providers available now;
+        # second pass: the rest, as a last resort (better a retry than none).
+        was_available = {id(s): s.available for s in capable}
         for last_resort in (False, True):
             for slot in capable:
-                if slot.available is last_resort and not last_resort:
-                    continue
-                if not last_resort and not slot.available:
-                    continue
-                if last_resort and slot.available:
-                    continue
+                if was_available[id(slot)] == last_resort:
+                    continue  # available slots run in pass 1, penalized in pass 2
                 started = time.monotonic()
                 try:
                     result = await call(slot.provider)

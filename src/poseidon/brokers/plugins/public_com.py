@@ -381,7 +381,17 @@ class PublicBroker(Broker):
                     ("SELL", "CLOSE"): OrderSide.SELL_TO_CLOSE,
                 }.get((row.get("side", "BUY"), open_close), side)
             expiration = row.get("expiration") or {}
-            quantity = _dec(row.get("quantity")) or _dec(row.get("notionalValue")) or Decimal("1")
+            # Use the real share quantity only. ``notionalValue`` is a dollar
+            # amount, NOT a share count — using it here would report a bogus
+            # size that pollutes the dashboard and the duplicate guard. When a
+            # notional (dollar-based) resting order carries no share count we
+            # fall back to a documented placeholder so the Order model (which
+            # requires quantity > 0) still validates; Poseidon-originated
+            # orders always carry a real share quantity, and the authoritative
+            # duplicate check is the client_order_id idempotency key.
+            quantity = _dec(row.get("quantity"))
+            if quantity is None or quantity <= 0:
+                quantity = Decimal("1")
             orders.append(
                 Order(
                     client_order_id=str(row.get("orderId", "")),

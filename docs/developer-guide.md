@@ -6,7 +6,7 @@
 git clone https://github.com/St3althWarri0r/Poseidon && cd Poseidon
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest            # 203 tests, a few seconds
+pytest            # 215 tests, a few seconds
 ruff check src tests
 mypy src          # strict mode
 ```

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import base64
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -236,13 +236,25 @@ class SchwabBroker(Broker):
         return order
 
     async def open_orders(self) -> list[Order]:
+        # Schwab's /orders endpoint REQUIRES fromEnteredTime/toEnteredTime
+        # (400 without them). Fetch the recent window and filter client-side to
+        # the statuses we consider open, so PENDING_*/QUEUED/AWAITING_* resting
+        # orders are included (a WORKING-only server filter drops them).
+        now = datetime.now(UTC)
         rows = await self._request(
             "GET", f"{_API}/trader/v1/accounts/{self._account_hash}/orders",
             headers=await self._auth_headers(),
-            params={"maxResults": 100, "status": "WORKING"},
+            params={
+                "maxResults": 300,
+                "fromEnteredTime": (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "toEnteredTime": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            },
         )
         orders: list[Order] = []
         for r in rows or []:
+            status = _STATUS_MAP.get(r.get("status", ""), OrderStatus.ACCEPTED)
+            if status.is_terminal:
+                continue
             legs = r.get("orderLegCollection") or [{}]
             leg = legs[0]
             instruction = leg.get("instruction", "BUY")

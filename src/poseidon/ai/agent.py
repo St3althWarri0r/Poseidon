@@ -232,6 +232,8 @@ class ClaudeAgent:
                         stop_price=Decimal(str(t["stop_price"])) if t.get("stop_price") else None,
                         time_in_force=TimeInForce(t.get("time_in_force", "day")),
                         strategy=t.get("strategy", ""),
+                        stop_loss=Decimal(str(t["stop_loss"])) if t.get("stop_loss") else None,
+                        take_profit=Decimal(str(t["take_profit"])) if t.get("take_profit") else None,
                     )
                 )
             except (KeyError, ValueError, InvalidOperation) as exc:
@@ -268,6 +270,8 @@ class ClaudeAgent:
             trades=trades,
             rationale=rationale,
             data_sources=sorted(self._dispatcher.sources_used),
+            data_gaps=[str(g) for g in (payload.get("data_gaps") or [])],
+            summary=str(payload.get("summary", "")),
             model=model,
             cycle_id=cycle_id,
             usage=dict(self._cycle_usage),

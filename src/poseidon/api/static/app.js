@@ -461,11 +461,13 @@ async function refreshApprovals() {
   el.querySelectorAll("[data-approve]").forEach((b) =>
     b.addEventListener("click", () =>
       postJSON(`/api/approvals/${b.dataset.approve}`, { approve: true })
-        .then(() => { toast("Approved — revalidating and submitting", "good"); refreshApprovals(); })));
+        .then(() => { toast("Approved — revalidating and submitting", "good"); refreshApprovals(); })
+        .catch((e) => toast("Approve failed: " + e.message, "bad"))));
   el.querySelectorAll("[data-reject]").forEach((b) =>
     b.addEventListener("click", () =>
       postJSON(`/api/approvals/${b.dataset.reject}`, { approve: false })
-        .then(() => { toast("Rejected", "warn"); refreshApprovals(); })));
+        .then(() => { toast("Rejected", "warn"); refreshApprovals(); })
+        .catch((e) => toast("Reject failed: " + e.message, "bad"))));
 }
 
 /* ================= performance / execution / AI usage ================= */
@@ -553,7 +555,7 @@ async function refreshAudit() {
         `<tr><td>${r.at ? new Date(r.at).toLocaleString() : "—"}</td>
          <td>${esc(r.actor)}</td>
          <td><span class="sym">${esc(r.action)}</span></td>
-         <td><small>${esc(JSON.stringify(r.details || {}).slice(0, 160))}</small></td></tr>`).join("")
+         <td><small>${esc(JSON.stringify(r.payload || {}).slice(0, 160))}</small></td></tr>`).join("")
     : '<tr><td colspan="4" class="empty">no audit records</td></tr>';
 }
 
@@ -579,7 +581,7 @@ function connectWebsocket() {
     if (evt.topic === "order.rejected") toast(`Rejected: ${evt.payload?.reason ?? ""}`.slice(0, 120), "bad");
     if (evt.topic === "ai.approval_requested") toast("New trade awaiting your approval", "warn");
     if (evt.topic === "risk.violation") toast(`Risk: ${evt.payload?.rule ?? "violation"}`, "warn");
-    if (evt.topic === "circuit.opened") toast("Circuit breaker OPEN — trading halted", "bad");
+    if (evt.topic === "risk.circuit_opened") toast("Circuit breaker OPEN — trading halted", "bad");
 
     if (["ai.approval_requested", "order.filled", "order.rejected"].includes(evt.topic)) {
       refreshApprovals().catch(() => {});
@@ -589,11 +591,12 @@ function connectWebsocket() {
       refreshPortfolio().catch(() => {});
     }
   };
+  const keepalive = setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 25000);
   ws.onclose = () => {
+    clearInterval(keepalive);  // else every reconnect leaks another ping timer
     $("#conn-dot").className = "conn-dot bad"; $("#conn-label").textContent = "reconnecting…";
     setTimeout(connectWebsocket, 3000);
   };
-  setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 25000);
 }
 
 /* ================= trade ticket ================= */
@@ -737,8 +740,10 @@ async function algoAction(fn, okMessage) {
 $("#al-save").addEventListener("click", () =>
   algoAction(async () => {
     const res = await postJSON("/api/algorithms", algoBody());
+    // Refresh the cache first: selectAlgo() looks the id up in algoCache,
+    // and the just-created draft isn't there until we reload.
+    await refreshAlgorithms();
     selectAlgo(res.algorithm.id);
-    selectedAlgo = res.algorithm.id;
   }, "Draft saved"));
 $("#al-update").addEventListener("click", () =>
   algoAction(() => putJSON(`/api/algorithms/${selectedAlgo}`, algoBody()), "Saved"));
@@ -754,7 +759,11 @@ $("#al-deactivate").addEventListener("click", () =>
   }, "Deactivated"));
 $("#al-delete").addEventListener("click", () =>
   algoAction(async () => {
-    await fetch(`/api/algorithms/${selectedAlgo}`, { method: "DELETE", headers: authHeaders() });
+    const res = await fetch(`/api/algorithms/${selectedAlgo}`, { method: "DELETE", headers: authHeaders() });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `delete failed: ${res.status}`);
+    }
     clearAlgoEditor();
   }, "Deleted"));
 $("#al-new").addEventListener("click", clearAlgoEditor);
