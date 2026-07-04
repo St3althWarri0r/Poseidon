@@ -303,7 +303,9 @@ async def drive() -> None:
         browser = await pw.chromium.launch(executable_path=exe) if exe \
             else await pw.chromium.launch()
         page = await browser.new_page(viewport={"width": 1600, "height": 1000})
-        page.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+        dialog_messages: list[str] = []
+        page.on("dialog", lambda d: (dialog_messages.append(d.message),
+                                     asyncio.ensure_future(d.accept())))
         js_errors: list[str] = []
         page.on("pageerror", lambda e: js_errors.append(str(e)))
 
@@ -457,6 +459,17 @@ async def drive() -> None:
         check("dry run stop -> research", mode_state is not None
               and "research" in mode_state.lower(), repr(mode_state))
         await page.screenshot(path=f"{SHOTS}/v-dryrun.png")
+
+        # Regression: on the paper broker, the autonomous confirm must NOT warn
+        # about real money (that warning is for live brokers only).
+        dialog_messages.clear()
+        await page.click('#mode-seg button[data-mode="autonomous"]')
+        await page.wait_for_timeout(300)
+        joined = " ".join(dialog_messages).lower()
+        check("paper autonomous confirm omits 'real money'",
+              "autonomous" in joined and "real money" not in joined, repr(dialog_messages))
+        await page.click('#mode-seg button[data-mode="research"]')  # reset for later checks
+        await page.wait_for_timeout(200)
 
         # -- Algorithms: auto-invest flow ----------------------------------
         await page.click('a[data-view="algorithms"]')
