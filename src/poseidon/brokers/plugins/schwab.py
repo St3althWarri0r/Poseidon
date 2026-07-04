@@ -13,7 +13,8 @@ Credentials (vault JSON):
    "account_hash": "..."}
 
 ``account_hash`` is the hashed account id from GET /accounts/accountNumbers;
-``poseidon broker schwab-setup`` walks through obtaining all of these.
+docs/broker-setup.md (Charles Schwab section) walks through obtaining all
+of these.
 """
 
 from __future__ import annotations
@@ -106,7 +107,8 @@ class SchwabBroker(Broker):
             raise BrokerAuthError(
                 self.name,
                 "token refresh failed — the 7-day refresh token has likely expired; "
-                "re-run: poseidon broker schwab-setup",
+                "redo the OAuth consent (docs/broker-setup.md, Charles Schwab) and "
+                "update the refresh_token in the Account view or the vault",
             )
         self._access_token = str(token)
         self._token_expiry = time.monotonic() + float(payload.get("expires_in", 1800))

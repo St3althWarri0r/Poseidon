@@ -27,6 +27,7 @@ from ..core.enums import OrderStatus, TimeInForce, TradingMode
 from ..core.errors import (
     BrokerError,
     CircuitBreakerOpen,
+    ConfigError,
     DataError,
     DuplicateOrderError,
     RiskViolation,
@@ -62,6 +63,15 @@ class OrderManager:
         self._bus = bus
         self._mode = mode
         self._poll_tasks: set[asyncio.Task[None]] = set()
+        # Broker-switch coordination: while _switching is set every new order
+        # pipeline is refused, and _drained signals when the in-flight ones
+        # have finished — the swap may only happen in that quiet window,
+        # otherwise an order decided against one account could be submitted
+        # to (or polled against) a different brokerage.
+        self._inflight = 0
+        self._switching = False
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     @property
     def mode(self) -> TradingMode:
@@ -69,6 +79,60 @@ class OrderManager:
 
     def set_mode(self, mode: TradingMode) -> None:
         self._mode = mode
+
+    @property
+    def broker_name(self) -> str:
+        return self._broker.name
+
+    def set_broker(self, broker: Broker) -> None:
+        """Hot-swap the broker (Account view switch). Only valid inside a
+        begin_broker_switch()/end_broker_switch() window with no open orders
+        — an order created at one broker must never be submitted to, polled,
+        or canceled against another."""
+        self._broker = broker
+
+    async def begin_broker_switch(self, timeout: float = 20.0) -> None:
+        """Refuse new order pipelines and wait for in-flight ones to drain.
+        Raises ConfigError (and lifts the refusal) if they do not finish in
+        time — e.g. an order is sitting in the human approval queue."""
+        self._switching = True
+        try:
+            await asyncio.wait_for(self._drained.wait(), timeout)
+        except TimeoutError:
+            self._switching = False
+            raise ConfigError(
+                f"{self._inflight} order pipeline(s) still in flight — resolve pending "
+                "approvals or in-progress orders, then retry the broker switch"
+            ) from None
+
+    def end_broker_switch(self) -> None:
+        self._switching = False
+
+    def _pipeline_enter(self) -> None:
+        self._inflight += 1
+        self._drained.clear()
+
+    def _pipeline_exit(self) -> None:
+        self._inflight -= 1
+        if self._inflight <= 0:
+            self._drained.set()
+
+    async def _refuse_for_switch(self, order: Order) -> Order:
+        order.status = OrderStatus.REJECTED_RISK
+        order.status_reason = "broker switch in progress — order refused; retry in a moment"
+        await self._persist(order)
+        return order
+
+    async def open_order_count(self) -> int:
+        """Orders that are (or may still go) live at the broker — the guard
+        the kernel checks before allowing a broker switch."""
+        row = await self._db.fetch_one(
+            "SELECT COUNT(*) FROM orders WHERE status IN (?, ?, ?, ?, ?)",
+            (OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
+             OrderStatus.PARTIALLY_FILLED.value, OrderStatus.PENDING_APPROVAL.value,
+             OrderStatus.APPROVED.value),
+        )
+        return int(row[0]) if row else 0
 
     # -- entry point --------------------------------------------------------------
 
@@ -105,7 +169,15 @@ class OrderManager:
             order.status_reason = "research mode: orders are never submitted"
             await self._persist(order)
             return order
+        if self._switching:
+            return await self._refuse_for_switch(order)
+        self._pipeline_enter()
+        try:
+            return await self._process_order_gated(order, decision)
+        finally:
+            self._pipeline_exit()
 
+    async def _process_order_gated(self, order: Order, decision: Decision) -> Order:
         # Risk gate — always, in every mode.
         try:
             await self._risk.validate_order(order)
@@ -168,6 +240,15 @@ class OrderManager:
             order.status_reason = "research mode: orders are never submitted (switch modes to trade)"
             await self._persist(order)
             return order
+        if self._switching:
+            return await self._refuse_for_switch(order)
+        self._pipeline_enter()
+        try:
+            return await self._submit_manual_gated(order)
+        finally:
+            self._pipeline_exit()
+
+    async def _submit_manual_gated(self, order: Order) -> Order:
         try:
             await self._risk.validate_order(order)
         except (RiskViolation, CircuitBreakerOpen, DataError) as exc:
@@ -190,11 +271,15 @@ class OrderManager:
     # -- submission ------------------------------------------------------------------
 
     async def _submit(self, order: Order) -> Order:
+        # Pin the broker for this submission AND its lifecycle poller: even
+        # if a hot swap lands later, this order stays with the brokerage that
+        # actually holds it.
+        broker = self._broker
         await self._guard_duplicate(order)
         # Broker-side preflight (where supported): a definitive broker
         # rejection is cheaper and cleaner caught here than as a failed
         # submission. A None result (unsupported/unavailable) changes nothing.
-        preflight_reason = await self._broker.preflight(order)
+        preflight_reason = await broker.preflight(order)
         if preflight_reason is not None:
             order.status = OrderStatus.REJECTED_BROKER
             order.status_reason = preflight_reason
@@ -208,7 +293,7 @@ class OrderManager:
         last_error: Exception | None = None
         for attempt in range(1, _SUBMIT_RETRIES + 1):
             try:
-                order = await self._broker.submit_order(order)
+                order = await broker.submit_order(order)
                 break
             except BrokerError as exc:
                 last_error = exc
@@ -235,7 +320,7 @@ class OrderManager:
             "symbol": order.symbol, "side": order.side, "qty": str(order.quantity),
         })
         await self._bus.publish(Topics.ORDER_UPDATED, {"order": order.model_dump(mode="json")})
-        self._spawn_poller(order)
+        self._spawn_poller(order, broker)
         return order
 
     async def _guard_duplicate(self, order: Order) -> None:
@@ -262,12 +347,15 @@ class OrderManager:
 
     # -- lifecycle polling ---------------------------------------------------------------
 
-    def _spawn_poller(self, order: Order) -> None:
-        task = asyncio.create_task(self._poll_to_terminal(order), name=f"order-poll-{order.id[:8]}")
+    def _spawn_poller(self, order: Order, broker: Broker) -> None:
+        # The poller is bound to the broker that holds the order — a later
+        # hot swap must not redirect status polls to a different brokerage.
+        task = asyncio.create_task(self._poll_to_terminal(order, broker),
+                                   name=f"order-poll-{order.id[:8]}")
         self._poll_tasks.add(task)
         task.add_done_callback(self._poll_tasks.discard)
 
-    async def _poll_to_terminal(self, order: Order) -> None:
+    async def _poll_to_terminal(self, order: Order, broker: Broker) -> None:
         is_gtc = order.time_in_force is TimeInForce.GTC
         timeout = _POLL_TIMEOUT_GTC if is_gtc else _POLL_TIMEOUT_DAY
         deadline = asyncio.get_running_loop().time() + timeout
@@ -277,7 +365,7 @@ class OrderManager:
             if is_gtc:  # a resting order rarely fills in the first seconds; ease off
                 interval = min(interval * 1.5, _POLL_INTERVAL_MAX)
             try:
-                order = await self._broker.order_status(order)
+                order = await broker.order_status(order)
             except BrokerError as exc:
                 log.warning("order status poll failed", order_id=order.id, error=str(exc))
                 continue
@@ -309,7 +397,20 @@ class OrderManager:
         count = 0
         for (payload,) in rows:
             order = Order.model_validate(json.loads(payload))
-            self._spawn_poller(order)
+            # Never poll an order against a different broker than the one it
+            # was submitted to (e.g. the operator switched brokers between
+            # runs): the ids mean nothing there and a cancel could misfire.
+            if order.broker and order.broker != self._broker.name:
+                order.status = OrderStatus.ERROR
+                order.status_reason = (
+                    f"order was open at '{order.broker}' but the active broker is now "
+                    f"'{self._broker.name}' — verify it at the brokerage directly"
+                )
+                await self._persist(order)
+                log.warning("open order orphaned by broker switch",
+                            order_id=order.id, was=order.broker, now=self._broker.name)
+                continue
+            self._spawn_poller(order, self._broker)
             count += 1
         if count:
             log.info("resumed polling for open orders", count=count)
@@ -320,6 +421,13 @@ class OrderManager:
         if row is None:
             raise KeyError(f"unknown order {order_id}")
         order = Order.model_validate(json.loads(row[0]))
+        if order.broker and order.broker != self._broker.name:
+            raise ConfigError(
+                f"order {order_id[:8]} belongs to '{order.broker}' but the active broker is "
+                f"'{self._broker.name}' — cancel it at that brokerage directly"
+            )
+        if self._switching:
+            raise ConfigError("broker switch in progress — retry the cancel in a moment")
         order = await self._broker.cancel_order(order)
         await self._persist(order)
         await self._audit.append("human", "order.canceled", {"order_id": order.id})

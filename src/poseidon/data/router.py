@@ -122,6 +122,19 @@ class DataRouter:
         quote.freshness = grade
         return quote
 
+    async def reference_quote(self, symbol: str) -> Quote:
+        """Latest quote WITHOUT the freshness gate — for display only.
+
+        When the market is closed there is no fresh print anywhere; the honest
+        answer for a human looking at a ticket is the last real trade, clearly
+        labeled with its age. The quote is graded and stamped (freshness may be
+        STALE) but never rejected. NO order path may use this: the risk
+        engine's validate_order fetches its own strictly-graded quote.
+        """
+        quote = await self._route(DataCapability.QUOTES, lambda p: p.quote(symbol))
+        quote.freshness = self._freshness.grade(quote.as_of)
+        return quote
+
     async def bars(self, symbol: str, *, timeframe: str = "1d", limit: int = 100) -> list[Bar]:
         bars = await self._route(
             DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit)

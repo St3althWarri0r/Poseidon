@@ -16,9 +16,18 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+async function errDetail(res, url) {
+  // Surface the server's explanation (FastAPI puts it in .detail) instead of
+  // a bare status code — "limit orders need a limit_price" beats "422".
+  try {
+    const data = await res.json();
+    if (data && data.detail) return String(data.detail);
+  } catch { /* not JSON */ }
+  return `${url}: ${res.status}`;
+}
 async function getJSON(url) {
   const res = await fetch(url, { headers: authHeaders() });
-  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  if (!res.ok) throw new Error(await errDetail(res, url));
   return res.json();
 }
 async function postJSON(url, body) {
@@ -27,7 +36,7 @@ async function postJSON(url, body) {
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  if (!res.ok) throw new Error(await errDetail(res, url));
   return res.json();
 }
 
@@ -45,7 +54,8 @@ const VIEWS = {
   overview:    { title: "Overview",    refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshEquity(), refreshRiskMetrics()]) },
   portfolio:   { title: "Portfolio",   refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshOrders(), refreshExitPlans()]) },
   algorithms:  { title: "Algorithms",  refresh: () => Promise.allSettled([refreshStatus(), refreshAlgorithms()]) },
-  ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage()]) },
+  ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage(), refreshChat()]) },
+  account:     { title: "Account",     refresh: () => Promise.allSettled([refreshStatus(), refreshAccount()]) },
   risk:        { title: "Risk",        refresh: () => Promise.allSettled([refreshStatus(), refreshRiskMetrics()]) },
   performance: { title: "Performance", refresh: () => Promise.allSettled([refreshPerformance(), refreshExecution()]) },
   system:      { title: "System",      refresh: () => Promise.allSettled([refreshStatus(), refreshAudit()]) },
@@ -608,16 +618,38 @@ async function ticketQuote() {
   box.textContent = "fetching live quote…";
   try {
     const q = await getJSON(`/api/quote/${encodeURIComponent(symbol)}`);
-    box.innerHTML = `<strong>${esc(symbol)}</strong> · bid ${fmtUsd(q.bid)} / ask ${fmtUsd(q.ask)}` +
-      ` · last ${fmtUsd(q.last)} <small>(${esc(q.source)}, ${esc(q.freshness)})</small>`;
-    if (!$("#tk-limit").value && q.last) $("#tk-limit").value = Number(q.last).toFixed(2);
+    if (q.reference) {
+      // Market not in regular session: this is the last real print, labeled.
+      // Display only — it must not seed the order form.
+      const at = q.as_of ? new Date(q.as_of).toLocaleString() : "unknown time";
+      box.innerHTML = `<strong>${esc(symbol)}</strong> · last ${fmtUsd(q.last)}` +
+        (q.bid || q.ask ? ` · bid ${fmtUsd(q.bid)} / ask ${fmtUsd(q.ask)}` : "") +
+        ` <small>(${esc(q.source)})</small><br><small>market ${esc(q.session || "closed")} — ` +
+        `last print ${esc(at)}. Reference only: orders always require a fresh quote.</small>`;
+    } else {
+      box.innerHTML = `<strong>${esc(symbol)}</strong> · bid ${fmtUsd(q.bid)} / ask ${fmtUsd(q.ask)}` +
+        ` · last ${fmtUsd(q.last)} <small>(${esc(q.source)}, ${esc(q.freshness)})</small>`;
+      if (!$("#tk-limit").value && q.last) $("#tk-limit").value = Number(q.last).toFixed(2);
+    }
   } catch (e) {
-    box.textContent = "no fresh quote available — the platform will not trade without one";
+    box.textContent = "no quote available — " + String(e.message).slice(0, 160);
   }
 }
 
 async function submitTicket(evt) {
   evt.preventDefault();
+  // Catch the obvious misses before the server does, with focus put right.
+  const type = $("#tk-type").value;
+  if ((type === "limit" || type === "stop_limit") && !$("#tk-limit").value.trim()) {
+    toast("Limit orders need a limit price", "warn");
+    $("#tk-limit").focus();
+    return;
+  }
+  if ((type === "stop" || type === "stop_limit") && !$("#tk-stop").value.trim()) {
+    toast("Stop orders need a stop price", "warn");
+    $("#tk-stop").focus();
+    return;
+  }
   const btn = $("#tk-submit");
   btn.disabled = true;
   try {
@@ -887,6 +919,254 @@ function renderReview(r) {
     toast("Loaded — review, then save as draft", "good");
   });
 }
+
+/* ================= AI chat ================= */
+
+let chatPending = false;
+
+function chatBubble(role, content, meta) {
+  const div = document.createElement("div");
+  div.className = "chat-msg " + role;
+  div.textContent = content;
+  if (meta) {
+    const m = document.createElement("span");
+    m.className = "chat-meta";
+    m.textContent = meta;
+    div.appendChild(m);
+  }
+  return div;
+}
+
+async function refreshChat() {
+  if (chatPending) return; // don't clobber the optimistic bubbles mid-send
+  const data = await getJSON("/api/chat?limit=200");
+  if (chatPending) return; // a send started while the GET was in flight
+  const logEl = $("#chat-log");
+  const msgs = data.messages || [];
+  // Skip the rebuild when nothing changed — the 30s auto-refresh must not
+  // destroy the reader's scroll position or text selection.
+  const sig = msgs.length + ":" + (msgs.length ? msgs[msgs.length - 1].at : "");
+  if (logEl.dataset.sig === sig) return;
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 8;
+  logEl.dataset.sig = sig;
+  logEl.innerHTML = msgs.length ? "" :
+    '<div class="empty">Ask about your portfolio, a symbol, risk, strategy ideas, or how Poseidon itself works.</div>';
+  for (const m of msgs) {
+    logEl.appendChild(chatBubble(m.role, m.content, m.at ? new Date(m.at).toLocaleTimeString() : ""));
+  }
+  if (atBottom || !logEl.dataset.hadContent) logEl.scrollTop = logEl.scrollHeight;
+  logEl.dataset.hadContent = "1";
+}
+
+async function sendChat(evt) {
+  evt.preventDefault();
+  if (chatPending) return;
+  const input = $("#chat-input");
+  const text = input.value.trim();
+  if (!text) return;
+  chatPending = true;
+  $("#chat-send").disabled = true;
+  input.value = "";
+  const logEl = $("#chat-log");
+  const empty = logEl.querySelector(".empty");
+  if (empty) empty.remove();
+  logEl.appendChild(chatBubble("user", text));
+  const wait = chatBubble("assistant", "Claude is looking at live data…");
+  wait.classList.add("pending");
+  logEl.appendChild(wait);
+  logEl.scrollTop = logEl.scrollHeight;
+  try {
+    const res = await postJSON("/api/chat", { message: text });
+    wait.remove();
+    const tools = (res.tool_calls || []).length
+      ? "checked: " + [...new Set(res.tool_calls)].join(", ") : "";
+    logEl.appendChild(chatBubble("assistant", res.reply || "(no reply)", tools));
+  } catch (e) {
+    wait.remove();
+    logEl.appendChild(chatBubble("assistant", "Error: " + String(e.message).slice(0, 300)));
+  } finally {
+    chatPending = false;
+    $("#chat-send").disabled = false;
+    logEl.dataset.sig = ""; // bubbles were added optimistically; resync next refresh
+    logEl.scrollTop = logEl.scrollHeight;
+    // refreshAiUsage reads the cached status — refetch it first so the
+    // usage card shows the tokens this chat turn just spent.
+    refreshStatus().then(refreshAiUsage).catch(() => {});
+  }
+}
+
+$("#chat-form").addEventListener("submit", sendChat);
+$("#chat-clear").addEventListener("click", async () => {
+  if (chatPending) return;
+  try {
+    const res = await fetch("/api/chat", { method: "DELETE", headers: authHeaders() });
+    if (!res.ok) throw new Error(await errDetail(res, "/api/chat"));
+    await refreshChat();
+    toast("Conversation cleared", "good");
+  } catch (e) {
+    toast("Clear failed: " + e.message, "bad");
+  }
+});
+
+/* ================= account / broker connect ================= */
+
+let brokerCatalog = [];
+let selectedBroker = null;
+
+async function refreshAccount() {
+  const data = await getJSON("/api/brokers");
+  brokerCatalog = data.brokers || [];
+  const cur = data.current || {};
+  $("#acct-sync-hint").textContent = cur.synced_at
+    ? "synced " + new Date(cur.synced_at).toLocaleTimeString() : "not synced yet";
+  $("#acct-current").innerHTML =
+    `<div class="kv"><span class="k">Broker</span><span class="v">${esc(cur.display_name || "—")}
+       <span class="acct-badge ${cur.paper ? "paper" : "live"}">${cur.paper ? "paper" : "LIVE"}</span></span></div>` +
+    `<div class="kv"><span class="k">Status</span>
+       <span class="v ${cur.connected ? "ok" : "bad"}">${cur.connected ? "connected" : "disconnected"}</span></div>` +
+    `<div class="kv"><span class="k">Account</span><span class="v">${esc(cur.account_id || "—")}</span></div>` +
+    `<div class="kv"><span class="k">Equity</span><span class="v">${fmtUsd(cur.equity)}</span></div>` +
+    `<div class="kv"><span class="k">Cash</span><span class="v">${fmtUsd(cur.cash)}</span></div>` +
+    `<div class="kv"><span class="k">Buying power</span><span class="v">${fmtUsd(cur.buying_power)}</span></div>` +
+    `<div class="kv"><span class="k">Operating mode</span><span class="v">${esc(data.mode || "")}</span></div>`;
+
+  const connectable = brokerCatalog.filter((b) => b.connectable);
+  $("#broker-list").innerHTML = connectable.map((b) => `
+    <button type="button" class="broker-tile ${selectedBroker === b.name ? "selected" : ""}" data-broker="${esc(b.name)}">
+      <span class="name">${esc(b.display_name)}${b.is_current ? " ✓" : ""}</span>
+      <span class="sub">${b.paper_choice === "live_only" ? "live only"
+        : b.paper_choice === "always" ? "simulation" : "paper or live"}${b.credential_saved ? " · key saved" : ""}</span>
+    </button>`).join("");
+  $("#broker-list").querySelectorAll("[data-broker]").forEach((el) =>
+    el.addEventListener("click", () => selectBroker(el.dataset.broker)));
+
+  const stubs = brokerCatalog.filter((b) => !b.connectable);
+  $("#broker-stubs").innerHTML = stubs.length
+    ? stubs.map((b) =>
+        `<div class="stub-row"><span class="name">${esc(b.display_name)}</span>
+         <span class="why">${esc(b.stub_reason || b.notes || "no dashboard setup available")}</span></div>`).join("")
+    : '<div class="empty">every installed broker plugin is connectable</div>';
+}
+
+function selectBroker(name) {
+  const b = brokerCatalog.find((x) => x.name === name);
+  if (!b) return;
+  selectedBroker = name;
+  $$("#broker-list .broker-tile").forEach((t) =>
+    t.classList.toggle("selected", t.dataset.broker === name));
+  const form = $("#broker-form");
+  form.hidden = false;
+  $("#bf-title").textContent = "Connect " + b.display_name;
+  $("#bf-notes").textContent = b.notes || "";
+  $("#bf-result").hidden = true;
+  const saved = b.credential_saved;
+  $("#bf-fields").innerHTML = (b.fields || []).map((f) => `
+    <div class="form-row"><label class="wide">${esc(f.label)}${f.optional ? " <small>(optional)</small>" : ""}
+      <input data-cred="${esc(f.key)}" type="${f.secret ? "password" : "text"}"
+        placeholder="${esc(f.placeholder || (saved ? "saved — leave blank to reuse" : ""))}" autocomplete="off">
+      ${f.help ? `<small>${esc(f.help)}</small>` : ""}</label></div>`).join("")
+    + (saved && (b.fields || []).length
+        ? '<p class="meter-note">A credential for this broker is already in the vault — leave every field blank to reuse it, or fill them all to replace it.</p>'
+        : "");
+  const paperRow = $("#bf-paper-row");
+  const paperBox = $("#bf-paper");
+  if (b.paper_choice === "toggle") { paperRow.hidden = false; paperBox.checked = true; paperBox.disabled = false; }
+  else if (b.paper_choice === "always") { paperRow.hidden = false; paperBox.checked = true; paperBox.disabled = true; }
+  else { paperRow.hidden = true; paperBox.checked = false; paperBox.disabled = true; }
+  updateLiveWarning();
+}
+
+function updateLiveWarning() {
+  const b = brokerCatalog.find((x) => x.name === selectedBroker);
+  if (!b) return;
+  const paper = b.paper_choice === "live_only" ? false
+    : b.paper_choice === "always" ? true : $("#bf-paper").checked;
+  $("#bf-live-warning").hidden = paper;
+}
+$("#bf-paper").addEventListener("change", updateLiveWarning);
+
+function brokerPayload() {
+  const b = brokerCatalog.find((x) => x.name === selectedBroker);
+  if (!b) throw new Error("pick a broker first");
+  const creds = {};
+  let any = false;
+  $$("#bf-fields [data-cred]").forEach((inp) => {
+    const v = inp.value.trim();
+    if (v) { creds[inp.dataset.cred] = v; any = true; }
+  });
+  const required = (b.fields || []).filter((f) => !f.optional);
+  if (any) {
+    const missing = required.filter((f) => !creds[f.key]);
+    if (missing.length) throw new Error("missing: " + missing.map((f) => f.label).join(", "));
+  } else if (required.length && !b.credential_saved) {
+    throw new Error("enter the credential fields first");
+  }
+  const paper = b.paper_choice === "live_only" ? false
+    : b.paper_choice === "always" ? true : $("#bf-paper").checked;
+  // A broker whose fields are all optional (IBKR) with nothing saved yet:
+  // send an explicit empty credentials object so the server doesn't try a
+  // vault lookup that cannot succeed.
+  const sendCreds = any || (!required.length && !b.credential_saved);
+  return { name: b.name, paper, ...(sendCreds ? { credentials: creds } : {}) };
+}
+
+$("#bf-test").addEventListener("click", async () => {
+  let body;
+  try { body = brokerPayload(); } catch (e) { toast(e.message, "warn"); return; }
+  const btn = $("#bf-test");
+  const out = $("#bf-result");
+  btn.disabled = true;
+  btn.textContent = "Testing…";
+  try {
+    const res = await postJSON("/api/brokers/test", body);
+    out.hidden = false;
+    out.innerHTML = res.ok
+      ? `✓ Connected to <strong>${esc(res.account.display_name)}</strong> — account ${esc(res.account.account_id)},
+         equity ${fmtUsd(res.account.equity)}, buying power ${fmtUsd(res.account.buying_power)}`
+      : "✗ " + esc(res.error || "connection failed");
+  } catch (e) {
+    out.hidden = false;
+    out.textContent = "✗ " + String(e.message).slice(0, 300);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Test connection";
+  }
+});
+
+$("#broker-form").addEventListener("submit", async (evt) => {
+  evt.preventDefault();
+  let body;
+  try { body = brokerPayload(); } catch (e) { toast(e.message, "warn"); return; }
+  const b = brokerCatalog.find((x) => x.name === selectedBroker);
+  if (!body.paper && !window.confirm(
+      `Switch to your LIVE ${b.display_name} account?\n\nOrders (in approval/autonomous mode) will use real money. ` +
+      "The operating mode is not changed by connecting.")) return;
+  const btn = $("#bf-connect");
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
+  try {
+    const res = await postJSON("/api/brokers/connect", body);
+    toast(`Switched to ${res.broker.display_name}` + (res.broker.paper ? " (paper)" : " (LIVE)"),
+          res.broker.paper ? "good" : "warn");
+    if (res.broker.provider_note) toast(res.broker.provider_note, "good");
+    $("#broker-form").hidden = true;
+    selectedBroker = null;
+    refreshAccount().catch(() => {});
+    refreshStatus().catch(() => {});
+    refreshPortfolio().catch(() => {});
+  } catch (e) {
+    toast("Connect failed: " + String(e.message).slice(0, 250), "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Connect & switch";
+  }
+});
+
+$("#bf-cancel").addEventListener("click", () => {
+  $("#broker-form").hidden = true;
+  selectedBroker = null;
+  $$("#broker-list .broker-tile").forEach((t) => t.classList.remove("selected"));
+});
 
 /* ================= actions & boot ================= */
 

@@ -20,7 +20,10 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..ai.chat import ChatBusyError
+from ..brokers.registry import broker_catalog
 from ..core.enums import TradingMode
+from ..core.errors import AgentError, BrokerError, ConfigError, DataError, VaultError
 from ..core.events import EventBus
 
 if TYPE_CHECKING:
@@ -69,6 +72,18 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     app = FastAPI(title="Poseidon", docs_url=None, redoc_url=None, openapi_url=None)
     hub = WebsocketHub(kernel.bus)
 
+    # DNS-rebinding protection: a malicious website resolving to 127.0.0.1
+    # sends its own domain in the Host header; reject anything that is not a
+    # genuine loopback/configured host. On a non-loopback bind the operator
+    # may reach it by any address, so the (mandatory) bearer token is the
+    # guard instead.
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    configured_host = kernel.config.dashboard.host
+    if configured_host in ("127.0.0.1", "localhost", "::1"):
+        app.add_middleware(TrustedHostMiddleware,
+                           allowed_hosts=["127.0.0.1", "localhost", "::1"])
+
     # Optional bearer-token auth (required by config validation whenever the
     # host is non-loopback). Static assets are exempt — they contain nothing
     # sensitive and <link>/<script> tags cannot carry headers.
@@ -116,8 +131,11 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.get("/api/equity")
     async def equity(limit: int = 2000) -> JSONResponse:
+        # Scoped to the active broker: a paper curve and a real-account curve
+        # must never be spliced into one line.
         rows = await kernel.db.fetch_all(
-            "SELECT at, equity FROM equity_marks ORDER BY at DESC LIMIT ?", (limit,)
+            "SELECT at, equity FROM equity_marks WHERE broker = ? ORDER BY at DESC LIMIT ?",
+            (kernel.broker.account_scope, limit),
         )
         points = [{"at": r[0], "equity": float(r[1])} for r in reversed(rows)]
         return JSONResponse({"points": points})
@@ -165,6 +183,8 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             order = await kernel.order_manager.cancel(order_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ConfigError as exc:  # broker switch in progress / wrong broker
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "status": order.status.value})
 
     @app.post("/api/mode")
@@ -204,13 +224,32 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.get("/api/quote/{symbol}")
     async def quote(symbol: str) -> JSONResponse:
-        """Live quote for the trade ticket (delayed data never quoted here —
-        a human about to trade sees the same freshness bar as the AI)."""
+        """Quote for the trade ticket. During regular hours only a FRESH quote
+        is shown (a human about to trade sees the same freshness bar as the
+        AI). Outside regular hours a fresh print cannot exist, so the last
+        real trade is returned clearly flagged ``reference: true`` — display
+        only; order submission still requires a fresh quote in the risk
+        engine, always."""
+        from ..core.enums import MarketSession
+        from ..core.errors import StaleDataError
+
+        session = kernel.clock.session().value
         try:
             q = await kernel.router.quote(symbol.upper(), allow_delayed=False)
+            return JSONResponse({**q.model_dump(mode="json"),
+                                 "session": session, "reference": False})
+        except StaleDataError as exc:
+            if kernel.clock.session() is MarketSession.REGULAR:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return JSONResponse(q.model_dump(mode="json"))
+        # Market not in regular session: serve the last print, labeled.
+        try:
+            q = await kernel.router.reference_quote(symbol.upper())
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse({**q.model_dump(mode="json"),
+                             "session": session, "reference": True})
 
     @app.post("/api/trade")
     async def trade(body: dict[str, Any]) -> JSONResponse:
@@ -238,6 +277,8 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             raise HTTPException(status_code=422, detail=f"invalid order: {exc}") from exc
         if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and order.limit_price is None:
             raise HTTPException(status_code=422, detail="limit orders need a limit_price")
+        if order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and order.stop_price is None:
+            raise HTTPException(status_code=422, detail="stop orders need a stop_price")
         result = await kernel.order_manager.submit_manual(order)
         return JSONResponse({
             "order": result.model_dump(mode="json"),
@@ -364,6 +405,100 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"review failed: {exc}") from exc
         return JSONResponse({"review": review})
+
+    # ------------------------------------------------- account / broker connect
+
+    @app.get("/api/brokers")
+    async def brokers() -> JSONResponse:
+        catalog = broker_catalog()
+        saved_names: set[str] = set()
+        with contextlib.suppress(Exception):
+            saved_names = set(kernel.vault.names())
+        for entry in catalog:
+            cred = str(entry.get("credential", ""))
+            entry["credential_saved"] = bool(cred) and cred in saved_names
+            entry["is_current"] = entry["name"] == kernel.broker.name
+        acct = kernel.portfolio.account
+        return JSONResponse({
+            "current": {
+                "name": kernel.broker.name,
+                "display_name": kernel.broker.display_name or kernel.broker.name,
+                "paper": kernel.broker.is_paper,
+                "connected": kernel.broker.connected,
+                "account_id": acct.account_id if acct else None,
+                "equity": str(acct.equity) if acct else None,
+                "cash": str(acct.cash) if acct else None,
+                "buying_power": str(acct.buying_power) if acct else None,
+                "synced_at": (kernel.portfolio.synced_at.isoformat()
+                              if kernel.portfolio.synced_at else None),
+            },
+            "brokers": catalog,
+            "mode": kernel.order_manager.mode.value,
+        })
+
+    def _broker_request(body: dict[str, Any]) -> tuple[str, bool, dict[str, str] | None]:
+        name = str(body.get("name", "")).strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="broker name required")
+        paper = bool(body.get("paper", True))
+        credentials: dict[str, str] | None = None
+        raw = body.get("credentials")
+        if isinstance(raw, dict):
+            # Drop blank optional fields so plugins see only real values.
+            credentials = {str(k): str(v).strip() for k, v in raw.items() if str(v).strip()}
+        return name, paper, credentials
+
+    @app.post("/api/brokers/test")
+    async def broker_test(body: dict[str, Any]) -> JSONResponse:
+        """Prove auth + account access without changing anything. Failures are
+        a normal outcome here, so they come back 200 with ok=false."""
+        name, paper, credentials = _broker_request(body)
+        try:
+            account = await kernel.broker_connection_test(
+                name, paper=paper, credentials=credentials)
+        except (BrokerError, ConfigError, VaultError, DataError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)})
+        return JSONResponse({"ok": True, "account": account})
+
+    @app.post("/api/brokers/connect")
+    async def broker_connect(body: dict[str, Any]) -> JSONResponse:
+        """Store credentials in the vault, persist the choice, and hot-swap
+        the active broker. The trading mode is untouched — connecting a live
+        account in research mode still cannot place an order."""
+        name, paper, credentials = _broker_request(body)
+        try:
+            result = await kernel.switch_broker(name, paper=paper, credentials=credentials)
+        except (BrokerError, ConfigError, VaultError, DataError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "broker": result})
+
+    # ----------------------------------------------------------------- AI chat
+
+    @app.get("/api/chat")
+    async def chat_history(limit: int = 200) -> JSONResponse:
+        if kernel.chat is None:
+            return JSONResponse({"messages": [], "busy": False})
+        return JSONResponse({"messages": await kernel.chat.history(limit),
+                             "busy": kernel.chat.busy})
+
+    @app.post("/api/chat")
+    async def chat_send(body: dict[str, Any]) -> JSONResponse:
+        message = str(body.get("message", "")).strip()
+        if not message:
+            raise HTTPException(status_code=422, detail="message required")
+        try:
+            result = await kernel.chat_message(message)
+        except ChatBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (AgentError, ConfigError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return JSONResponse(result)
+
+    @app.delete("/api/chat")
+    async def chat_clear() -> JSONResponse:
+        if kernel.chat is not None:
+            await kernel.chat.clear()
+        return JSONResponse({"ok": True})
 
     @app.get("/api/audit")
     async def audit(limit: int = 100) -> JSONResponse:
