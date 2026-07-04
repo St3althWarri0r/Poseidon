@@ -16,14 +16,14 @@
 ## Layers
 
 ```
-src/aegis_trader/
+src/poseidon/
 ├── core/          domain models, enums, errors, config, event bus, market clock, DI
 ├── security/      encrypted vault, tamper-evident audit log
 ├── storage/       async SQLite (WAL): orders, decisions, equity, audit, kv
 ├── data/          provider ABC, 6 providers, failover router (staleness gate)
 ├── brokers/       broker ABC, plugin registry, 6 live plugins + 6 documented stubs
 ├── portfolio/     portfolio state + continuous sync service
-├── risk/          18 pre-trade rules, circuit breaker, cooldowns
+├── risk/          20 pre-trade rules, circuit breaker, cooldowns
 ├── execution/     order manager (the only broker path), approval queue
 ├── ai/            Claude agent (tool loop), tool dispatcher, schemas, reports
 ├── strategy/      strategy ABC + 16 built-in screeners + engine
@@ -33,7 +33,7 @@ src/aegis_trader/
 ├── backtest/      replay engine, Monte Carlo, walk-forward, stress
 ├── api/           FastAPI dashboard (REST + websocket + static dark UI)
 ├── app.py         ApplicationKernel — composition root
-└── cli.py         aegis command
+└── cli.py         poseidon command
 ```
 
 ## The review cycle

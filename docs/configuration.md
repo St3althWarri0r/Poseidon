@@ -1,20 +1,20 @@
 # Configuration reference
 
-File: `~/.config/aegis-trader/aegis.yaml` (override with `aegis
+File: `~/.config/poseidon/poseidon.yaml` (override with `poseidon
 --config`). Validated strictly at startup — unknown keys and invalid values
-refuse to boot. Environment variables `AEGIS_SECTION__FIELD=value` override
-file values (e.g. `AEGIS_AI__MODEL=claude-opus-4-8`,
-`AEGIS_DASHBOARD__HOST=0.0.0.0`).
+refuse to boot. Environment variables `POSEIDON_SECTION__FIELD=value` override
+file values (e.g. `POSEIDON_AI__MODEL=claude-opus-4-8`,
+`POSEIDON_DASHBOARD__HOST=0.0.0.0`).
 
 Secrets never appear in this file: fields named `credential` hold the
-*name* of a vault entry (`aegis vault set <name>`).
+*name* of a vault entry (`poseidon vault set <name>`).
 
 ## Top level
 
 | Field | Default | Notes |
 | --- | --- | --- |
 | `mode` | `research` | `research` / `approval` / `autonomous`; switchable live from the dashboard |
-| `data_dir` | `~/.local/share/aegis-trader` | DB, logs, vault, paper state |
+| `data_dir` | `~/.local/share/poseidon` | DB, logs, vault, paper state |
 | `log_level` | `INFO` | console + rotating JSON file logs |
 
 ## `ai`
@@ -40,9 +40,11 @@ Secrets never appear in this file: fields named `credential` hold the
 | `allow_delayed_for_research` | true | delayed data may inform research; orders always need fresh quotes |
 | `request_timeout_seconds` | 10 | per HTTP call |
 
-Provider names: `polygon`, `finnhub`, `twelvedata`, `alphavantage`,
-`alpaca` (credential = JSON with `key_id`/`secret_key`), `tradier_data`
-(options: `{sandbox: true}`).
+Provider names: `public_data` (free with a Public account; credential =
+API secret or JSON with `secret`/`account_id`), `polygon`, `finnhub`,
+`twelvedata`, `alphavantage`, `alpaca` (credential = JSON with
+`key_id`/`secret_key`), `tradier_data` (options: `{sandbox: true}`).
+Every provider has a $0 tier — see docs/api-configuration.md.
 
 ## `brokers[]`
 
@@ -62,7 +64,13 @@ Every limit is enforced pre-trade by the risk engine
 `min_avg_volume`, `max_orders_per_day`, `trade_cooldown_seconds`,
 `news_blackout_minutes_before_econ`, `volatility_halt_daily_move_pct`,
 `circuit_breaker_error_threshold`, `circuit_breaker_window_seconds`,
-`circuit_breaker_cooldown_seconds`, `slippage_limit_pct`.
+`circuit_breaker_cooldown_seconds`, `slippage_limit_pct`,
+`max_portfolio_var_pct` (0 disables the VaR halt; enabling it requires
+fresh risk metrics before new risk), `benchmark_symbol` (beta/correlation
+/regime benchmark, default SPY), `position_risk_budget_pct` (per-position
+daily risk budget for the AI's vol-targeted sizing tool, default 0.5%).
+
+Every rule is documented with its rationale in docs/risk-controls.md.
 
 ## `guardian`
 
@@ -88,14 +96,17 @@ independently; disabled strategies never run.
 ## `schedules[]`
 
 `name`, `job` (`review_cycle`, `portfolio_sync`, `update_check`,
-`audit_verify`, `position_guardian`, `daily_report`), and exactly one of:
+`audit_verify`, `position_guardian`, `daily_report`, `risk_metrics`), and
+exactly one of:
 
 - `every_seconds: N` — fixed interval, 1 s and up;
 - `cron: "m h dom mon dow"` — standard cron, evaluated in America/New_York.
 
 `only_market_hours: true` gates the trigger on the regular session.
 Defaults added automatically when absent: a market-hours `review_cycle`
-every `ai.review_interval_seconds`, and a nightly `audit_verify` at 02:15.
+every `ai.review_interval_seconds`, a nightly `audit_verify` at 02:15,
+and market-hours `position_guardian` (60 s) and `risk_metrics` (15 min)
+refreshes.
 
 ## `notifications[]`
 
@@ -119,6 +130,6 @@ update availability. Repeats are deduplicated for 5 minutes.
 
 ## Validation
 
-`aegis config validate` checks the file without starting anything;
-`aegis doctor` additionally checks the vault, credentials, calendar
+`poseidon config validate` checks the file without starting anything;
+`poseidon doctor` additionally checks the vault, credentials, calendar
 coverage, and database.

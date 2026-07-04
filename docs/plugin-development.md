@@ -5,13 +5,13 @@ follow the same pattern — implement one class, register it.
 
 ## Broker plugins
 
-Implement `aegis_trader.brokers.base.Broker`:
+Implement `poseidon.brokers.base.Broker`:
 
 ```python
-from aegis_trader.brokers.base import Broker
-from aegis_trader.core.enums import BrokerCapability
-from aegis_trader.core.errors import BrokerAuthError, BrokerError
-from aegis_trader.core.models import AccountSnapshot, Order, Position
+from poseidon.brokers.base import Broker
+from poseidon.core.enums import BrokerCapability
+from poseidon.core.errors import BrokerAuthError, BrokerError
+from poseidon.core.models import AccountSnapshot, Order, Position
 
 class MyBroker(Broker):
     name = "mybroker"            # config brokers[].name
@@ -46,7 +46,7 @@ Contract (enforced by how the platform uses you):
 Register externally (separate package, no fork needed):
 
 ```toml
-[project.entry-points."aegis_trader.brokers"]
+[project.entry-points."poseidon.brokers"]
 mybroker = "my_pkg.broker:MyBroker"
 ```
 
@@ -55,7 +55,7 @@ plugin. Config then simply names it: `brokers: [{name: mybroker, ...}]`.
 
 ## Market-data providers
 
-Implement `aegis_trader.data.base.MarketDataProvider`; advertise only real
+Implement `poseidon.data.base.MarketDataProvider`; advertise only real
 capabilities:
 
 ```python
@@ -73,7 +73,7 @@ class MyProvider(MarketDataProvider):
 Rules: return provider timestamps in `as_of` (receipt time only as a last
 resort); raise `ProviderError`/`ProviderRateLimitError` on failure — the
 router handles failover and penalties; never return defaults for missing
-fields. Entry-point group: `aegis_trader.data_providers`; built-ins map in
+fields. Entry-point group: `poseidon.data_providers`; built-ins map in
 `data/providers/__init__.py`.
 
 ## Strategies
@@ -82,7 +82,7 @@ Strategies are quantitative screeners: they read live data and emit
 `Signal`s that inform the AI. They cannot place orders.
 
 ```python
-from aegis_trader.strategy.base import Signal, Strategy
+from poseidon.strategy.base import Signal, Strategy
 
 class MyStrategy(Strategy):
     name = "my_strategy"
@@ -103,12 +103,12 @@ backtester's replay shim (see `tests/unit/test_strategies.py`).
 
 ## Custom risk rules
 
-Subclass `aegis_trader.risk.rules.RiskRule`, raise `RiskViolation` in
+Subclass `poseidon.risk.rules.RiskRule`, raise `RiskViolation` in
 `check(ctx)`, and pass `rules=[...ALL_RULES, MyRule()]` when constructing
 `RiskEngine` (kernel change) — deliberately not hot-pluggable from config;
 risk changes should be code-reviewed.
 
 ## Notification channels
 
-Subclass `aegis_trader.notifications.channels.Channel`, implement
+Subclass `poseidon.notifications.channels.Channel`, implement
 `send(level, title, body) -> bool` (never raise), add to `CHANNEL_KINDS`.

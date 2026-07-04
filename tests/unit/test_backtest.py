@@ -8,10 +8,10 @@ from decimal import Decimal
 
 import pytest
 
-from aegis_trader.backtest.analysis import monte_carlo, stress_test, walk_forward
-from aegis_trader.backtest.engine import BacktestConfig, BacktestEngine, BacktestResult
-from aegis_trader.core.models import Bar
-from aegis_trader.strategy.builtin.trend import MomentumStrategy
+from poseidon.backtest.analysis import monte_carlo, stress_test, walk_forward
+from poseidon.backtest.engine import BacktestConfig, BacktestEngine, BacktestResult
+from poseidon.core.models import Bar
+from poseidon.strategy.builtin.trend import MomentumStrategy
 
 
 def synthetic_history(symbol: str = "TEST", days: int = 250, drift: float = 0.001,
@@ -88,3 +88,50 @@ async def test_stress_scenarios() -> None:
     assert {r["scenario"] for r in reports} >= {"black_monday_1987", "covid_mar_2020"}
     for report in reports:
         assert 0 < report["total_drawdown"] < 1
+
+
+async def test_rebalance_gap_day_does_not_crater_equity() -> None:
+    # A2 regression: on a day a HELD symbol prints no bar (holiday/halt/gap),
+    # the backtester must mark it at its last known close, not 0 — otherwise
+    # equity collapses to ~0 for that day and rebounds, fabricating a ~100%
+    # drawdown and destroying Sharpe. Hold 100% of "A"; punch a one-day hole in
+    # A's history (B still prints, so it stays a trading day) and confirm the
+    # equity curve never craters.
+    from poseidon.backtest.rebalance import rebalance_backtest
+    from poseidon.strategy.base import Signal, Strategy
+
+    class _HoldA(Strategy):
+        name = "hold_a"
+
+        async def scan(self, router, portfolio):  # type: ignore[no-untyped-def]
+            return [Signal(strategy=self.name, symbol="A", direction="long",
+                           strength=1.0, evidence={"target_weight": 1.0})]
+
+    def _series(symbol: str, days: int = 260, drop: int | None = None) -> list[Bar]:
+        bars: list[Bar] = []
+        start = datetime(2024, 1, 1, tzinfo=UTC)
+        d = 0
+        for i in range(days * 2):  # walk calendar days, keep only weekdays
+            day = start + timedelta(days=i)
+            if day.weekday() >= 5:
+                continue
+            d += 1
+            if d > days:
+                break
+            if drop is not None and d == drop:
+                continue  # gap: this symbol does not print on this trading day
+            price = 100.0
+            bars.append(
+                Bar(symbol=symbol, open=Decimal("100"), high=Decimal("101"),
+                    low=Decimal("99"), close=Decimal(str(price)),
+                    volume=1_000_000, start=day, end=day, source="synthetic")
+            )
+        return bars
+
+    history = {"A": _series("A", drop=245), "B": _series("B")}
+    result = await rebalance_backtest(_HoldA(symbols=["A"]), history, starting_cash=100_000)
+    equities = [pt["equity"] for pt in result["equity_curve"]]
+    # A flat-price hold should stay near starting cash; a zero-mark day would
+    # show up as an equity point far below it and a ~100% drawdown.
+    assert min(equities) > 90_000
+    assert result["max_drawdown"] < 0.2

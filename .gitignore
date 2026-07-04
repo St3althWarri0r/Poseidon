@@ -15,12 +15,12 @@ venv/
 .coverage
 htmlcov/
 
-# Runtime state (never commit)
+# Runtime state (never commit) — anchored so src/poseidon/data is not caught
 *.db
 *.db-journal
 *.sqlite3
-data/
-logs/
+/data/
+/logs/
 *.log
 
 # Secrets (never commit)
@@ -28,7 +28,7 @@ logs/
 *.key
 vault.bin
 credentials*.json
-config/aegis.yaml
+config/poseidon.yaml
 
 # Editors
 .idea/

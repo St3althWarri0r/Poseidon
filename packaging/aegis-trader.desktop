@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Aegis Trader
-Comment=Autonomous AI trading platform dashboard
-Exec=xdg-open http://127.0.0.1:8321
-Icon=utilities-terminal
-Terminal=false
-Categories=Office;Finance;
-Keywords=trading;portfolio;stocks;

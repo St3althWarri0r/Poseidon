@@ -5,11 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from aegis_trader.core.models import Bar
-from aegis_trader.portfolio.state import PortfolioState
-from aegis_trader.strategy.base import pct_return, realized_vol, sma
-from aegis_trader.strategy.builtin.reversion import MeanReversionStrategy
-from aegis_trader.strategy.builtin.trend import BreakoutStrategy, MomentumStrategy
+from poseidon.core.models import Bar
+from poseidon.portfolio.state import PortfolioState
+from poseidon.strategy.base import pct_return, realized_vol, sma
+from poseidon.strategy.builtin.reversion import MeanReversionStrategy
+from poseidon.strategy.builtin.trend import BreakoutStrategy, MomentumStrategy
 
 
 class BarsRouter:

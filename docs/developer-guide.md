@@ -3,10 +3,10 @@
 ## Setup
 
 ```bash
-git clone https://github.com/St3althWarri0r/Aegis-Trader && cd Aegis-Trader
+git clone https://github.com/St3althWarri0r/Poseidon && cd Poseidon
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest            # 101 tests, a few seconds
+pytest            # 215 tests, a few seconds
 ruff check src tests
 mypy src          # strict mode
 ```
@@ -27,7 +27,7 @@ Key invariants to preserve when changing code:
    `Broker.submit_order`. Do not add another.
 3. Money is `Decimal` end to end.
 4. New consequential actions get an `audit.append(...)`.
-5. Exceptions: subclass `AegisError`, set `retryable` honestly.
+5. Exceptions: subclass `PoseidonError`, set `retryable` honestly.
 
 ## Testing
 
@@ -46,11 +46,11 @@ Key invariants to preserve when changing code:
 
 Broker simulation: `PaperBroker` *is* the broker simulator and is used by
 the integration suite. Backtests: `BacktestEngine` + `monte_carlo` /
-`walk_forward` / `stress_test` in `aegis_trader.backtest`.
+`walk_forward` / `stress_test` in `poseidon.backtest`.
 
 ```python
-from aegis_trader.backtest.engine import BacktestEngine, BacktestConfig
-from aegis_trader.backtest.analysis import monte_carlo, walk_forward, stress_test
+from poseidon.backtest.engine import BacktestEngine, BacktestConfig
+from poseidon.backtest.analysis import monte_carlo, walk_forward, stress_test
 result = await BacktestEngine(BacktestConfig()).run(strategy, history)  # history: dict[symbol, list[Bar]]
 print(result.summary(), monte_carlo(result, runs=1000).median_return)
 ```
@@ -79,5 +79,5 @@ grid, tabular numerals in tables/axes.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs ruff + pytest on 3.11 and
 3.12 and builds the Docker image on every push. Version lives in
-`aegis_trader/__init__.py` + `pyproject.toml`; the PKGBUILD derives
+`poseidon/__init__.py` + `pyproject.toml`; the PKGBUILD derives
 `pkgver` from git tags.

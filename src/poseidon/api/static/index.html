@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poseidon</title>
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%233987e5"><path d="M6.2 1.9 8.9 6.9 7 6v3.3H5.4V6L3.5 6.9 6.2 1.9Z"/><path d="M17.8 1.9l2.7 5L18.6 6v3.3H17V6l-1.9.9 2.7-5Z"/><path d="M12 0l2.8 5.2-1.95-.9V19.7l2 2.3H9.15l2-2.3V4.3l-1.95.9L12 0Z"/><path d="M4.2 9.3h15.6v1.8H4.2Z"/></svg>'>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="shell">
+
+<aside class="sidebar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.2 1.9 8.9 6.9 7 6v3.3H5.4V6L3.5 6.9 6.2 1.9Z"/><path d="M17.8 1.9l2.7 5L18.6 6v3.3H17V6l-1.9.9 2.7-5Z"/><path d="M12 0l2.8 5.2-1.95-.9V19.7l2 2.3H9.15l2-2.3V4.3l-1.95.9L12 0Z"/><path d="M4.2 9.3h15.6v1.8H4.2Z"/></svg>
+    <span class="brand-name">POSEIDON</span>
+  </div>
+  <nav class="nav" id="nav">
+    <a href="#/overview" data-view="overview">
+      <svg viewBox="0 0 20 20"><path d="M3 11l7-8 7 8M5 10v7h4v-4h2v4h4v-7"/></svg>
+      <span>Overview</span></a>
+    <a href="#/portfolio" data-view="portfolio">
+      <svg viewBox="0 0 20 20"><path d="M3 16l4-6 3 3 4-7 3 5M3 3v14h14"/></svg>
+      <span>Portfolio</span></a>
+    <a href="#/ai" data-view="ai">
+      <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7"/><path d="M7 10.5l2 2 4-5"/></svg>
+      <span>AI Desk</span><span class="badge" id="nav-badge-ai" hidden>0</span></a>
+    <a href="#/risk" data-view="risk">
+      <svg viewBox="0 0 20 20"><path d="M10 2l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V5z"/></svg>
+      <span>Risk</span></a>
+    <a href="#/performance" data-view="performance">
+      <svg viewBox="0 0 20 20"><path d="M4 16V9M9 16V4M14 16v-5M2 18h16"/></svg>
+      <span>Performance</span></a>
+    <a href="#/algorithms" data-view="algorithms">
+      <svg viewBox="0 0 20 20"><path d="M7 4L3 10l4 6M13 4l4 6-4 6M11 3L9 17"/></svg>
+      <span>Algorithms</span></a>
+    <a href="#/system" data-view="system">
+      <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3M4.5 4.5l2 2M13.5 13.5l2 2M15.5 4.5l-2 2M6.5 13.5l-2 2"/></svg>
+      <span>System</span></a>
+  </nav>
+  <div class="sidebar-foot">
+    <span class="conn"><span class="conn-dot" id="conn-dot"></span><span id="conn-label">connecting…</span></span>
+    <span class="version" id="app-version"></span>
+  </div>
+</aside>
+
+<div class="main">
+  <header class="topbar">
+    <h1 id="view-title">Overview</h1>
+    <div class="topbar-pills">
+      <span class="pill" id="pill-session" title="Market session">session —</span>
+      <span class="pill" id="pill-regime" title="Market regime (benchmark)">regime —</span>
+      <span class="pill" id="pill-health" title="System health">health —</span>
+      <span class="pill" id="pill-circuit" title="Circuit breaker">circuit —</span>
+    </div>
+    <div class="topbar-actions">
+      <div class="segmented" id="mode-seg" role="radiogroup" aria-label="Operating mode">
+        <button data-mode="research" title="Mode 1 — analysis only, no orders">Research</button>
+        <button data-mode="approval" title="Mode 2 — you approve each trade">Approval</button>
+        <button data-mode="autonomous" title="Mode 3 — executes within risk limits">Auto</button>
+      </div>
+      <button id="btn-cycle" class="btn" title="Run a review cycle now">Run cycle</button>
+      <button id="btn-halt" class="btn btn-danger" title="Open the circuit breaker">HALT</button>
+      <button id="btn-resume" class="btn btn-ghost" hidden>Resume</button>
+    </div>
+  </header>
+
+  <!-- ============ Overview ============ -->
+  <section class="view" data-view="overview">
+    <div class="tiles">
+      <div class="tile"><div class="tile-label">Equity</div><div class="tile-value" id="t-equity">—</div><div class="tile-sub" id="t-equity-sub"></div></div>
+      <div class="tile"><div class="tile-label">Day P&amp;L</div><div class="tile-value" id="t-daypnl">—</div><div class="tile-sub" id="t-daypnl-sub"></div></div>
+      <div class="tile"><div class="tile-label">Cash</div><div class="tile-value" id="t-cash">—</div><div class="tile-sub" id="t-cash-sub"></div></div>
+      <div class="tile"><div class="tile-label">Drawdown</div><div class="tile-value" id="t-dd">—</div><div class="tile-sub">from peak equity</div></div>
+      <div class="tile"><div class="tile-label">Exposure</div><div class="tile-value" id="t-exposure">—</div><div class="tile-sub" id="t-exposure-sub"></div></div>
+      <div class="tile"><div class="tile-label">Regime</div><div class="tile-value tile-value-sm" id="t-regime">—</div><div class="tile-sub" id="t-regime-sub"></div></div>
+    </div>
+    <div class="grid">
+      <div class="card span-8">
+        <div class="card-head"><h2>Equity curve</h2><span class="hint" id="equity-range"></span></div>
+        <div class="chart-wrap"><svg id="equity-chart" role="img" aria-label="Equity over time"></svg>
+          <div id="equity-tip" class="tooltip" hidden></div></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Risk limits</h2></div>
+        <div id="risk-meters"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Allocation</h2><span class="hint">% of equity</span></div>
+        <div id="allocation"></div>
+      </div>
+      <div class="card span-8">
+        <div class="card-head"><h2>Live events</h2><span class="hint">bus feed</span></div>
+        <div id="events" class="feed" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Portfolio ============ -->
+  <section class="view" data-view="portfolio" hidden>
+    <div class="grid">
+      <div class="card span-8">
+        <div class="card-head"><h2>Positions</h2><span class="hint" id="positions-count"></span></div>
+        <div class="table-wrap"><table id="positions-table">
+          <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Avg cost</th>
+            <th class="num">Value</th><th class="num">Weight</th><th class="num">Unrealized</th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Trade ticket</h2><span class="hint">runs the full risk engine</span></div>
+        <form id="ticket" class="ticket" autocomplete="off">
+          <div class="form-row">
+            <label>Symbol<input id="tk-symbol" required placeholder="AAPL"></label>
+            <label>Quantity<input id="tk-qty" required inputmode="decimal" placeholder="10"></label>
+          </div>
+          <div class="form-row">
+            <label>Side<select id="tk-side">
+              <option value="buy">Buy</option><option value="sell">Sell</option>
+            </select></label>
+            <label>Type<select id="tk-type">
+              <option value="limit">Limit</option><option value="market">Market</option>
+              <option value="stop">Stop</option><option value="stop_limit">Stop limit</option>
+            </select></label>
+          </div>
+          <div class="form-row">
+            <label>Limit price<input id="tk-limit" inputmode="decimal" placeholder="—"></label>
+            <label>Stop price<input id="tk-stop" inputmode="decimal" placeholder="—"></label>
+          </div>
+          <div class="form-row">
+            <label>Time in force<select id="tk-tif">
+              <option value="day">Day</option><option value="gtc">GTC</option>
+            </select></label>
+            <label class="check"><input type="checkbox" id="tk-ext"> Extended hours</label>
+          </div>
+          <div class="ticket-quote" id="tk-quote">quote appears when you enter a symbol</div>
+          <div class="ticket-actions">
+            <button type="button" class="btn" id="tk-refresh">Quote</button>
+            <button type="submit" class="btn" id="tk-submit">Review &amp; submit</button>
+          </div>
+          <div class="meter-note">Manual orders pass every risk rule and are audited like AI orders. Research mode refuses all orders.</div>
+        </form>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Armed exit plans</h2><span class="hint">guardian</span></div>
+        <div id="exit-plans" class="stack"></div>
+      </div>
+      <div class="card span-8">
+        <div class="card-head"><h2>Orders</h2><span class="hint">most recent first</span></div>
+        <div class="table-wrap"><table id="orders-table">
+          <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th>
+            <th class="num">Limit</th><th>Status</th><th>Reason</th><th></th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ AI Desk ============ -->
+  <section class="view" data-view="ai" hidden>
+    <div class="grid">
+      <div class="card span-5">
+        <div class="card-head"><h2>Pending approvals</h2></div>
+        <div id="approvals" class="stack"></div>
+      </div>
+      <div class="card span-7">
+        <div class="card-head"><h2>AI usage</h2><span class="hint">this month</span></div>
+        <div id="ai-usage" class="kv-grid"></div>
+      </div>
+      <div class="card span-12">
+        <div class="card-head"><h2>Reasoning log</h2><span class="hint">every decision, with its full rationale</span></div>
+        <div id="decisions" class="stack"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Risk ============ -->
+  <section class="view" data-view="risk" hidden>
+    <div class="tiles">
+      <div class="tile"><div class="tile-label">VaR 95 · 1d</div><div class="tile-value" id="r-var95">—</div><div class="tile-sub">historical simulation</div></div>
+      <div class="tile"><div class="tile-label">VaR 99 · 1d</div><div class="tile-value" id="r-var99">—</div><div class="tile-sub" id="r-es-sub">ES₉₅ —</div></div>
+      <div class="tile"><div class="tile-label">Beta</div><div class="tile-value" id="r-beta">—</div><div class="tile-sub" id="r-beta-sub">vs benchmark</div></div>
+      <div class="tile"><div class="tile-label">Portfolio vol</div><div class="tile-value" id="r-vol">—</div><div class="tile-sub">annualized</div></div>
+      <div class="tile"><div class="tile-label">Top correlation</div><div class="tile-value tile-value-sm" id="r-corr">—</div><div class="tile-sub" id="r-corr-sub"></div></div>
+    </div>
+    <div class="grid">
+      <div class="card span-5">
+        <div class="card-head"><h2>Market regime</h2><span class="hint" id="regime-benchmark"></span></div>
+        <div id="regime-card"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Loss limits</h2></div>
+        <div id="risk-meters-2"></div>
+      </div>
+      <div class="card span-3">
+        <div class="card-head"><h2>Coverage</h2></div>
+        <div id="risk-coverage" class="stack"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Performance ============ -->
+  <section class="view" data-view="performance" hidden>
+    <div class="grid">
+      <div class="card span-4">
+        <div class="card-head"><h2>Portfolio</h2></div>
+        <div id="perf-portfolio"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Trades</h2><span class="hint">closed round trips</span></div>
+        <div id="perf-trades"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Execution quality</h2><span class="hint">TCA</span></div>
+        <div id="execution"></div>
+      </div>
+      <div class="card span-6">
+        <div class="card-head"><h2>By strategy</h2></div>
+        <div class="table-wrap"><table id="strategy-table">
+          <thead><tr><th>Strategy</th><th class="num">Trades</th><th class="num">Win rate</th>
+            <th class="num">P&amp;L</th><th class="num">Avg hold</th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+      <div class="card span-6">
+        <div class="card-head"><h2>Monthly returns</h2></div>
+        <div id="monthly-returns" class="stack"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Algorithms ============ -->
+  <section class="view" data-view="algorithms" hidden>
+    <div class="grid">
+      <div class="card span-4">
+        <div class="card-head"><h2>Library</h2><span class="hint" id="algo-count"></span></div>
+        <div id="algo-list" class="stack"></div>
+      </div>
+      <div class="card span-8">
+        <div class="card-head"><h2>Editor</h2><span class="hint">async def scan(ctx) — signals only, never orders</span></div>
+        <div class="form-row">
+          <label>Name<input id="al-name" placeholder="my_breakout_screen"></label>
+          <label>Symbols <small>(blank = watchlist)</small><input id="al-symbols" placeholder="AAPL, MSFT"></label>
+        </div>
+        <div class="form-row">
+          <label class="wide">Description<input id="al-desc" placeholder="What this screen looks for"></label>
+          <label>Sleeve % of equity <small>(0 = advisory only)</small>
+            <input id="al-sleeve" inputmode="decimal" placeholder="0"
+              title="Dedicated capital sleeve: this algorithm's positions may use up to this % of equity, overriding max_position_pct for its orders only. All other risk rules still apply."></label>
+        </div>
+        <textarea id="al-source" class="code" spellcheck="false" rows="16"
+          placeholder="async def scan(ctx):&#10;    signals = []&#10;    for symbol in ctx.symbols:&#10;        bars = await ctx.bars(symbol, timeframe=&quot;1d&quot;, limit=50)&#10;        ...&#10;    return signals"></textarea>
+        <div id="al-notes" class="review-notes" hidden></div>
+        <div id="al-testout" hidden></div>
+        <div class="ticket-actions">
+          <button class="btn" id="al-save">Save as new draft</button>
+          <button class="btn" id="al-update" hidden>Save changes</button>
+          <button class="btn" id="al-test" hidden>Test run</button>
+          <span id="al-bt-controls" class="bt-controls" hidden>
+            <select id="al-bt-period" title="Backtest lookback window">
+              <option value="ytd">YTD</option>
+              <option value="1y">1Y</option>
+              <option value="3y">3Y</option>
+              <option value="5y" selected>5Y</option>
+              <option value="custom">Custom…</option>
+            </select>
+            <input type="date" id="al-bt-start" hidden title="Start date">
+            <input type="date" id="al-bt-end" hidden title="End date (blank = latest)">
+            <button class="btn" id="al-backtest">Backtest</button>
+          </span>
+          <button class="btn" id="al-activate" hidden>Activate</button>
+          <button class="btn btn-ghost" id="al-deactivate" hidden>Deactivate</button>
+          <button class="btn btn-reject" id="al-delete" hidden>Delete</button>
+          <button class="btn btn-ghost" id="al-new" hidden>New</button>
+        </div>
+      </div>
+      <div class="card span-12">
+        <div class="card-head"><h2>Import &amp; Claude review</h2>
+          <span class="hint">paste an algorithm from any platform — Pine Script, thinkScript, Python, pseudocode</span></div>
+        <textarea id="rv-source" class="code" spellcheck="false" rows="8"
+          placeholder="Paste the algorithm here…"></textarea>
+        <label class="wide">Instructions for Claude <small>(optional)</small>
+          <input id="rv-instructions" placeholder="e.g. adapt to daily bars only; keep the RSI filter"></label>
+        <div class="ticket-actions">
+          <button class="btn" id="rv-go">Ask Claude to review</button>
+          <span class="hint" id="rv-status"></span>
+        </div>
+        <div id="rv-result" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ System ============ -->
+  <section class="view" data-view="system" hidden>
+    <div class="grid">
+      <div class="card span-4">
+        <div class="card-head"><h2>Components</h2></div>
+        <div id="system-health" class="stack"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Data providers</h2><span class="hint">priority order</span></div>
+        <div id="providers" class="stack"></div>
+      </div>
+      <div class="card span-4">
+        <div class="card-head"><h2>Runtime</h2></div>
+        <div id="runtime" class="stack"></div>
+      </div>
+      <div class="card span-12">
+        <div class="card-head"><h2>Audit trail</h2><span class="hint">tamper-evident, hash-chained</span></div>
+        <div class="table-wrap"><table id="audit-table">
+          <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead>
+          <tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+</div>
+</div>
+
+<div class="modal-backdrop" id="halt-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="halt-title">
+    <h3 id="halt-title">Halt all trading?</h3>
+    <p>The circuit breaker opens immediately and every order is refused
+       until you resume. Open positions are not touched.</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="halt-cancel">Cancel</button>
+      <button class="btn btn-danger" id="halt-confirm">Halt trading</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

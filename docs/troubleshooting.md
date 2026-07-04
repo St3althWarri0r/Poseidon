@@ -3,28 +3,28 @@
 First stop, always:
 
 ```bash
-aegis doctor                       # config, vault, credentials, calendar, DB
-journalctl --user -u aegis-trader -e --no-pager   # service logs
-tail -f ~/.local/share/aegis-trader/logs/aegis.jsonl
+poseidon doctor                       # config, vault, credentials, calendar, DB
+journalctl --user -u poseidon -e --no-pager   # service logs
+tail -f ~/.local/share/poseidon/logs/poseidon.jsonl
 ```
 
 ## Startup
 
-**`no vault at ...` / `vault is locked`** — run `aegis vault init`; for
+**`no vault at ...` / `vault is locked`** — run `poseidon vault init`; for
 the service, store the passphrase as a systemd credential
 (docs/security.md). Interactive runs prompt automatically.
 
 **`wrong passphrase or corrupt vault`** — the passphrase is wrong, or the
 file was damaged. There is no recovery without the passphrase (by design);
-restore from backup or `rm vault.bin && aegis vault init` and re-enter
+restore from backup or `rm vault.bin && poseidon vault init` and re-enter
 keys.
 
-**`invalid configuration`** — the error names the exact field; `aegis
+**`invalid configuration`** — the error names the exact field; `poseidon
 config validate` reproduces it without starting anything.
 
 **`audit chain verification FAILED at seq N`** — the audit table was
-modified outside the app (or disk corruption). Aegis refuses to start.
-Investigate first (`aegis audit tail`); if you accept losing history,
+modified outside the app (or disk corruption). Poseidon refuses to start.
+Investigate first (`poseidon audit tail`); if you accept losing history,
 archive the DB file and start fresh.
 
 **`unknown broker '...'` / `unknown strategy '...'`** — the error lists
@@ -33,14 +33,14 @@ valid names; check spelling in config.
 ## Data
 
 **`all providers failed for 'quotes'`** — keys missing/expired
-(`aegis vault list`), rate limits exhausted, or network down. The
+(`poseidon vault list`), rate limits exhausted, or network down. The
 dashboard's *Data providers* card shows per-provider penalty state and
 latency. Trading pauses by design until data returns.
 
 **`quote ... is stale — refusing to use it`** — the provider is serving
 old data (common: Alpha Vantage EOD quotes, or a free-tier delayed feed).
-Add a real-time source (Polygon/Alpaca/Tradier) for anything that must
-trade. Delayed data can still inform research if
+Add a real-time source (Public/Finnhub/Alpaca/Tradier — all free, or
+Polygon paid) for anything that must trade. Delayed data can still inform research if
 `data.allow_delayed_for_research: true`.
 
 **AI decisions list `data_gaps`** — expected behavior when a capability
@@ -86,7 +86,7 @@ Cancel from the Orders table if unwanted.
 ## AI
 
 **`Anthropic authentication failed`** — key missing/rotated:
-`aegis vault set anthropic_api_key`.
+`poseidon vault set anthropic_api_key`.
 
 **`rate limited after SDK retries`** — lower the review cadence
 (`ai.review_interval_seconds`) or raise your Anthropic tier.
@@ -107,5 +107,5 @@ cycle safely ends as no-action when the limit hits.
 
 `holiday calendar does not cover today` (health card red, market treated
 as closed): you're running a build older than the shipped calendar years.
-`aegis update apply` or pull the latest — the calendar ships in
+`poseidon update apply` or pull the latest — the calendar ships in
 `core/clock.py` and is maintained two years ahead.

@@ -13,10 +13,10 @@ from unittest.mock import patch
 
 import pytest
 
-from aegis_trader.brokers.plugins.paper import PaperBroker
-from aegis_trader.core.clock import FreshnessPolicy, MarketClock
-from aegis_trader.core.config import RiskConfig
-from aegis_trader.core.enums import (
+from poseidon.brokers.plugins.paper import PaperBroker
+from poseidon.core.clock import FreshnessPolicy, MarketClock
+from poseidon.core.config import RiskConfig
+from poseidon.core.enums import (
     DecisionAction,
     MarketSession,
     OrderSide,
@@ -24,16 +24,16 @@ from aegis_trader.core.enums import (
     OrderType,
     TradingMode,
 )
-from aegis_trader.core.events import EventBus
-from aegis_trader.core.models import Decision, ExitPlan, ProposedTrade, TradeRationale
-from aegis_trader.data.router import DataRouter
-from aegis_trader.execution.approvals import ApprovalQueue
-from aegis_trader.execution.manager import OrderManager
-from aegis_trader.portfolio.state import PortfolioState
-from aegis_trader.portfolio.sync import PortfolioSyncService
-from aegis_trader.risk.engine import RiskEngine
-from aegis_trader.security.audit import AuditLog
-from aegis_trader.storage.db import Database
+from poseidon.core.events import EventBus
+from poseidon.core.models import Decision, ExitPlan, Order, ProposedTrade, TradeRationale
+from poseidon.data.router import DataRouter
+from poseidon.execution.approvals import ApprovalQueue
+from poseidon.execution.manager import OrderManager
+from poseidon.portfolio.state import PortfolioState
+from poseidon.portfolio.sync import PortfolioSyncService
+from poseidon.risk.engine import RiskEngine
+from poseidon.security.audit import AuditLog
+from poseidon.storage.db import Database
 
 from ..conftest import FakeProvider
 
@@ -166,3 +166,35 @@ async def test_sync_baselines_and_drawdown(stack) -> None:
     assert portfolio.account is not None
     assert portfolio.day_start_equity is not None
     assert portfolio.drawdown_pct() >= 0.0
+
+
+class TestManualTrading:
+    """Operator-entered orders: same risk gate, no approval queue."""
+
+    def _manual(self, qty: str = "10", limit: str = "100.05") -> Order:
+        return Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                     quantity=Decimal(qty), limit_price=Decimal(limit), strategy="manual")
+
+    async def test_manual_order_executes_in_autonomous(self, stack) -> None:
+        order = await stack["manager"].submit_manual(self._manual())
+        assert order.status is OrderStatus.FILLED
+        assert order.strategy == "manual"
+        assert order.arrival_price is not None  # TCA benchmark captured
+
+    async def test_manual_order_skips_approval_queue_in_approval_mode(self, stack) -> None:
+        stack["manager"].set_mode(TradingMode.APPROVAL)
+        order = await stack["manager"].submit_manual(self._manual())
+        assert order.status is OrderStatus.FILLED  # the human IS the approver
+        assert stack["approvals"].pending() == []
+
+    async def test_manual_order_refused_in_research(self, stack) -> None:
+        stack["manager"].set_mode(TradingMode.RESEARCH)
+        order = await stack["manager"].submit_manual(self._manual())
+        assert order.status is OrderStatus.REJECTED_HUMAN
+        assert "research mode" in (order.status_reason or "")
+
+    async def test_manual_order_still_passes_risk(self, stack) -> None:
+        # Fat-finger: notional above max_order_notional gets rejected.
+        order = await stack["manager"].submit_manual(self._manual(qty="5000"))
+        assert order.status is OrderStatus.REJECTED_RISK
+        assert order.status_reason

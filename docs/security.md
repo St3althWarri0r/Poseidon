@@ -15,34 +15,34 @@ own MFA — see below).
 ## Credential vault
 
 - All secrets (Anthropic key, provider keys, broker credentials, SMTP/bot
-  tokens) live in `~/.local/share/aegis-trader/vault.bin`.
+  tokens) live in `~/.local/share/poseidon/vault.bin`.
 - Format: versioned header + 16-byte random salt + Fernet token
   (AES-128-CBC + HMAC-SHA256). The key derives from your passphrase with
   scrypt (n=2¹⁵, r=8, p=1).
 - Plaintext secrets exist only in process memory while unlocked; the file
   is written atomically with mode 0600.
-- Unlock paths: interactive prompt, `AEGIS_VAULT_PASSPHRASE`,
-  `AEGIS_VAULT_PASSPHRASE_FILE` (must be 0600), or a systemd encrypted
+- Unlock paths: interactive prompt, `POSEIDON_VAULT_PASSPHRASE`,
+  `POSEIDON_VAULT_PASSPHRASE_FILE` (must be 0600), or a systemd encrypted
   credential (preferred for the service):
 
 ```bash
-systemd-creds encrypt --user --name=aegis-vault-passphrase \
+systemd-creds encrypt --user --name=poseidon-vault-passphrase \
     <(printf '%s' 'YOUR-PASSPHRASE') \
-    ~/.config/aegis-trader/vault-passphrase.cred
+    ~/.config/poseidon/vault-passphrase.cred
 ```
 
 The unit's `LoadCredentialEncrypted=` decrypts it at start (bound to this
 machine's TPM/host key where available) and exposes it only to the service
 process.
 
-- `aegis vault list` shows names only; values are never enumerable.
+- `poseidon vault list` shows names only; values are never enumerable.
 
 ## Multi-factor authentication
 
 Enable MFA on every upstream account: your brokerage(s), data providers,
 and Anthropic console. Broker plugins use token/OAuth mechanisms that
 survive MFA (Schwab's consent flow, tastytrade remember tokens, IBKR's
-gateway login) — Aegis never asks you to weaken account security to
+gateway login) — Poseidon never asks you to weaken account security to
 automate it.
 
 ## Logs & database
@@ -66,7 +66,7 @@ the previous record. The application never updates or deletes audit rows.
 - Startup verifies the whole chain and **refuses to boot** on a mismatch.
 - A nightly job re-verifies and force-opens the circuit breaker on
   failure.
-- `aegis audit verify` / `aegis audit tail` for manual inspection.
+- `poseidon audit verify` / `poseidon audit tail` for manual inspection.
 
 This makes silent history rewriting detectable: an attacker (or a bug)
 that alters a record breaks every subsequent hash.

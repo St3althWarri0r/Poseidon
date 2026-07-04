@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from aegis_trader.core.errors import VaultError, VaultLockedError
-from aegis_trader.security.audit import AuditLog
-from aegis_trader.security.vault import Vault
-from aegis_trader.storage.db import Database
+from poseidon.core.errors import VaultError, VaultLockedError
+from poseidon.security.audit import AuditLog
+from poseidon.security.vault import Vault
+from poseidon.storage.db import Database
 
 
 class TestVault:

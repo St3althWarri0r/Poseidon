@@ -1,11 +1,11 @@
-# Maintainer: local build — CachyOS/Arch native package for Aegis Trader
+# Maintainer: local build — CachyOS/Arch native package for Poseidon
 # Build & install:  cd packaging && makepkg -si
-pkgname=aegis-trader
-pkgver=1.0.0
+pkgname=poseidon
+pkgver=2.1.0
 pkgrel=1
 pkgdesc="Autonomous AI trading platform with Claude as the portfolio manager"
 arch=('any')
-url="https://github.com/St3althWarri0r/Aegis-Trader"
+url="https://github.com/St3althWarri0r/Poseidon"
 license=('MIT')
 depends=('python' 'python-anthropic' 'python-httpx' 'python-pydantic'
          'python-pydantic-settings' 'python-yaml' 'python-structlog'
@@ -18,7 +18,7 @@ sha256sums=()
 
 pkgver() {
   cd "$startdir/.."
-  git describe --tags --always 2>/dev/null | sed 's/^v//;s/-/./g' || echo "1.0.0"
+  git describe --tags --always 2>/dev/null | sed 's/^v//;s/-/./g' || echo "2.1.0"
 }
 
 build() {
@@ -29,14 +29,14 @@ build() {
 package() {
   python -m installer --destdir="$pkgdir" "$srcdir"/dist/*.whl
   cd "$startdir/.."
-  install -Dm644 packaging/aegis-trader.desktop \
-    "$pkgdir/usr/share/applications/aegis-trader.desktop"
-  install -Dm644 config/aegis.example.yaml \
-    "$pkgdir/usr/share/aegis-trader/aegis.example.yaml"
+  install -Dm644 packaging/poseidon.desktop \
+    "$pkgdir/usr/share/applications/poseidon.desktop"
+  install -Dm644 config/poseidon.example.yaml \
+    "$pkgdir/usr/share/poseidon/poseidon.example.yaml"
   # The stock unit points at the venv install; the system package uses /usr/bin.
-  sed 's|ExecStart=.*|ExecStart=/usr/bin/aegis run|' packaging/aegis-trader.service \
-    > "$srcdir/aegis-trader.service"
-  install -Dm644 "$srcdir/aegis-trader.service" \
-    "$pkgdir/usr/lib/systemd/user/aegis-trader.service"
+  sed 's|ExecStart=.*|ExecStart=/usr/bin/poseidon run|' packaging/poseidon.service \
+    > "$srcdir/poseidon.service"
+  install -Dm644 "$srcdir/poseidon.service" \
+    "$pkgdir/usr/lib/systemd/user/poseidon.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

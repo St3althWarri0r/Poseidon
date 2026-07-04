@@ -5,12 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from aegis_trader.analytics.performance import (
+from poseidon.analytics.performance import (
     FillRecord,
     build_round_trips,
     compute_performance,
 )
-from aegis_trader.core.enums import OrderSide
+from poseidon.core.enums import OrderSide
 
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 

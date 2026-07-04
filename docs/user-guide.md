@@ -54,23 +54,120 @@ you're notified). A daily digest lands on your notification channels at
 
 ## The dashboard (http://127.0.0.1:8321)
 
-- **Header**: mode selector, market session, overall health, circuit
-  state, *Run cycle* (manual review), **HALT** (kill switch — opens the
-  circuit breaker until *Resume*).
-- **Tiles**: equity, day P&L, cash/buying power, drawdown, gross/options
-  exposure.
-- **Equity chart** with crosshair inspection.
-- **Risk limits**: live meters for daily/weekly loss and drawdown against
-  their limits, plus the order budget for the day.
-- **Pending approvals** (Mode 2): the proposal with thesis, confidence,
-  max loss, and countdown; Approve/Reject buttons.
-- **Positions / Orders**: live tables; open orders can be canceled.
-- **AI reasoning log**: every decision with its rationale and the data
-  sources actually used.
-- **System / Data providers**: component health, broker connection,
-  provider latency and penalty status.
-- **Event feed**: the live event bus (fills, syncs, violations, health
-  transitions).
+A sidebar-navigated app with six views. The header is always present:
+mode switch (Research / Approval / Auto), market session, **market
+regime**, health, circuit state, *Run cycle*, and **HALT** (kill switch —
+opens the circuit breaker until *Resume*; asks for confirmation). Action
+feedback arrives as toasts; the AI Desk item shows a badge while trades
+await your approval.
+
+- **Overview** — equity, day P&L, cash/buying power, drawdown, exposure,
+  and regime tiles; the equity curve with crosshair inspection; loss-limit
+  meters; allocation; and the live event feed.
+- **Portfolio** — positions (with portfolio weight), the **trade ticket**
+  (your own orders — see *Trading manually*), armed guardian exit plans,
+  and the order blotter (fills show their slippage; open orders can be
+  canceled).
+- **AI Desk** — pending approvals with thesis/confidence/max-loss and
+  countdown; the full reasoning log; AI token usage and estimated spend.
+- **Risk** — 1-day VaR/expected shortfall, portfolio beta, annualized
+  vol, most-correlated pair, the market-regime read (trend, vol
+  percentile, drawdown), loss-limit meters, and metric coverage.
+- **Performance** — portfolio and trade statistics, per-strategy
+  attribution, monthly returns, and the execution-quality (TCA) report.
+- **Algorithms** — the workshop: your saved custom screeners (drafts,
+  active, archived), an editor, and the Claude import/review flow (see
+  *The algorithm workshop*).
+- **System** — component health, data-provider latency/penalty status,
+  scheduler runtime, and the tamper-evident audit trail.
+
+## Trading manually
+
+Claude managing the book never locks you out of it. The Portfolio view's
+trade ticket places your own orders — equities, market/limit/stop, day or
+GTC, extended hours — with a live freshness-graded quote beside the form.
+Manual orders take the exact pipeline AI orders take: **every risk rule**,
+duplicate prevention, broker preflight, lifecycle polling, TCA slippage
+capture, and the audit log (actor: `human`). Two deliberate differences:
+there is no approval queue (you are the approver), and research mode still
+refuses — research means no orders from anyone. Your fills sync into the
+portfolio like any others, so Claude sees and manages around them on the
+next cycle.
+
+## The algorithm workshop
+
+Custom screeners, written by you or by Claude, saved in the platform:
+
+- **Write** one in the Algorithms editor. The contract is a single
+  function — ``async def scan(ctx)`` — with live data (``ctx.quote``,
+  ``ctx.bars``, ``ctx.option_chain``), your watchlist, params, and a
+  read-only portfolio view. It returns signal rows (symbol, direction,
+  strength, evidence). Algorithms are screeners with the same standing as
+  the 16 built-ins: their signals feed Claude's review cycle — they can
+  never place orders directly.
+- **Import** one from anywhere: paste Pine Script, thinkScript,
+  QuantConnect Python, or pseudocode into *Import & Claude review*, add
+  instructions if you like, and Claude analyzes it (flagging lookahead
+  bias, overfit parameters, features that don't translate) and produces a
+  ready-to-save Poseidon implementation when the idea works as a screener
+  — or tells you honestly when it doesn't.
+- **Claude can author them too**: during review cycles the agent can save
+  an algorithm it considers worth running (`propose_algorithm`). Anything
+  Claude writes lands as a **draft** — only you can activate.
+- **Lifecycle**: drafts are validated on save (syntax, the scan contract,
+  and a static screen that rejects file/network/os access); *Activate*
+  compiles it into the live engine immediately; edits to an active
+  algorithm hot-reload; *Deactivate* or archive any time. Every state
+  change is audited. A broken active algorithm demotes itself to draft at
+  startup instead of blocking the platform.
+
+Rotation models (Composer symphonies, tactical allocation trees) port
+naturally: compute the target book and emit one `long` signal per holding
+with `target_weight` in the evidence, plus `exit` signals for holdings
+that fell out — in autonomous mode the AI executes the rebalance through
+the risk engine with no human input. A full indicator suite is
+built in via `ctx.ta` — every Composer function (`rsi` (Wilder), `sma`,
+`ema`, `cumulative_return`, `moving_average_return`, `stdev_price`,
+`stdev_return`, `max_drawdown`, percent units throughout) plus the
+standard desk set (`macd`, `bollinger`, `stochastic`, `atr`, `adx`,
+`obv`, `rate_of_change`, `highest`/`lowest`), with the four most common
+also directly on ctx (`ctx.rsi`, `ctx.sma`, ...). Every function returns
+None on insufficient history — never a guess. Use **Test run** in the
+editor to dry-run any saved algorithm against live data, and
+**Backtest 5y** to replay it through real historical daily bars with the
+anti-lookahead window — target-weight rebalancing, slippage, annual
+returns, Sharpe, drawdown — before activating. Give a concentrated
+rotation model a **sleeve** (% of equity) and its orders may use that
+allocation as their position cap while every other risk rule still
+applies (docs/risk-controls.md#dedicated-sleeves). On first boot the library is
+pre-seeded (as drafts) with four bundled algorithms: faithful ports of
+the operator's three Composer symphonies under their original names, and
+**TQQQ Day Trader** — an intraday 5-minute mean-reversion sibling that
+re-evaluates every review cycle, entering as many times per day as its
+setup appears (zero on quiet days) and flattening into the close. For
+intraday algorithms, set a short `ai.review_interval_seconds` (60–300s)
+and give the algorithm a sleeve.
+
+A word on trust: algorithms run in-process, like installed plugins. The
+static screen is a guardrail against accidents, not a sandbox — read
+anything you paste from the internet before activating it.
+
+## Small accounts (starting with ~$100)
+
+A deliberately small first deposit works, with three adjustments:
+
+- Use a **fractional-shares broker** (Public.com or Alpaca). With a 10%
+  position cap a $100 account trades $10 slices — impossible in whole
+  shares of most ETFs.
+- Leave `min_order_notional` at its $1 default and consider lowering
+  `max_orders_per_day`; more importantly, know that **PDT rules** allow
+  only 3 day trades per rolling 5 sessions in a margin account under
+  $25k (cash accounts are exempt but settle T+1). The intraday
+  algorithm is the one this constrains.
+- Expect metrics noise: at $100, commissions/slippage of cents are
+  whole percentage points. Treat the run as a *behavioral* test — did
+  the platform do exactly what it said, with a perfect audit trail —
+  not a returns test.
 
 ## Approvals (Mode 2)
 
@@ -80,7 +177,7 @@ rejection. After you approve, the risk engine re-validates against fresh
 data before submission — an approval cannot execute in a market that has
 moved outside the limits.
 
-## When Aegis refuses to trade
+## When Poseidon refuses to trade
 
 By design you will see cycles end with *no action* and reasons such as:
 
@@ -97,14 +194,14 @@ reasoning log, the event feed, and notifications.
 ## CLI quick reference
 
 ```
-aegis run                 start (foreground)
-aegis cycle               one review cycle, then exit
-aegis doctor              self-diagnostics
-aegis config validate     check the YAML
-aegis vault set NAME      store/replace a credential
-aegis audit tail -n 50    recent audit records
-aegis audit verify        verify the tamper-evident chain
-aegis update check|apply  self-update (git installs)
+poseidon run                 start (foreground)
+poseidon cycle               one review cycle, then exit
+poseidon doctor              self-diagnostics
+poseidon config validate     check the YAML
+poseidon vault set NAME      store/replace a credential
+poseidon audit tail -n 50    recent audit records
+poseidon audit verify        verify the tamper-evident chain
+poseidon update check|apply  self-update (git installs)
 ```
 
 ## Backtesting & simulation
@@ -113,7 +210,7 @@ The backtester replays the same strategy screeners over historical daily
 bars with anti-lookahead visibility, next-close execution with slippage,
 stops/targets/time exits, and reports return, drawdown, Sharpe, and win
 rate; Monte Carlo, walk-forward, and crisis stress analyses build on the
-result (see `aegis_trader.backtest` and docs/developer-guide.md for
+result (see `poseidon.backtest` and docs/developer-guide.md for
 programmatic use). The AI judgment layer is *not* simulated — historical
 news and calendars don't exist to feed it honestly. Evaluate the full loop
 forward-in-time with the paper broker instead.
