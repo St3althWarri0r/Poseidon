@@ -54,7 +54,9 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Algorithm workshop** — write custom screeners in the dashboard, have
   Claude author them during cycles (always saved as drafts for your
   approval), or paste algorithms from other platforms (Pine Script,
-  thinkScript, ...) for Claude to review and convert. Activate, edit,
+  thinkScript, ...) for Claude to review and convert. One-click
+  **auto-investing** per algorithm (activates it and arms autonomous
+  execution, with a plain-language confirmation). Activate, edit,
   archive — validated, hot-reloaded, audited.
 - **Professional dashboard** — a sidebar-navigated dark UI (Overview,
   Portfolio, AI Desk, Risk, Performance, Algorithms, Account, System) with
@@ -94,7 +96,7 @@ from live, authoritative data providers — never from memory, never estimated.
 - **Operations** — systemd service with watchdog, health monitor, crash
   recovery (orders and baselines resume), auto-reconnect, notifications
   (desktop/email/Discord/Telegram/webhooks), git-channel self-update.
-- **Testing** — 234 unit/integration tests, paper trading, historical
+- **Testing** — 237 unit/integration tests, paper trading, historical
   replay backtester (anti-lookahead), Monte Carlo, walk-forward, and
   crisis stress scenarios.
 
@@ -110,6 +112,7 @@ poseidon vault set anthropic_api_key
 poseidon vault set finnhub_api_key  # + any other providers you enable
 poseidon config validate
 poseidon run                        # dashboard at http://127.0.0.1:8321
+poseidon app                        # or: open it as a desktop app window
 ```
 
 Native package: `cd packaging && makepkg -si`. Docker: `docker compose -f

@@ -260,7 +260,8 @@ class ApplicationKernel:
 
     # ------------------------------------------------------- broker connection
 
-    def _broker_config_for(self, name: str, *, paper: bool) -> BrokerConfig:
+    def _broker_config_for(self, name: str, *, paper: bool,
+                           options: dict[str, object] | None = None) -> BrokerConfig:
         entry = next((e for e in broker_catalog() if e["name"] == name), None)
         if entry is None or not entry.get("connectable"):
             reason = str(entry.get("stub_reason", "")) if entry else "unknown broker"
@@ -269,23 +270,27 @@ class ApplicationKernel:
             )
         # Inherit what the operator already configured in poseidon.yaml for
         # this broker (options like ibkr's gateway_url, or a custom credential
-        # name) — the dashboard switch must not silently discard them.
+        # name) — the dashboard switch must not silently discard them. Form
+        # options (paper starting_cash, reset) layer on top.
         existing = next((b for b in self.config.brokers if b.name == name), None)
         credential = (existing.credential if existing and existing.credential
                       else str(entry.get("credential", "")))
-        options = dict(existing.options) if existing else {}
+        merged_options: dict[str, object] = dict(existing.options) if existing else {}
+        merged_options.update(options or {})
         return BrokerConfig(name=name, enabled=True, primary=True,
-                            credential=credential, paper=paper, options=options)
+                            credential=credential, paper=paper, options=merged_options)
 
     async def broker_connection_test(self, name: str, *, paper: bool,
-                                     credentials: dict[str, str] | None) -> dict[str, object]:
+                                     credentials: dict[str, str] | None,
+                                     options: dict[str, object] | None = None) -> dict[str, object]:
         """Prove a broker connection end-to-end (auth + account fetch) without
         touching the active broker, the vault, or any config. ``credentials``
         None means use the credential already stored in the vault."""
-        cfg = self._broker_config_for(name, paper=paper)
+        cfg = self._broker_config_for(name, paper=paper, options=options)
         if name == "paper":
             # The test instance shares the active paper broker's state file;
-            # it may read the simulated account but must never write it back.
+            # it may read the simulated account but must never write it back
+            # (a requested reset shows the fresh numbers without committing).
             cfg.options["read_only"] = True
         broker = await self._build_broker(cfg, credentials_override=credentials)
         try:
@@ -303,7 +308,8 @@ class ApplicationKernel:
                 await broker.disconnect()
 
     async def switch_broker(self, name: str, *, paper: bool,
-                            credentials: dict[str, str] | None) -> dict[str, object]:
+                            credentials: dict[str, str] | None,
+                            options: dict[str, object] | None = None) -> dict[str, object]:
         """Connect a brokerage from the Account view and make it the active
         broker, live — no restart.
 
@@ -322,8 +328,11 @@ class ApplicationKernel:
                     f"{self.broker.display_name or self.broker.name} — cancel them or let "
                     "them finish before switching brokers"
                 )
-            cfg = self._broker_config_for(name, paper=paper)
+            cfg = self._broker_config_for(name, paper=paper, options=options)
             new_broker = await self._build_broker(cfg, credentials_override=credentials)
+            # A simulator reset is a one-shot action, never persisted config —
+            # a restart must not silently wipe the paper book again.
+            cfg.options.pop("reset", None)
             try:
                 if credentials is not None and cfg.credential:
                     await asyncio.to_thread(self.vault.set, cfg.credential,
@@ -370,6 +379,14 @@ class ApplicationKernel:
             await self.audit.append("human", "broker.switched", {
                 "from": old.name, "to": new_broker.name, "paper": new_broker.is_paper,
             })
+            if isinstance(old, PaperBroker) and isinstance(new_broker, PaperBroker):
+                # Both share the simulator state file; the NEW instance owns
+                # it now (it may have just been reset) — the old one's
+                # disconnect must not write its stale book back.
+                old.make_read_only()
+            if isinstance(new_broker, PaperBroker) and (options or {}).get("reset"):
+                # The switch is fully persisted — NOW commit the fresh book.
+                new_broker.commit_state()
             with contextlib.suppress(Exception):
                 await old.disconnect()
         finally:
@@ -873,6 +890,7 @@ class ApplicationKernel:
         return {
             "version": __version__,
             "mode": self.order_manager.mode.value,
+            "cycle_running": self._cycle_lock.locked(),
             "market_session": self.clock.session().value,
             "broker": {"name": self.broker.name, "paper": self.broker.is_paper,
                        "connected": self.broker.connected},

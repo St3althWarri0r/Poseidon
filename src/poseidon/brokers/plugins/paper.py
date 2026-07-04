@@ -58,6 +58,12 @@ class PaperBroker(Broker):
         """Wired by the kernel after the data router exists."""
         self._quote_fn = fn
 
+    def make_read_only(self) -> None:
+        """Stop this instance from ever writing the state file again — used
+        when a replacement paper instance now owns that file (e.g. a reset),
+        so this one's stale book cannot clobber it on disconnect."""
+        self._read_only = True
+
     def capabilities(self) -> frozenset[BrokerCapability]:
         return frozenset(
             {
@@ -70,8 +76,17 @@ class PaperBroker(Broker):
         )
 
     async def connect(self) -> None:
-        self._load_state()
+        if not self._options.get("reset"):
+            self._load_state()
+        # reset: start from the clean in-memory book (cash = starting_cash)
+        # WITHOUT touching the state file yet — the kernel calls
+        # commit_state() only after the whole switch has been persisted, so
+        # an aborted switch leaves the old book intact on disk.
         self._connected = True
+
+    def commit_state(self) -> None:
+        """Explicitly persist the current book (used to finalize a reset)."""
+        self._save_state()
 
     async def disconnect(self) -> None:
         self._save_state()

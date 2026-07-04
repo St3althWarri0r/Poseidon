@@ -455,3 +455,5 @@ label input, label select { width: 100%; min-width: 0; }
 
 /* [hidden] must win over display rules like .form-row { display: grid } */
 [hidden] { display: none !important; }
+
+.chip.auto { border-color: var(--good); color: var(--good); background: var(--good-soft); }

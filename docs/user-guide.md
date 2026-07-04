@@ -90,6 +90,9 @@ The Account view connects a real brokerage without touching a terminal:
 
 1. Pick a broker tile (Public, Alpaca, Tradier, tastytrade, Schwab, IBKR —
    the paper simulator is a tile too, so you can always switch back).
+   A tile marked *fees may apply* shows a cost note in its form (the
+   platform itself is always free; some brokers bill for extras like IBKR
+   market-data subscriptions).
 2. Enter the credentials the form asks for. They are written **only to the
    encrypted vault**, never to a file; a saved credential can be reused by
    leaving the fields blank.
@@ -97,14 +100,41 @@ The Account view connects a real brokerage without touching a terminal:
    buying power) without changing anything.
 4. **Connect & switch** re-proves the connection, stores the credential,
    persists the choice (`poseidon.local.yaml` — safe to delete to revert),
-   and hot-swaps the active broker. No restart needed.
+   and hot-swaps the active broker. No restart needed. **Sync now** pulls
+   the account fresh at any time.
+
+The paper tile takes a **Starting cash** amount — entering one resets the
+simulator to a fresh account at that balance (with a confirmation).
 
 Safety rails: switching never changes the operating mode (a LIVE account in
 research mode still cannot trade); the switch is refused while any order is
 open; and equity history, loss baselines, and peak-drawdown tracking are
-per-broker, so a paper history can never trip a halt on your real account.
-Brokers without an official self-service API (Fidelity, Vanguard, M1,
-Robinhood equities, …) are listed with the reason they cannot be connected.
+per-broker-and-environment, so a paper history can never trip a halt on
+your real account. Brokers without an official self-service API (Fidelity,
+Vanguard, M1, Robinhood equities, …) cannot be connected at any price —
+there is no compliant interface to them; see docs/broker-setup.md's status
+matrix.
+
+## Auto-investing an algorithm
+
+Every algorithm card in the workshop has **▶ Start auto-investing**: it
+activates the algorithm *and* switches Poseidon to autonomous mode (with a
+confirmation spelling out exactly what that means), so Claude executes the
+algorithm's signals within every risk limit from the next cycle on. The
+status line under the editor always states plainly whether an algorithm is
+auto-investing, feeding approvals, or signals-only. Prefer to confirm each
+trade yourself? *Activate (signals only)* + Approval mode gives you a
+one-click approval queue instead. *Stop / deactivate* ends it.
+
+## The desktop app
+
+`poseidon app` (also the **Poseidon** entry in your application menu) opens
+the dashboard as its own desktop window — no tabs, no URL bar. It uses a
+native window when `pip install poseidon[gui]` (pywebview) is installed,
+otherwise a Chromium app-mode window. The engine itself stays a background
+service: closing the window never stops trading. If the engine isn't
+running, `poseidon app` starts the systemd service when it can, or tells
+you exactly what to run.
 
 ## Chatting with Claude
 

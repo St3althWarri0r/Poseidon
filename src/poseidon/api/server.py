@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from ..ai.chat import ChatBusyError
@@ -115,8 +115,15 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             return await call_next(request)
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html")
+    async def index() -> Response:
+        # Version-stamp the asset URLs (?v=x.y.z) so a browser can never pair
+        # a new backend with cached old JS/CSS — the "I updated but see the
+        # old dashboard" class of confusion.
+        from .. import __version__
+
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(html.replace("__V__", __version__),
+                            headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/status")
     async def status() -> JSONResponse:
@@ -436,7 +443,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             "mode": kernel.order_manager.mode.value,
         })
 
-    def _broker_request(body: dict[str, Any]) -> tuple[str, bool, dict[str, str] | None]:
+    def _broker_request(
+        body: dict[str, Any],
+    ) -> tuple[str, bool, dict[str, str] | None, dict[str, object]]:
         name = str(body.get("name", "")).strip()
         if not name:
             raise HTTPException(status_code=422, detail="broker name required")
@@ -446,16 +455,31 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         if isinstance(raw, dict):
             # Drop blank optional fields so plugins see only real values.
             credentials = {str(k): str(v).strip() for k, v in raw.items() if str(v).strip()}
-        return name, paper, credentials
+        options: dict[str, object] = {}
+        raw_options = body.get("options")
+        if isinstance(raw_options, dict):
+            # Whitelist: only the option keys the catalog advertises for this
+            # broker (plus the one-shot reset flag) may cross the API — never
+            # internal plugin knobs like state_file or read_only.
+            entry = next((e for e in broker_catalog() if e["name"] == name), None)
+            allowed: set[str] = {"reset"}
+            if entry is not None:
+                fields = entry.get("option_fields")
+                if isinstance(fields, list):
+                    allowed.update(str(f["key"]) for f in fields
+                                   if isinstance(f, dict) and "key" in f)
+            options = {str(k): v for k, v in raw_options.items()
+                       if str(k) in allowed and str(v).strip() != ""}
+        return name, paper, credentials, options
 
     @app.post("/api/brokers/test")
     async def broker_test(body: dict[str, Any]) -> JSONResponse:
         """Prove auth + account access without changing anything. Failures are
         a normal outcome here, so they come back 200 with ok=false."""
-        name, paper, credentials = _broker_request(body)
+        name, paper, credentials, options = _broker_request(body)
         try:
             account = await kernel.broker_connection_test(
-                name, paper=paper, credentials=credentials)
+                name, paper=paper, credentials=credentials, options=options)
         except (BrokerError, ConfigError, VaultError, DataError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)})
         return JSONResponse({"ok": True, "account": account})
@@ -465,12 +489,24 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         """Store credentials in the vault, persist the choice, and hot-swap
         the active broker. The trading mode is untouched — connecting a live
         account in research mode still cannot place an order."""
-        name, paper, credentials = _broker_request(body)
+        name, paper, credentials, options = _broker_request(body)
         try:
-            result = await kernel.switch_broker(name, paper=paper, credentials=credentials)
+            result = await kernel.switch_broker(
+                name, paper=paper, credentials=credentials, options=options)
         except (BrokerError, ConfigError, VaultError, DataError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "broker": result})
+
+    @app.post("/api/sync")
+    async def sync_now() -> JSONResponse:
+        """Manual portfolio sync — pull the account from the broker right now."""
+        try:
+            await kernel.sync.sync_once()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"sync failed: {exc}") from exc
+        return JSONResponse({"ok": True,
+                             "synced_at": kernel.portfolio.synced_at.isoformat()
+                             if kernel.portfolio.synced_at else None})
 
     # ----------------------------------------------------------------- AI chat
 

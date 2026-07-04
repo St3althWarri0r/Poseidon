@@ -51,7 +51,7 @@ function toast(message, kind = "") {
 /* ================= routing ================= */
 
 const VIEWS = {
-  overview:    { title: "Overview",    refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshEquity(), refreshRiskMetrics()]) },
+  overview:    { title: "Overview",    refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshEquity(), refreshRiskMetrics(), refreshAlgorithms()]) },
   portfolio:   { title: "Portfolio",   refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshOrders(), refreshExitPlans()]) },
   algorithms:  { title: "Algorithms",  refresh: () => Promise.allSettled([refreshStatus(), refreshAlgorithms()]) },
   ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage(), refreshChat()]) },
@@ -101,11 +101,30 @@ async function refreshStatus() {
   $("#btn-resume").hidden = !s.risk.circuit_open;
   $("#btn-halt").hidden = !!s.risk.circuit_open;
 
+  const cycleBtn = $("#btn-cycle");
+  cycleBtn.disabled = !!s.cycle_running;
+  cycleBtn.textContent = s.cycle_running ? "Cycle running…" : "Run cycle";
+
   renderRiskMeters(s.risk, "#risk-meters");
   renderRiskMeters(s.risk, "#risk-meters-2");
   renderSystem(s.health.components, s.broker);
   renderProviders(s.providers);
   renderRuntime(s);
+  updateAutomationTile();
+}
+
+function updateAutomationTile() {
+  const tile = $("#t-auto");
+  if (!tile || !lastStatus) return;
+  const active = algoCache.filter((a) => a.status === "active").length;
+  const mode = lastStatus.mode;
+  tile.textContent = mode === "autonomous" ? "AUTO" : mode;
+  tile.className = "tile-value tile-value-sm" + (mode === "autonomous" && active ? " neg" : "");
+  $("#t-auto-sub").textContent =
+    active ? `${active} algorithm${active === 1 ? "" : "s"} active` +
+             (mode === "autonomous" ? " — executing" :
+              mode === "approval" ? " — trades need your OK" : " — signals only")
+           : "no algorithms active";
 }
 
 function meter(label, used, limit, note) {
@@ -174,8 +193,11 @@ function renderRuntime(s) {
 
 /* ================= portfolio ================= */
 
+let lastPortfolio = null;
+
 async function refreshPortfolio() {
   const p = await getJSON("/api/portfolio");
+  lastPortfolio = p;
   const account = p.account || {};
   const equity = Number(account.equity) || 0;
   $("#t-equity").textContent = fmtUsd(account.equity);
@@ -204,11 +226,42 @@ async function refreshPortfolio() {
         <td class="num">${fmtUsd(pos.avg_entry_price)}</td>
         <td class="num">${fmtUsd(pos.market_value)}</td>
         <td class="num">${equity > 0 ? fmtPct(value / equity, 1) : "—"}</td>
-        <td class="num ${upl > 0 ? "pos" : upl < 0 ? "neg" : ""}">${fmtUsd(upl)}</td></tr>`;
+        <td class="num ${upl > 0 ? "pos" : upl < 0 ? "neg" : ""}">${fmtUsd(upl)}</td>
+        <td><button class="btn btn-sm" data-close-pos="${esc(pos.symbol)}"
+              data-close-qty="${esc(pos.quantity)}" title="Prefill the ticket to exit this position">Close</button></td></tr>`;
       }).join("")
-    : '<tr><td colspan="6" class="empty">no positions</td></tr>';
+    : '<tr><td colspan="7" class="empty">no positions</td></tr>';
+  tbody.querySelectorAll("[data-close-pos]").forEach((btn) =>
+    btn.addEventListener("click", () =>
+      prefillCloseTicket(btn.dataset.closePos, btn.dataset.closeQty)));
 
   renderAllocation(positions, account.equity);
+  renderFills(p.recent_fills || []);
+  updateNotional();
+}
+
+function prefillCloseTicket(symbol, qty) {
+  // Exiting a long = sell; covering a short = buy. Same risk-gated pipeline.
+  const numQty = Number(qty);
+  $("#tk-symbol").value = symbol;
+  $("#tk-qty").value = String(Math.abs(numQty));
+  $("#tk-side").value = numQty >= 0 ? "sell" : "buy";
+  $("#tk-type").value = "limit";
+  $("#tk-limit").value = ""; // let the fresh quote seed it
+  ticketQuote();
+  $("#tk-submit").scrollIntoView({ behavior: "smooth", block: "center" });
+  toast(`Ticket prefilled to close ${symbol} — review and submit`, "warn");
+}
+
+function renderFills(fills) {
+  const el = $("#fills");
+  if (!el) return;
+  el.innerHTML = fills.length
+    ? [...fills].reverse().map((f) =>
+        `<div class="kv"><span class="k">${f.filled_at ? new Date(f.filled_at).toLocaleTimeString() : "—"}
+           <span class="sym">${esc(f.symbol)}</span></span>
+         <span class="v">${esc(f.side)} ${esc(f.quantity)} @ ${fmtUsd(f.price)}</span></div>`).join("")
+    : '<div class="empty">no fills yet</div>';
 }
 
 function renderAllocation(positions, equity) {
@@ -394,31 +447,57 @@ function statusClass(status) {
   return "";
 }
 
+let workingOrderIds = [];
+
 async function refreshOrders() {
   const data = await getJSON("/api/orders");
   const tbody = $("#orders-table tbody");
   const orders = data.orders || [];
+  workingOrderIds = orders
+    .filter((o) => ["submitted", "accepted", "partially_filled"].includes(o.status))
+    .map((o) => o.id);
+  $("#orders-hint").textContent = workingOrderIds.length
+    ? `${workingOrderIds.length} working · most recent first` : "most recent first";
+  $("#orders-cancel-all").hidden = workingOrderIds.length < 2;
   tbody.innerHTML = orders.length
     ? orders.map((o) => {
         const open = ["submitted", "accepted", "partially_filled"].includes(o.status);
         const slip = o.slippage_bps != null ? ` · ${Number(o.slippage_bps).toFixed(1)}bps` : "";
+        const filledQty = Number(o.filled_quantity) || 0;
+        const fill = filledQty > 0
+          ? `${o.filled_quantity}/${o.quantity}` +
+            (o.avg_fill_price ? ` @ ${fmtUsd(o.avg_fill_price)}` : "")
+          : "—";
         return `<tr>
         <td>${o.created_at ? new Date(o.created_at).toLocaleTimeString() : "—"}</td>
         <td><span class="sym">${esc(o.symbol)}</span></td>
         <td>${esc(o.side)}</td>
         <td class="num">${esc(o.quantity)}</td>
         <td class="num">${o.limit_price ? fmtUsd(o.limit_price) : "mkt"}</td>
+        <td class="num">${esc(fill)}</td>
         <td><span class="status-tag ${statusClass(o.status)}">${esc(o.status)}</span>${slip}</td>
         <td>${esc(o.status_reason || "")}</td>
         <td>${open ? `<button class="btn btn-sm" data-cancel="${esc(o.id)}">Cancel</button>` : ""}</td></tr>`;
       }).join("")
-    : '<tr><td colspan="8" class="empty">no orders yet</td></tr>';
+    : '<tr><td colspan="9" class="empty">no orders yet</td></tr>';
   tbody.querySelectorAll("[data-cancel]").forEach((btn) =>
     btn.addEventListener("click", () =>
       postJSON(`/api/orders/${btn.dataset.cancel}/cancel`)
         .then(() => { toast("Cancel requested", "warn"); refreshOrders(); })
         .catch((e) => toast("Cancel failed: " + e.message, "bad"))));
 }
+
+$("#orders-cancel-all").addEventListener("click", async () => {
+  const ids = [...workingOrderIds];
+  if (!ids.length) return;
+  if (!window.confirm(`Cancel all ${ids.length} working orders?`)) return;
+  const results = await Promise.allSettled(
+    ids.map((id) => postJSON(`/api/orders/${id}/cancel`)));
+  const failed = results.filter((r) => r.status === "rejected").length;
+  toast(failed ? `Canceled ${ids.length - failed}/${ids.length} — ${failed} failed`
+               : `Canceled all ${ids.length} working orders`, failed ? "bad" : "warn");
+  refreshOrders().catch(() => {});
+});
 
 async function refreshDecisions() {
   const data = await getJSON("/api/decisions");
@@ -461,13 +540,14 @@ async function refreshApprovals() {
         return `<div class="approval">
           <div class="head">${esc(o.side)} ${esc(o.quantity)} ${esc(o.symbol)} @ ${o.limit_price ? fmtUsd(o.limit_price) : "mkt"}</div>
           ${r ? `<p>${esc(r.thesis)}</p><p class="expiry">confidence ${fmtPct(r.confidence, 0)} · max loss ${esc(r.max_expected_loss)}</p>` : ""}
-          <div class="expiry">expires in ${Math.floor(a.seconds_remaining / 60)}m ${a.seconds_remaining % 60}s — then it is auto-rejected</div>
+          <div class="expiry" data-deadline="${Date.now() + a.seconds_remaining * 1000}"></div>
           <div class="actions">
             <button class="btn btn-approve" data-approve="${esc(o.id)}">Approve</button>
             <button class="btn btn-reject" data-reject="${esc(o.id)}">Reject</button>
           </div></div>`;
       }).join("")
     : '<div class="empty">nothing awaiting approval</div>';
+  tickApprovalCountdowns();
   el.querySelectorAll("[data-approve]").forEach((b) =>
     b.addEventListener("click", () =>
       postJSON(`/api/approvals/${b.dataset.approve}`, { approve: true })
@@ -479,6 +559,20 @@ async function refreshApprovals() {
         .then(() => { toast("Rejected", "warn"); refreshApprovals(); })
         .catch((e) => toast("Reject failed: " + e.message, "bad"))));
 }
+
+function tickApprovalCountdowns() {
+  // A hard deadline must visibly move: tick every second, not every 30s poll.
+  $$("#approvals .expiry[data-deadline]").forEach((el) => {
+    const left = Math.floor((Number(el.dataset.deadline) - Date.now()) / 1000);
+    if (left > 0) {
+      el.textContent = `expires in ${Math.floor(left / 60)}m ${left % 60}s — then it is auto-rejected`;
+    } else {
+      el.textContent = "expired — auto-rejected";
+      el.closest(".approval")?.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    }
+  });
+}
+setInterval(tickApprovalCountdowns, 1000);
 
 /* ================= performance / execution / AI usage ================= */
 
@@ -592,6 +686,13 @@ function connectWebsocket() {
     if (evt.topic === "ai.approval_requested") toast("New trade awaiting your approval", "warn");
     if (evt.topic === "risk.violation") toast(`Risk: ${evt.payload?.rule ?? "violation"}`, "warn");
     if (evt.topic === "risk.circuit_opened") toast("Circuit breaker OPEN — trading halted", "bad");
+    if (evt.topic === "ai.decision") {
+      const trades = (evt.payload?.trades || []).length;
+      toast(`Cycle complete: ${evt.payload?.action ?? "decision"}` +
+            (trades ? ` — ${trades} trade${trades === 1 ? "" : "s"} proposed` : ""), "good");
+      refreshStatus().catch(() => {});
+      if (!$("#decisions").closest(".view").hidden) refreshDecisions().catch(() => {});
+    }
 
     if (["ai.approval_requested", "order.filled", "order.rejected"].includes(evt.topic)) {
       refreshApprovals().catch(() => {});
@@ -611,6 +712,26 @@ function connectWebsocket() {
 
 /* ================= trade ticket ================= */
 
+let tkLastPrice = null; // last/reference price for the notional readout
+
+function updateNotional() {
+  const el = $("#tk-notional");
+  if (!el) return;
+  const qty = Number($("#tk-qty").value);
+  const px = Number($("#tk-limit").value) || tkLastPrice;
+  if (!Number.isFinite(qty) || qty <= 0 || !px) { el.hidden = true; return; }
+  const notional = qty * px;
+  const bp = lastPortfolio && lastPortfolio.account
+    ? Number(lastPortfolio.account.buying_power) : null;
+  const over = bp != null && $("#tk-side").value === "buy" && notional > bp;
+  el.hidden = false;
+  el.innerHTML = `Est. notional <strong>${fmtUsd(notional)}</strong>` +
+    (bp != null ? ` · buying power ${fmtUsd(bp)}` : "") +
+    (over ? ' · <span class="neg">exceeds buying power</span>' : "");
+}
+["#tk-qty", "#tk-limit"].forEach((s) => $(s).addEventListener("input", updateNotional));
+$("#tk-side").addEventListener("change", updateNotional);
+
 async function ticketQuote() {
   const symbol = $("#tk-symbol").value.trim().toUpperCase();
   if (!symbol) return;
@@ -618,6 +739,7 @@ async function ticketQuote() {
   box.textContent = "fetching live quote…";
   try {
     const q = await getJSON(`/api/quote/${encodeURIComponent(symbol)}`);
+    tkLastPrice = q.last ? Number(q.last) : null;
     if (q.reference) {
       // Market not in regular session: this is the last real print, labeled.
       // Display only — it must not seed the order form.
@@ -631,7 +753,9 @@ async function ticketQuote() {
         ` · last ${fmtUsd(q.last)} <small>(${esc(q.source)}, ${esc(q.freshness)})</small>`;
       if (!$("#tk-limit").value && q.last) $("#tk-limit").value = Number(q.last).toFixed(2);
     }
+    updateNotional();
   } catch (e) {
+    tkLastPrice = null;
     box.textContent = "no quote available — " + String(e.message).slice(0, 160);
   }
 }
@@ -702,13 +826,16 @@ async function refreshAlgorithms() {
         <div class="head"><span class="name">${esc(a.name)}</span>
           ${a.created_by === "claude" ? '<span class="chip claude">claude</span>' : ""}
           ${a.sleeve_pct ? `<span class="chip">sleeve ${(a.sleeve_pct * 100).toFixed(0)}%</span>` : ""}
-          <span class="chip ${esc(a.status)}">${esc(a.status)}</span></div>
+          ${a.status === "active" && lastStatus && lastStatus.mode === "autonomous"
+            ? '<span class="chip auto">auto-investing</span>'
+            : `<span class="chip ${esc(a.status)}">${esc(a.status)}</span>`}</div>
         ${a.description ? `<div class="desc">${esc(a.description)}</div>` : ""}
         <div class="meta">updated ${new Date(a.updated_at).toLocaleString()}</div>
       </div>`).join("")
     : '<div class="empty">nothing saved yet — write one in the editor, ask Claude during a cycle, or import below</div>';
   $("#algo-list").querySelectorAll("[data-algo]").forEach((row) =>
     row.addEventListener("click", () => selectAlgo(row.dataset.algo)));
+  updateAutomationTile(); // status and algorithms load concurrently — render on whichever lands last
 }
 
 function selectAlgo(id) {
@@ -733,6 +860,7 @@ function selectAlgo(id) {
   $("#al-deactivate").hidden = a.status !== "active";
   $("#al-delete").hidden = false;
   $("#al-new").hidden = false;
+  renderAutoInvestState(a);
   refreshAlgorithms();
 }
 
@@ -744,7 +872,8 @@ function clearAlgoEditor() {
   $("#al-notes").hidden = true;
   $("#al-save").hidden = false;
   $("#al-testout").hidden = true;
-  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test", "#al-bt-controls"]
+  ["#al-update", "#al-activate", "#al-deactivate", "#al-delete", "#al-new", "#al-test",
+   "#al-bt-controls", "#al-autoinvest", "#al-autostate"]
     .forEach((s) => ($(s).hidden = true));
   refreshAlgorithms();
 }
@@ -779,6 +908,59 @@ $("#al-save").addEventListener("click", () =>
   }, "Draft saved"));
 $("#al-update").addEventListener("click", () =>
   algoAction(() => putJSON(`/api/algorithms/${selectedAlgo}`, algoBody()), "Saved"));
+function renderAutoInvestState(a) {
+  const mode = lastStatus ? lastStatus.mode : null;
+  const state = $("#al-autostate");
+  const btn = $("#al-autoinvest");
+  state.hidden = false;
+  if (a.status === "active" && mode === "autonomous") {
+    btn.hidden = true;
+    state.textContent = "Auto-investing is ON: this algorithm's signals feed every review cycle "
+      + "and Claude executes trades within the risk limits. Stop / deactivate ends it.";
+  } else if (a.status === "active" && mode === "approval") {
+    btn.hidden = false;
+    state.textContent = "Active — signals feed every cycle; proposed trades wait for your approval "
+      + "(approval mode). Start auto-investing switches the platform to autonomous.";
+  } else if (a.status === "active") {
+    btn.hidden = false;
+    state.textContent = "Active — signals only: research mode never trades. "
+      + "Start auto-investing switches the platform to autonomous execution.";
+  } else {
+    btn.hidden = false;
+    state.textContent = "Not scanning yet. Activate makes its signals feed review cycles; "
+      + "Start auto-investing also puts the platform in autonomous mode so trades execute.";
+  }
+}
+
+$("#al-autoinvest").addEventListener("click", async () => {
+  const a = algoCache.find((x) => x.id === selectedAlgo);
+  if (!a) return;
+  const mode = lastStatus ? lastStatus.mode : "research";
+  const broker = (lastStatus && lastStatus.broker) || {};
+  const liveNote = broker.paper === false
+    ? `\n\nACTIVE BROKER IS LIVE (${broker.name}) — trades will use real money.` : "";
+  if (mode !== "autonomous" && !window.confirm(
+      `Start auto-investing with "${a.name}"?\n\n` +
+      "This activates the algorithm AND switches Poseidon to AUTONOMOUS mode: Claude will " +
+      "execute trades from its signals within every risk limit, without asking first." + liveNote +
+      "\n\n(Prefer confirming each trade yourself? Cancel here, Activate the algorithm, and " +
+      "use Approval mode in the header instead.)")) return;
+  const btn = $("#al-autoinvest");
+  btn.disabled = true;
+  try {
+    if (a.status !== "active") await postJSON(`/api/algorithms/${a.id}/activate`);
+    if (mode !== "autonomous") await postJSON("/api/mode", { mode: "autonomous" });
+    toast(`Auto-investing: ${a.name} is live`, "warn");
+    await refreshStatus();
+    await refreshAlgorithms();
+    selectAlgo(a.id);
+  } catch (e) {
+    toast("Could not start auto-investing: " + String(e.message).slice(0, 200), "bad");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 $("#al-activate").addEventListener("click", () =>
   algoAction(async () => {
     await postJSON(`/api/algorithms/${selectedAlgo}/activate`);
@@ -1035,18 +1217,28 @@ async function refreshAccount() {
     <button type="button" class="broker-tile ${selectedBroker === b.name ? "selected" : ""}" data-broker="${esc(b.name)}">
       <span class="name">${esc(b.display_name)}${b.is_current ? " ✓" : ""}</span>
       <span class="sub">${b.paper_choice === "live_only" ? "live only"
-        : b.paper_choice === "always" ? "simulation" : "paper or live"}${b.credential_saved ? " · key saved" : ""}</span>
+        : b.paper_choice === "always" ? "simulation" : "paper or live"}${b.credential_saved ? " · key saved" : ""}${b.cost_note ? " · fees may apply" : ""}</span>
     </button>`).join("");
   $("#broker-list").querySelectorAll("[data-broker]").forEach((el) =>
     el.addEventListener("click", () => selectBroker(el.dataset.broker)));
-
-  const stubs = brokerCatalog.filter((b) => !b.connectable);
-  $("#broker-stubs").innerHTML = stubs.length
-    ? stubs.map((b) =>
-        `<div class="stub-row"><span class="name">${esc(b.display_name)}</span>
-         <span class="why">${esc(b.stub_reason || b.notes || "no dashboard setup available")}</span></div>`).join("")
-    : '<div class="empty">every installed broker plugin is connectable</div>';
 }
+
+$("#acct-sync").addEventListener("click", async () => {
+  const btn = $("#acct-sync");
+  btn.disabled = true;
+  btn.textContent = "Syncing…";
+  try {
+    await postJSON("/api/sync");
+    toast("Portfolio synced", "good");
+    refreshAccount().catch(() => {});
+    refreshPortfolio().catch(() => {});
+  } catch (e) {
+    toast("Sync failed: " + String(e.message).slice(0, 200), "bad");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sync now";
+  }
+});
 
 function selectBroker(name) {
   const b = brokerCatalog.find((x) => x.name === name);
@@ -1058,7 +1250,15 @@ function selectBroker(name) {
   form.hidden = false;
   $("#bf-title").textContent = "Connect " + b.display_name;
   $("#bf-notes").textContent = b.notes || "";
+  const costEl = $("#bf-cost");
+  costEl.hidden = !b.cost_note;
+  costEl.textContent = b.cost_note ? "Cost note: " + b.cost_note : "";
   $("#bf-result").hidden = true;
+  $("#bf-options").innerHTML = (b.option_fields || []).map((f) => `
+    <div class="form-row"><label class="wide">${esc(f.label)}${f.optional ? " <small>(optional)</small>" : ""}
+      <input data-opt="${esc(f.key)}" type="text" inputmode="decimal"
+        placeholder="${esc(f.placeholder || "")}" autocomplete="off">
+      ${f.help ? `<small>${esc(f.help)}</small>` : ""}</label></div>`).join("");
   const saved = b.credential_saved;
   $("#bf-fields").innerHTML = (b.fields || []).map((f) => `
     <div class="form-row"><label class="wide">${esc(f.label)}${f.optional ? " <small>(optional)</small>" : ""}
@@ -1107,7 +1307,20 @@ function brokerPayload() {
   // send an explicit empty credentials object so the server doesn't try a
   // vault lookup that cannot succeed.
   const sendCreds = any || (!required.length && !b.credential_saved);
-  return { name: b.name, paper, ...(sendCreds ? { credentials: creds } : {}) };
+  const options = {};
+  $$("#bf-options [data-opt]").forEach((inp) => {
+    const v = inp.value.trim();
+    if (v) options[inp.dataset.opt] = v;
+  });
+  if (b.name === "paper" && options.starting_cash) {
+    const cash = Number(options.starting_cash.replace(/[$,\s]/g, ""));
+    if (!Number.isFinite(cash) || cash <= 0) throw new Error("starting cash must be a positive number");
+    options.starting_cash = String(cash);
+    options.reset = true; // setting an amount means: fresh simulator at that balance
+  }
+  return { name: b.name, paper,
+           ...(sendCreds ? { credentials: creds } : {}),
+           ...(Object.keys(options).length ? { options } : {}) };
 }
 
 $("#bf-test").addEventListener("click", async () => {
@@ -1140,7 +1353,11 @@ $("#broker-form").addEventListener("submit", async (evt) => {
   const b = brokerCatalog.find((x) => x.name === selectedBroker);
   if (!body.paper && !window.confirm(
       `Switch to your LIVE ${b.display_name} account?\n\nOrders (in approval/autonomous mode) will use real money. ` +
+      (b.cost_note ? "\n\nCost note: " + b.cost_note + " " : "") +
       "The operating mode is not changed by connecting.")) return;
+  if (body.options && body.options.reset && !window.confirm(
+      `Reset the paper simulator to $${Number(body.options.starting_cash).toLocaleString()}?\n\n` +
+      "Paper positions and history start over. No real account is affected.")) return;
   const btn = $("#bf-connect");
   btn.disabled = true;
   btn.textContent = "Connecting…";

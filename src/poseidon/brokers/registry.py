@@ -93,6 +93,12 @@ _CONNECT_META: dict[str, dict[str, object]] = {
     "paper": {
         "credential": "",
         "fields": [],
+        "option_fields": [
+            _field("starting_cash", "Starting cash (USD)", optional=True,
+                   placeholder="100000",
+                   help_text="Entering an amount RESETS the simulator to a fresh account "
+                             "with this balance (positions and paper history start over)."),
+        ],
         "paper_choice": "always",  # simulation only
         "notes": "Built-in simulator. Fills are priced from live quotes; no real money moves.",
     },
@@ -113,6 +119,8 @@ _CONNECT_META: dict[str, dict[str, object]] = {
         ],
         "paper_choice": "toggle",
         "notes": "Paper mode targets the free developer sandbox.",
+        "cost_note": "Live API access is free with a funded Tradier brokerage account "
+                     "(the sandbox needs no account at all).",
     },
     "tastytrade": {
         "credential": "tasty_creds",
@@ -147,6 +155,8 @@ _CONNECT_META: dict[str, dict[str, object]] = {
         "paper_choice": "toggle",
         "notes": "Requires IBKR's Client Portal Gateway running locally (you log in there); "
                  "paper vs live follows the gateway login.",
+        "cost_note": "IBKR's API is free, but live market-data subscriptions at IBKR can "
+                     "carry monthly exchange fees billed by IBKR.",
     },
     "public": {
         "credential": "public_api_secret",
@@ -182,8 +192,10 @@ def broker_catalog() -> list[dict[str, object]]:
             entry.update({
                 "credential": meta["credential"],
                 "fields": meta["fields"],
+                "option_fields": meta.get("option_fields", []),
                 "paper_choice": meta["paper_choice"],
                 "notes": meta["notes"],
+                "cost_note": meta.get("cost_note", ""),
             })
         elif not stub:
             # Connectable class without UI metadata (e.g. an external

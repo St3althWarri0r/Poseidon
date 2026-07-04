@@ -66,6 +66,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_app(args: argparse.Namespace) -> int:
+    """Open the dashboard as a desktop window (starting the engine's systemd
+    service if needed). The engine keeps trading when the window closes."""
+    config = _load(args)
+    from .gui import launch
+
+    return launch(f"http://{config.dashboard.host}:{config.dashboard.port}")
+
+
 def cmd_cycle(args: argparse.Namespace) -> int:
     config = _load(args)
     configure_logging(config.data_dir / "logs", config.log_level)
@@ -265,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("run", help="start the platform").set_defaults(func=cmd_run)
+    sub.add_parser("app", help="open the dashboard as a desktop window").set_defaults(func=cmd_app)
     sub.add_parser("cycle", help="run a single review cycle and exit").set_defaults(func=cmd_cycle)
     sub.add_parser("doctor", help="self-diagnostics").set_defaults(func=cmd_doctor)
 

@@ -58,6 +58,53 @@ def test_catalog_live_only_brokers() -> None:
     assert by_name["schwab"]["paper_choice"] == "live_only"
 
 
+def test_catalog_paper_starting_cash_and_cost_notes() -> None:
+    by_name = {e["name"]: e for e in broker_catalog()}
+    keys = [f["key"] for f in by_name["paper"]["option_fields"]]
+    assert "starting_cash" in keys
+    assert by_name["ibkr"]["cost_note"]  # fees warning surfaces in the UI
+    assert by_name["public"]["cost_note"] == ""  # free stays unmarked
+
+
+async def test_paper_reset_starts_fresh_at_chosen_cash(tmp_path) -> None:
+    state = str(tmp_path / "paper.json")
+    first = PaperBroker(credentials={}, options={"starting_cash": "100000",
+                                                 "state_file": state})
+    await first.connect()
+    await first.disconnect()  # persists the $100k book
+    reset = PaperBroker(credentials={}, options={"starting_cash": "2500",
+                                                 "state_file": state, "reset": True})
+    await reset.connect()
+    account = await reset.account()
+    assert account.cash == Decimal("2500")
+    await reset.disconnect()
+    # And the reset persisted: a normal instance now loads the fresh book.
+    third = PaperBroker(credentials={}, options={"state_file": state})
+    await third.connect()
+    assert (await third.account()).cash == Decimal("2500")
+    await third.disconnect()
+
+
+async def test_old_paper_instance_cannot_clobber_reset(tmp_path) -> None:
+    # Paper->paper switch with a reset: the OLD instance's disconnect (which
+    # saves state) must not write its stale book over the fresh one.
+    state = str(tmp_path / "paper.json")
+    old = PaperBroker(credentials={}, options={"starting_cash": "100000",
+                                               "state_file": state})
+    await old.connect()
+    fresh = PaperBroker(credentials={}, options={"starting_cash": "2500",
+                                                 "state_file": state, "reset": True})
+    await fresh.connect()   # fresh in-memory book; nothing written yet
+    old.make_read_only()    # what switch_broker does before disconnecting it
+    fresh.commit_state()    # ...and this once the switch is fully persisted
+    await old.disconnect()
+    check = PaperBroker(credentials={}, options={"state_file": state})
+    await check.connect()
+    assert (await check.account()).cash == Decimal("2500")
+    await check.disconnect()
+    await fresh.disconnect()
+
+
 # ---------------------------------------------------------------- overlay
 
 
