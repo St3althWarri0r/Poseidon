@@ -13,6 +13,7 @@ import json
 import signal
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import structlog
 
@@ -114,6 +115,8 @@ class ApplicationKernel:
             default_symbols=cfg.all_watchlist_symbols(),
             sleeve_caps=self.risk.sleeve_caps,
         )
+        bundled = Path(__file__).resolve().parents[2] / "examples" / "algorithms"
+        await self.workshop.seed_bundled(bundled)
         await self.workshop.load_active()
         dispatcher = ToolDispatcher(
             self.router, self.portfolio, self.risk,

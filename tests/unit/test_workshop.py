@@ -197,7 +197,7 @@ class TestFTLTExample:
 
     def _source(self) -> str:
         import pathlib
-        return pathlib.Path("examples/algorithms/tqqq_ftlt.py").read_text()
+        return pathlib.Path("examples/algorithms/tqqq_long_term_strategy_refined.py").read_text()
 
     def test_validates_and_compiles(self) -> None:
         source = self._source()
@@ -312,7 +312,7 @@ class TestSecondExampleAndDryRun:
     def test_lts_v1_validates_and_compiles(self) -> None:
         import pathlib
 
-        source = pathlib.Path("examples/algorithms/tqqq_lts_v1.py").read_text()
+        source = pathlib.Path("examples/algorithms/tqqq_long_term_strategy_v1.py").read_text()
         assert validate_algorithm(source) == []
         CustomAlgorithm(algo_name="tqqq_lts_v1", source=source, symbols=[])
 
@@ -438,3 +438,47 @@ class TestSleeves:
                 await shop.create(name="bad", source=GOOD_SOURCE, sleeve_pct=1.5)
         finally:
             await db.close()
+
+
+class TestBundledSeeding:
+    async def test_examples_seed_once_as_drafts(self, tmp_path) -> None:  # noqa: ANN001
+        db = Database(tmp_path / "seed.db")
+        await db.open()
+        try:
+            shop = AlgorithmWorkshop(db, StrategyEngine([], ["AAPL"]), AuditLog(db),
+                                     default_symbols=["AAPL"])
+            count = await shop.seed_bundled("examples/algorithms")
+            assert count == 4
+            names = {a["name"] for a in await shop.list_all()}
+            assert names == {"tqqq_long_term_strategy_refined", "tqqq_long_term_strategy_v1",
+                             "tqqq_long_term_strategy_v2", "tqqq_day_trader"}
+            assert all(a["status"] == "draft" for a in await shop.list_all())
+            # Second boot: nothing re-seeds (deletions stay deleted).
+            first = (await shop.list_all())[0]
+            await shop.delete(first["id"])
+            assert await shop.seed_bundled("examples/algorithms") == 0
+            assert len(await shop.list_all()) == 3
+        finally:
+            await db.close()
+
+
+class TestV2AndDayTrader:
+    def test_v2_validates_and_compiles(self) -> None:
+        import pathlib
+
+        source = pathlib.Path("examples/algorithms/tqqq_long_term_strategy_v2.py").read_text()
+        assert validate_algorithm(source) == []
+        CustomAlgorithm(algo_name="v2", source=source, symbols=[])
+
+    async def test_day_trader_runs_and_respects_state(self) -> None:
+        import pathlib
+
+        source = pathlib.Path("examples/algorithms/tqqq_day_trader.py").read_text()
+        assert validate_algorithm(source) == []
+        router = DataRouter([(FakeProvider(name="feed", bars_count=280), 10)],
+                            FreshnessPolicy())
+        algo = CustomAlgorithm(algo_name="tqqq_day_trader", source=source, symbols=[])
+        signals = await algo.scan(router, PortfolioState())
+        # Flat fake data: RSI is neutral, so no entry — and that's correct
+        # behavior for a day trader with no setup. It must never raise.
+        assert all(s.direction in ("long", "exit") for s in signals)

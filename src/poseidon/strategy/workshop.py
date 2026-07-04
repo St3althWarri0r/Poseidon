@@ -245,6 +245,39 @@ class AlgorithmWorkshop:
                                   "total_return": report["total_return"]})
         return report
 
+    async def seed_bundled(self, directory: Any) -> int:
+        """First boot: load the bundled example algorithms (the operator's
+        Composer ports and the intraday day trader) into the library as
+        drafts. Runs exactly once per database — deletions and edits are
+        never overwritten afterwards."""
+        from pathlib import Path
+
+        directory = Path(directory)
+        if await self._db.kv_get("workshop_seeded") or not directory.is_dir():
+            return 0
+        count = 0
+        for path in sorted(directory.glob("*.py")):
+            name = self._clean_name(path.stem)
+            exists = await self._db.fetch_one(
+                "SELECT 1 FROM algorithms WHERE name = ?", (name,)
+            )
+            if exists:
+                continue
+            source = path.read_text(encoding="utf-8")
+            first_line = source.lstrip().splitlines()[0].lstrip("# ").strip()
+            try:
+                await self.create(name=path.stem, source=source,
+                                  description=first_line,
+                                  review_notes="bundled example — review before activating")
+                count += 1
+            except ConfigError as exc:
+                log.error("bundled algorithm failed validation; skipped",
+                          file=path.name, error=str(exc))
+        await self._db.kv_set("workshop_seeded", True)
+        if count:
+            log.info("bundled algorithms seeded as drafts", count=count)
+        return count
+
     async def load_active(self) -> int:
         """Startup: compile and register every active algorithm. One broken
         algorithm demotes itself to draft (with a note) instead of blocking

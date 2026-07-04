@@ -139,8 +139,14 @@ anti-lookahead window — target-weight rebalancing, slippage, annual
 returns, Sharpe, drawdown — before activating. Give a concentrated
 rotation model a **sleeve** (% of equity) and its orders may use that
 allocation as their position cap while every other risk rule still
-applies (docs/risk-controls.md#dedicated-sleeves). `examples/algorithms/` ships two
-complete faithful symphony ports as templates.
+applies (docs/risk-controls.md#dedicated-sleeves). On first boot the library is
+pre-seeded (as drafts) with four bundled algorithms: faithful ports of
+the operator's three Composer symphonies under their original names, and
+**TQQQ Day Trader** — an intraday 5-minute mean-reversion sibling that
+re-evaluates every review cycle, entering as many times per day as its
+setup appears (zero on quiet days) and flattening into the close. For
+intraday algorithms, set a short `ai.review_interval_seconds` (60–300s)
+and give the algorithm a sleeve.
 
 A word on trust: algorithms run in-process, like installed plugins. The
 static screen is a guardrail against accidents, not a sandbox — read
