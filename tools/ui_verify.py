@@ -133,7 +133,8 @@ class FakeWorkshop:
              "created_at": NOW.isoformat(), "updated_at": NOW.isoformat()},
             {"id": "a2", "name": "tqqq_day_trader", "description": "draft", "source": "async def scan(ctx):\n    return []",
              "symbols": [], "params": {}, "status": "draft", "created_by": "claude",
-             "review_notes": "", "sleeve_pct": 0,
+             # Marks it as a bundled starter so the Dry Run panel offers to activate it.
+             "review_notes": "bundled example — review before activating", "sleeve_pct": 0,
              "created_at": NOW.isoformat(), "updated_at": NOW.isoformat()},
         ]
 
@@ -289,6 +290,9 @@ class FakeKernel:
         self.mode = mode
         self.order_manager.mode = mode
 
+    async def run_review_cycle(self):
+        return None
+
 
 async def drive() -> None:
     from playwright.async_api import async_playwright
@@ -299,7 +303,9 @@ async def drive() -> None:
         browser = await pw.chromium.launch(executable_path=exe) if exe \
             else await pw.chromium.launch()
         page = await browser.new_page(viewport={"width": 1600, "height": 1000})
-        page.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+        dialog_messages: list[str] = []
+        page.on("dialog", lambda d: (dialog_messages.append(d.message),
+                                     asyncio.ensure_future(d.accept())))
         js_errors: list[str] = []
         page.on("pageerror", lambda e: js_errors.append(str(e)))
 
@@ -426,6 +432,44 @@ async def drive() -> None:
         toasts = await page.text_content("#toasts")
         check("sync now", toasts is not None and "synced" in toasts.lower(), repr(toasts))
         await page.screenshot(path=f"{SHOTS}/v-account.png")
+
+        # -- Dry Run: the guided paper-dry-run panel -----------------------
+        await page.click('a[data-view="dryrun"]')
+        await page.wait_for_timeout(400)
+        banner = await page.text_content("#dryrun-banner")
+        check("dry run safe banner", banner is not None and "no real money" in banner.lower(),
+              repr(banner))
+        steps = await page.locator("#dryrun-steps .dryrun-step").count()
+        check("dry run has three steps", steps == 3, f"count={steps}")
+        market = await page.text_content("#dryrun-market")
+        check("dry run market indicator", market is not None and "market" in market.lower(),
+              repr(market))
+        await page.click("#dryrun-mode-toggle")  # paper broker -> no real-money confirm needed
+        await page.wait_for_timeout(400)
+        mode_state = await page.text_content("#dryrun-mode-state")
+        check("dry run autonomous engaged", mode_state is not None
+              and "autonomous" in mode_state.lower(), repr(mode_state))
+        await page.click("#dryrun-run-now")
+        await page.wait_for_timeout(300)
+        toasts = await page.text_content("#toasts")
+        check("dry run run-now", toasts is not None and "cycle" in toasts.lower(), repr(toasts))
+        await page.click("#dryrun-stop")
+        await page.wait_for_timeout(400)
+        mode_state = await page.text_content("#dryrun-mode-state")
+        check("dry run stop -> research", mode_state is not None
+              and "research" in mode_state.lower(), repr(mode_state))
+        await page.screenshot(path=f"{SHOTS}/v-dryrun.png")
+
+        # Regression: on the paper broker, the autonomous confirm must NOT warn
+        # about real money (that warning is for live brokers only).
+        dialog_messages.clear()
+        await page.click('#mode-seg button[data-mode="autonomous"]')
+        await page.wait_for_timeout(300)
+        joined = " ".join(dialog_messages).lower()
+        check("paper autonomous confirm omits 'real money'",
+              "autonomous" in joined and "real money" not in joined, repr(dialog_messages))
+        await page.click('#mode-seg button[data-mode="research"]')  # reset for later checks
+        await page.wait_for_timeout(200)
 
         # -- Algorithms: auto-invest flow ----------------------------------
         await page.click('a[data-view="algorithms"]')

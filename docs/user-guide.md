@@ -126,6 +126,19 @@ auto-investing, feeding approvals, or signals-only. Prefer to confirm each
 trade yourself? *Activate (signals only)* + Approval mode gives you a
 one-click approval queue instead. *Stop / deactivate* ends it.
 
+## Paper dry run
+
+Before trading real money, run the whole autonomous stack — Claude *and* the
+built-in algorithms — against the **paper** account, risk-free. Open the
+**Dry Run** view in the left nav and turn on its three transparent steps:
+**Paper broker**, **built-in algorithms active**, and **Autonomous mode**. A
+persistent "PAPER — no real money" banner makes clear it is a safe simulation,
+and a market-open indicator tells you whether trades can fill yet. Use **Run a
+review cycle now** to trigger Claude on demand instead of waiting for the
+scheduler (trades only fill during market hours). **Stop dry run** returns the
+platform to Research mode. Nothing on this view can touch a live account — it
+only ever engages autonomous mode on the paper simulator.
+
 ## The desktop app
 
 `poseidon app` (also the **Poseidon** entry in your application menu) opens

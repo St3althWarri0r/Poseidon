@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+# The review note stamped on bundled example algorithms when first seeded.
+# The dashboard's Dry Run panel uses it to recognise the built-in starters.
+BUNDLED_REVIEW_NOTE = "bundled example — review before activating"
+
 _COLUMNS = ("id, name, description, source, symbols, params, status, "
             "created_by, review_notes, sleeve_pct, created_at, updated_at")
 
@@ -313,7 +317,7 @@ class AlgorithmWorkshop:
             try:
                 await self.create(name=path.stem, source=source,
                                   description=first_line,
-                                  review_notes="bundled example — review before activating")
+                                  review_notes=BUNDLED_REVIEW_NOTE)
                 count += 1
             except ConfigError as exc:
                 log.error("bundled algorithm failed validation; skipped",

@@ -37,6 +37,9 @@
     <a href="#/account" data-view="account">
       <svg viewBox="0 0 20 20"><path d="M10 2l8 5H2l8-5M4 9v6M8 9v6M12 9v6M16 9v6M2 17h16"/></svg>
       <span>Account</span></a>
+    <a href="#/dryrun" data-view="dryrun">
+      <svg viewBox="0 0 20 20"><path d="M4 10a6 6 0 1 1 12 0 6 6 0 0 1-12 0M10 6v4l3 2"/></svg>
+      <span>Dry Run</span></a>
     <a href="#/system" data-view="system">
       <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/><path d="M10 2v3M10 15v3M2 10h3M15 10h3M4.5 4.5l2 2M13.5 13.5l2 2M15.5 4.5l-2 2M6.5 13.5l-2 2"/></svg>
       <span>System</span></a>
@@ -245,6 +248,18 @@
         </form>
       </div>
     </div>
+  </section>
+
+  <!-- ============ Dry Run ============ -->
+  <section class="view" data-view="dryrun" hidden>
+    <p class="meter-note good" id="dryrun-banner">PAPER — no real money. This is a safe simulation of the full autonomous stack.</p>
+    <div id="dryrun-steps"></div>
+    <p class="meter-note" id="dryrun-market"></p>
+    <div class="ticket-actions">
+      <button type="button" class="btn" id="dryrun-run-now">Run a review cycle now</button>
+      <button type="button" class="btn btn-ghost" id="dryrun-stop">Stop dry run (back to Research)</button>
+    </div>
+    <p class="meter-note" id="dryrun-summary"></p>
   </section>
 
   <!-- ============ Risk ============ -->
