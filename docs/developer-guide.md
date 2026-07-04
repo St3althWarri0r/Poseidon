@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-git clone https://github.com/St3althWarri0r/Aegis-Trader && cd Aegis-Trader
+git clone https://github.com/St3althWarri0r/Poseidon && cd Poseidon
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest            # 203 tests, a few seconds

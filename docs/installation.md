@@ -6,8 +6,8 @@ Python 3.11+.
 ## Option A — one-command installer (recommended)
 
 ```bash
-git clone https://github.com/St3althWarri0r/Aegis-Trader
-cd Aegis-Trader
+git clone https://github.com/St3althWarri0r/Poseidon
+cd Poseidon
 ./install.sh
 ```
 

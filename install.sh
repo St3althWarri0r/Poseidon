@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Poseidon — one-command installer for CachyOS / Arch (and other Linux).
 #
-#   git clone https://github.com/St3althWarri0r/Aegis-Trader && cd Aegis-Trader && ./install.sh
+#   git clone https://github.com/St3althWarri0r/Poseidon && cd Poseidon && ./install.sh
 #
 # What it does:
 #   1. verifies python >= 3.11 (offers pacman hints on Arch/CachyOS)

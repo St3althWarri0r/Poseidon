@@ -5,7 +5,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Autonomous AI trading platform with Claude as the portfolio manager"
 arch=('any')
-url="https://github.com/St3althWarri0r/Aegis-Trader"
+url="https://github.com/St3althWarri0r/Poseidon"
 license=('MIT')
 depends=('python' 'python-anthropic' 'python-httpx' 'python-pydantic'
          'python-pydantic-settings' 'python-yaml' 'python-structlog'

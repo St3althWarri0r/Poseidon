@@ -95,8 +95,8 @@ from live, authoritative data providers — never from memory, never estimated.
 ## Quick start (CachyOS / Arch)
 
 ```bash
-git clone https://github.com/St3althWarri0r/Aegis-Trader
-cd Aegis-Trader
+git clone https://github.com/St3althWarri0r/Poseidon
+cd Poseidon
 ./install.sh                     # one command: venv, config, service, doctor
 
 poseidon vault init                 # create the encrypted credential vault
