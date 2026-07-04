@@ -34,3 +34,4 @@ config/poseidon.yaml
 .idea/
 .vscode/
 *.swp
+tools/ui-verify-shots/
