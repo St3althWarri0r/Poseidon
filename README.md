@@ -63,6 +63,9 @@ from live, authoritative data providers — never from memory, never estimated.
   live tiles, equity curve, Claude chat, approvals with one-click actions,
   toasts, and the full audit trail. No frameworks, no CDNs —
   self-contained and localhost-only.
+- **Market-study terminal** — the full Bloomberg-style Trading-Terminal
+  (charts, fundamentals, news, watchlist) embedded at `/terminal`, served
+  natively by Poseidon with keyless Yahoo data (`docs/terminal.md`).
 - **Execution quality (TCA)** — arrival price captured at risk validation,
   signed slippage in bps on every fill, and a standing best-execution
   report (fill rate, per-side/per-symbol cost, time-to-fill).
