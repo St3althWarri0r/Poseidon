@@ -12,13 +12,24 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
 import httpx
 import structlog
 
 from poseidon.core.errors import DataError
+
+from .constants import (
+    COMMODITIES,
+    CRYPTO,
+    CURRENCIES,
+    FUTURES,
+    MAJOR_INDICES,
+    RANGE_CONFIG,
+    RATES,
+    SECTOR_ETFS,
+)
 
 T = TypeVar("T")
 
@@ -345,3 +356,150 @@ def normalize_fundamentals(sym: str, qs: Any) -> dict[str, Any]:
             "numberOfAnalysts": num(fd.get("numberOfAnalystOpinions")),
         },
     }
+
+
+_cache = TTLCache()
+
+_Q2 = "https://query2.finance.yahoo.com"
+_MODULES = "assetProfile,summaryDetail,financialData,defaultKeyStatistics,price"
+
+
+async def _quotes_uncached(clean: list[str]) -> list[dict[str, Any]]:
+    async def one_call(symbols: str) -> list[Any]:
+        raw = await session().get_json(f"{_Q2}/v7/finance/quote",
+                                       {"symbols": symbols}, needs_crumb=True)
+        result = (raw or {}).get("quoteResponse", {}).get("result") or []
+        return [q for q in result if q and q.get("quoteType") != "NONE"]
+
+    try:
+        rows = await one_call(",".join(clean))
+    except DataError:
+        # Graceful degradation: one bad symbol can't blank an entire panel.
+        results = await asyncio.gather(*(one_call(s) for s in clean),
+                                       return_exceptions=True)
+        rows = [r[0] for r in results if isinstance(r, list) and r]
+    return [normalize_quote(q) for q in rows]
+
+
+async def get_quotes(symbols: list[str]) -> list[dict[str, Any]]:
+    clean = sorted({s for s in (safe_sym(x) for x in symbols) if s})
+    if not clean:
+        return []
+    return await _cache.get_or_fetch(
+        f"quotes:{','.join(clean)}", 10.0, lambda: _quotes_uncached(clean))
+
+
+def _period1(range_key: str) -> int:
+    spec = RANGE_CONFIG[range_key]
+    now = datetime.now().astimezone()
+    if spec.days == "ytd":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif spec.days == "max":
+        return 86_400  # 1970-01-02, mirroring lib/yahoo.ts
+    else:
+        start = now - timedelta(days=int(spec.days))
+    return int(start.timestamp())
+
+
+async def get_chart(symbol: str, range_key: str) -> dict[str, Any]:
+    if range_key not in RANGE_CONFIG:
+        raise DataError(f"Invalid range: {range_key}")
+    sym = safe_sym(symbol)
+    ttl = 30.0 if range_key in ("1D", "5D") else 120.0
+
+    async def fetch() -> dict[str, Any]:
+        raw = await session().get_json(f"{_Q2}/v8/finance/chart/{sym}", {
+            "period1": str(_period1(range_key)),
+            "period2": str(int(datetime.now().timestamp())),
+            "interval": RANGE_CONFIG[range_key].interval,
+            "includePrePost": "true",
+            "events": "div|split|earn",
+        })
+        result = ((raw or {}).get("chart", {}).get("result") or [{}])[0] or {}
+        meta = result.get("meta") or {}
+        return {
+            "symbol": text(meta.get("symbol"), sym),
+            "currency": text(meta.get("currency"), "USD"),
+            "exchangeName": text(meta.get("fullExchangeName")) or text(meta.get("exchangeName")),
+            "regularMarketPrice": num(meta.get("regularMarketPrice")),
+            "previousClose": num(meta.get("previousClose"))
+            if num(meta.get("previousClose")) is not None
+            else num(meta.get("chartPreviousClose")),
+            "candles": normalize_candles(result),
+        }
+
+    return await _cache.get_or_fetch(f"chart:{sym}:{range_key}", ttl, fetch)
+
+
+async def search_symbols(q: str) -> list[dict[str, Any]]:
+    query = q.strip()
+    if not query:
+        return []
+
+    async def fetch() -> list[dict[str, Any]]:
+        raw = await session().get_json(f"{_Q2}/v1/finance/search", {
+            "q": query, "quotesCount": "10", "newsCount": "0",
+            "lang": "en-US", "region": "US",
+        })
+        return normalize_search((raw or {}).get("quotes"))
+
+    return await _cache.get_or_fetch(f"search:{query.lower()}", 60.0, fetch)
+
+
+async def get_news(symbol: str | None) -> list[dict[str, Any]]:
+    query = safe_sym(symbol) if symbol and symbol.strip() else "stock market"
+
+    async def fetch() -> list[dict[str, Any]]:
+        raw = await session().get_json(f"{_Q2}/v1/finance/search", {
+            "q": query, "quotesCount": "0", "newsCount": "12",
+            "lang": "en-US", "region": "US",
+        })
+        return normalize_news((raw or {}).get("news"))
+
+    # Short TTL so the panel's manual refresh pulls genuinely fresh headlines.
+    return await _cache.get_or_fetch(f"news:{query.lower()}", 30.0, fetch)
+
+
+async def get_fundamentals(symbol: str) -> dict[str, Any]:
+    sym = safe_sym(symbol)
+
+    async def fetch() -> dict[str, Any]:
+        raw = await session().get_json(f"{_Q2}/v10/finance/quoteSummary/{sym}", {
+            "modules": _MODULES, "formatted": "false",
+        }, needs_crumb=True)
+        result = ((raw or {}).get("quoteSummary", {}).get("result") or [{}])[0]
+        return normalize_fundamentals(sym, simplify_raw(result))
+
+    return await _cache.get_or_fetch(f"fundamentals:{sym}", 6 * 3600.0, fetch)
+
+
+async def _quotes_for(universe: tuple[tuple[str, str], ...]) -> list[dict[str, Any]]:
+    try:
+        quotes = await get_quotes([s for s, _ in universe])
+    except DataError:
+        return []
+    by_sym = {q["symbol"]: q for q in quotes}
+    return [by_sym[s] for s, _ in universe if s in by_sym]  # configured display order
+
+
+async def get_market_overview() -> dict[str, Any]:
+    async def fetch() -> dict[str, Any]:
+        indices, futures, rates, commodities, crypto, currencies, sector_quotes = (
+            await asyncio.gather(
+                _quotes_for(MAJOR_INDICES), _quotes_for(FUTURES), _quotes_for(RATES),
+                _quotes_for(COMMODITIES), _quotes_for(CRYPTO), _quotes_for(CURRENCIES),
+                _quotes_for(SECTOR_ETFS),
+            ))
+        names = dict(SECTOR_ETFS)
+        sectors = sorted(
+            ({"symbol": q["symbol"], "name": names.get(q["symbol"], q["symbol"]),
+              "changePercent": q["changePercent"]} for q in sector_quotes),
+            key=lambda s: s["changePercent"]
+            if s["changePercent"] is not None else float("-inf"),
+            reverse=True,
+        )
+        return {"indices": indices, "futures": futures, "rates": rates,
+                "commodities": commodities, "crypto": crypto,
+                "currencies": currencies, "sectors": sectors}
+
+    return await _cache.get_or_fetch("market-overview", 15.0, fetch)
