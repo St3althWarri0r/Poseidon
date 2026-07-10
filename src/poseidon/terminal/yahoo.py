@@ -7,11 +7,17 @@ only — never used by the trading data router or risk engine.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
+
+import httpx
+import structlog
+
+from poseidon.core.errors import DataError
 
 T = TypeVar("T")
 
@@ -77,3 +83,70 @@ class TTLCache:
         now = time.monotonic()
         for k in [k for k, (exp, _) in self._store.items() if exp <= now]:
             del self._store[k]
+
+
+log = structlog.get_logger(__name__)
+
+_UA = "Mozilla/5.0 (compatible; poseidon-terminal/1.0)"
+_CRUMB_URL = "https://query1.finance.yahoo.com/v1/test/getcrumb"
+_COOKIE_URLS = ("https://fc.yahoo.com/", "https://finance.yahoo.com/quote/AAPL")
+
+
+class YahooSession:
+    """Shared httpx client with Yahoo's cookie+crumb handshake."""
+
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        self._client = client or httpx.AsyncClient(
+            timeout=10.0, follow_redirects=True, headers={"User-Agent": _UA})
+        self._crumb: str | None = None
+        self._lock = asyncio.Lock()
+
+    async def _bootstrap(self) -> None:
+        async with self._lock:
+            for cookie_url in _COOKIE_URLS:
+                try:
+                    await self._client.get(cookie_url)  # any status; sets cookies
+                    r = await self._client.get(_CRUMB_URL, headers={
+                        "origin": "https://finance.yahoo.com",
+                        "referer": "https://finance.yahoo.com/quote/AAPL",
+                        "accept": "*/*",
+                    })
+                    if r.status_code == 200 and r.text and "<" not in r.text:
+                        self._crumb = r.text.strip()
+                        return
+                except httpx.HTTPError as exc:
+                    log.debug("terminal.crumb_bootstrap_failed", url=cookie_url, err=str(exc))
+        raise DataError("Yahoo crumb handshake failed")
+
+    async def get_json(self, url: str, params: dict[str, str], *,
+                       needs_crumb: bool = False) -> Any:
+        for attempt in (1, 2):
+            q = dict(params)
+            if needs_crumb:
+                if self._crumb is None:
+                    await self._bootstrap()
+                q["crumb"] = self._crumb or ""
+            try:
+                r = await self._client.get(url, params=q)
+            except httpx.HTTPError as exc:
+                raise DataError(f"Yahoo request failed: {exc}") from exc
+            if r.status_code in (401, 403) and needs_crumb and attempt == 1:
+                self._crumb = None  # stale crumb — re-handshake once
+                continue
+            if r.status_code != 200:
+                raise DataError(f"Yahoo returned HTTP {r.status_code}")
+            return r.json()
+        raise DataError("Yahoo auth retry exhausted")  # pragma: no cover
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+_session: YahooSession | None = None
+
+
+def session() -> YahooSession:
+    global _session
+    if _session is None:
+        _session = YahooSession()
+    return _session
