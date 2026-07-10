@@ -18,6 +18,7 @@ from decimal import Decimal
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
 
+import poseidon.terminal.yahoo as terminal_yahoo  # noqa: E402
 from poseidon.api.server import build_app  # noqa: E402
 from poseidon.core.config import AppConfig  # noqa: E402
 from poseidon.core.enums import MarketSession, OrderSide, TradingMode  # noqa: E402
@@ -36,6 +37,61 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
     if not cond:
         FAILURES.append(name)
+
+
+def _stub_terminal_data() -> None:
+    """Monkeypatch poseidon.terminal.yahoo so /api/terminal routes (which call
+    through the module attribute, e.g. `yahoo.get_quotes`) return plausible
+    data with no real Yahoo traffic."""
+    q = {"symbol": "AAPL", "name": "Apple Inc.", "quoteType": "EQUITY",
+         "currency": "USD", "exchange": "NasdaqGS", "marketState": "REGULAR",
+         "price": 314.66, "change": 1.25, "changePercent": 0.4,
+         "previousClose": 313.39, "open": 310.45, "dayHigh": 315.5,
+         "dayLow": 308.16, "volume": 26_390_000, "avgVolume": 54_440_000,
+         "marketCap": 4.62e12, "trailingPE": 38.05, "forwardPE": None,
+         "eps": 7.1, "dividendYield": 0.0044, "beta": 1.2,
+         "fiftyTwoWeekHigh": 317.4, "fiftyTwoWeekLow": 201.5,
+         "fiftyDayAverage": None, "twoHundredDayAverage": None,
+         "sharesOutstanding": None, "postMarketPrice": None,
+         "postMarketChange": None, "postMarketChangePercent": None,
+         "preMarketPrice": None, "preMarketChange": None,
+         "preMarketChangePercent": None}
+
+    async def quotes(symbols: list[str]) -> list[dict]:
+        return [dict(q, symbol=s, name=s) for s in symbols]
+
+    async def market() -> dict:
+        row = dict(q)
+        return {"indices": [row], "futures": [row], "rates": [row],
+                "commodities": [row], "crypto": [row], "currencies": [row],
+                "sectors": [{"symbol": "XLK", "name": "Technology",
+                             "changePercent": 1.9}]}
+
+    async def chart(symbol: str, range_key: str) -> dict:
+        candles = [{"time": 1_752_000_000 + i * 86_400, "open": 300.0 + i,
+                    "high": 302.0 + i, "low": 299.0 + i, "close": 301.0 + i,
+                    "volume": 1_000_000} for i in range(30)]
+        return {"symbol": symbol, "currency": "USD", "exchangeName": "NasdaqGS",
+                "regularMarketPrice": 314.66, "previousClose": 313.39,
+                "candles": candles}
+
+    async def news(symbol: str | None) -> list[dict]:
+        return [{"id": "n1", "title": "Markets rally on strong earnings",
+                 "publisher": "STUBWIRE", "link": "https://example.com",
+                 "publishedAt": 1_752_000_000_000, "thumbnail": None,
+                 "tickers": ["AAPL"]}]
+
+    async def funda(symbol: str) -> dict:
+        return {"symbol": symbol, "profile": {"name": symbol, "sector": "Tech",
+                "industry": None, "employees": None, "country": None,
+                "city": None, "website": None, "summary": None},
+                "valuation": {}, "financials": {}, "perShare": {}, "targets": {}}
+
+    terminal_yahoo.get_quotes = quotes  # type: ignore[assignment]
+    terminal_yahoo.get_market_overview = market  # type: ignore[assignment]
+    terminal_yahoo.get_chart = chart  # type: ignore[assignment]
+    terminal_yahoo.get_news = news  # type: ignore[assignment]
+    terminal_yahoo.get_fundamentals = funda  # type: ignore[assignment]
 
 
 class FakeDB:
@@ -316,6 +372,8 @@ async def drive() -> None:
         await page.wait_for_timeout(600)
         auto = await page.text_content("#t-auto-sub")
         check("overview automation tile", auto is not None and "algorithm" in auto, repr(auto))
+        check("nav: terminal entry present",
+              await page.locator('nav a[href="/terminal/"]').count() == 1)
         await page.screenshot(path=f"{SHOTS}/v-overview.png")
 
         # -- Portfolio: Close button, notional, Fill column, fills tape ---
@@ -495,6 +553,20 @@ async def drive() -> None:
             await page.wait_for_timeout(500)
             await page.screenshot(path=f"{SHOTS}/v-{view}.png")
 
+        # -- Embedded terminal ---------------------------------------------
+        resp = await page.goto(f"{base}/terminal/")
+        check("terminal: bundle serves", resp is not None and resp.status == 200)
+        await page.wait_for_timeout(2500)  # boot splash -> live terminal
+        body = await page.inner_text("body")
+        check("terminal: shell rendered",
+              "TRADING TERMINAL" in body or "WATCHLIST" in body.upper())
+        check("terminal: market data rendered", "AAPL" in body)
+        api = await page.evaluate(
+            "fetch('/api/terminal/market').then(r => r.json())")
+        check("terminal: market endpoint shape",
+              isinstance(api, dict) and set(api) >= {"indices", "sectors"})
+        await page.screenshot(path=f"{SHOTS}/terminal.png", full_page=True)
+
         check("no JS page errors", not js_errors, "; ".join(js_errors[:3]))
         await browser.close()
 
@@ -502,6 +574,7 @@ async def drive() -> None:
 async def main() -> None:
     import uvicorn
 
+    _stub_terminal_data()
     app = build_app(FakeKernel())
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8399,
                                            log_level="error"))
