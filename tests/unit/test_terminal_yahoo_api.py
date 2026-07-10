@@ -74,6 +74,24 @@ async def test_get_quotes_falls_back_per_symbol(monkeypatch: pytest.MonkeyPatch)
     assert [q["symbol"] for q in out] == ["GOOD"]  # one failure can't blank the panel
 
 
+async def test_get_quotes_reraises_programming_error_in_fallback(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        if (b := bootstrap_ok(req)) is not None:
+            return b
+        syms = req.url.params["symbols"]
+        if "," in syms:
+            return httpx.Response(500)
+        if syms == "BOOM":
+            raise RuntimeError("simulated programming error")
+        return httpx.Response(200, json={"quoteResponse": {"result": [
+            {"symbol": syms, "regularMarketPrice": 9.9}]}})
+
+    install(monkeypatch, handler)
+    with pytest.raises(RuntimeError, match="simulated programming error"):
+        await ty.get_quotes(["GOOD", "BOOM"])
+
+
 async def test_get_chart_params_and_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         assert req.url.path == "/v8/finance/chart/AAPL"

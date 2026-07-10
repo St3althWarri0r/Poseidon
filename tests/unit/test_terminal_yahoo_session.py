@@ -79,3 +79,12 @@ async def test_upstream_error_raises_dataerror() -> None:
     s = make_session(httpx.MockTransport(handler))
     with pytest.raises(DataError):
         await s.get_json("https://query2.finance.yahoo.com/v8/finance/chart/AAPL", {})
+
+
+async def test_malformed_json_on_200_raises_dataerror() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>not json")
+
+    s = make_session(httpx.MockTransport(handler))
+    with pytest.raises(DataError):
+        await s.get_json("https://query2.finance.yahoo.com/v8/finance/chart/AAPL", {})

@@ -147,7 +147,10 @@ class YahooSession:
                 continue
             if r.status_code != 200:
                 raise DataError(f"Yahoo returned HTTP {r.status_code}")
-            return r.json()
+            try:
+                return r.json()
+            except ValueError as exc:
+                raise DataError("Yahoo returned invalid JSON") from exc
         raise DataError("Yahoo auth retry exhausted")  # pragma: no cover
 
     async def aclose(self) -> None:
@@ -375,9 +378,21 @@ async def _quotes_uncached(clean: list[str]) -> list[dict[str, Any]]:
         rows = await one_call(",".join(clean))
     except DataError:
         # Graceful degradation: one bad symbol can't blank an entire panel.
+        # Only DataError (a known, expected failure mode) is swallowed here;
+        # anything else is a programming error and must not be masked.
         results = await asyncio.gather(*(one_call(s) for s in clean),
                                        return_exceptions=True)
-        rows = [r[0] for r in results if isinstance(r, list) and r]
+        rows = []
+        for sym, r in zip(clean, results, strict=True):
+            if isinstance(r, list):
+                if r:
+                    rows.append(r[0])  # single-symbol call returns at most one row
+                else:
+                    log.debug("terminal.quote_symbol_empty", symbol=sym)
+            elif isinstance(r, DataError):
+                log.debug("terminal.quote_symbol_failed", symbol=sym, err=str(r))
+            elif isinstance(r, BaseException):
+                raise r from None
     return [normalize_quote(q) for q in rows]
 
 
