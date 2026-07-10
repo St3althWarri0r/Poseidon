@@ -8,11 +8,13 @@ only — never used by the trading data router or risk engine.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, TypeVar
 
 import httpx
@@ -105,16 +107,56 @@ _COOKIE_URLS = ("https://fc.yahoo.com/", "https://finance.yahoo.com/quote/AAPL")
 
 
 class YahooSession:
-    """Shared httpx client with Yahoo's cookie+crumb handshake."""
+    """Shared httpx client with Yahoo's cookie+crumb handshake.
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    When ``state_path`` is given, the cookie jar and crumb persist across
+    process restarts (like yahoo-finance2's disk jar) — a fresh, uncookied
+    bootstrap is the request Yahoo throttles most aggressively, so reusing
+    yesterday's session state is what keeps a restart working under load.
+    ``state_path=None`` (tests, ad-hoc sessions) disables persistence.
+    """
+
+    def __init__(self, client: httpx.AsyncClient | None = None,
+                 state_path: Path | None = None) -> None:
         self._client = client or httpx.AsyncClient(
             timeout=10.0, follow_redirects=True, headers={"User-Agent": _UA})
         self._crumb: str | None = None
         self._lock = asyncio.Lock()
+        self._state_path = state_path
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+            crumb = data.get("crumb")
+            self._crumb = crumb if isinstance(crumb, str) and crumb else None
+            for c in data.get("cookies", []):
+                self._client.cookies.set(str(c["name"]), str(c["value"]),
+                                         domain=str(c.get("domain", "")),
+                                         path=str(c.get("path", "/")))
+        except (OSError, ValueError, KeyError, TypeError):
+            self._crumb = None  # missing/corrupt state — start clean
+
+    def _save_state(self) -> None:
+        if self._state_path is None:
+            return
+        cookies = [{"name": c.name, "value": c.value or "", "domain": c.domain,
+                    "path": c.path} for c in self._client.cookies.jar]
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps({"crumb": self._crumb, "cookies": cookies}),
+                encoding="utf-8")
+            self._state_path.chmod(0o600)
+        except OSError as exc:
+            log.debug("terminal.session_state_save_failed", err=str(exc))
 
     async def _bootstrap(self) -> None:
         async with self._lock:
+            if self._crumb is not None:
+                return  # another coroutine already completed the handshake
             for cookie_url in _COOKIE_URLS:
                 try:
                     await self._client.get(cookie_url)  # any status; sets cookies
@@ -125,6 +167,7 @@ class YahooSession:
                     })
                     if r.status_code == 200 and r.text and "<" not in r.text:
                         self._crumb = r.text.strip()
+                        self._save_state()
                         return
                 except httpx.HTTPError as exc:
                     log.debug("terminal.crumb_bootstrap_failed", url=cookie_url, err=str(exc))
@@ -163,7 +206,9 @@ _session: YahooSession | None = None
 def session() -> YahooSession:
     global _session
     if _session is None:
-        _session = YahooSession()
+        from poseidon.core.config import default_data_dir
+
+        _session = YahooSession(state_path=default_data_dir() / "terminal-yahoo.json")
     return _session
 
 
