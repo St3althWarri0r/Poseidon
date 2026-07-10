@@ -44,6 +44,19 @@ log = structlog.get_logger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def _token_exempt(path: str) -> bool:
+    """Paths the dashboard bearer token does not protect: /static assets
+    (they carry no secrets and <script>/<link> tags cannot send headers) and
+    the embedded market-study terminal — read-only public market data with no
+    account, position, or broker state reachable (spec addendum 2026-07-09).
+    Terminal prefixes are path-boundary aware so a future route named e.g.
+    /terminalfoo would NOT silently inherit the exemption."""
+    if path.startswith("/static"):
+        return True
+    return any(path == p or path.startswith(p + "/")
+               for p in ("/terminal", "/api/terminal"))
+
+
 def build_dryrun_state(*, broker_is_paper: bool, active_broker: str, mode_value: str,
                        algorithms_raw: list[dict[str, Any]], session: MarketSession) -> dict[str, Any]:
     """Aggregate the Dry Run panel's state from plain inputs (pure, testable)."""
@@ -203,12 +216,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
         @app.middleware("http")
         async def _require_token(request: Request, call_next):  # type: ignore[no-untyped-def]
-            # /static and the embedded market-study terminal are token-exempt:
-            # static assets carry no secrets and cannot send headers from
-            # <script>/<link>; /terminal + /api/terminal are read-only public
-            # market data (keyless Yahoo) — no account, positions, or broker
-            # state is reachable through them (spec addendum 2026-07-09).
-            if request.url.path.startswith(("/static", "/terminal", "/api/terminal")):
+            if _token_exempt(request.url.path):
                 return await call_next(request)
             supplied = request.query_params.get("token")
             header = request.headers.get("Authorization", "")

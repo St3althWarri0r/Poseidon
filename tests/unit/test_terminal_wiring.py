@@ -22,7 +22,18 @@ def test_server_source_wires_terminal() -> None:
     assert "from ..terminal.routes import router as terminal_router" in src
     assert "app.include_router(terminal_router)" in src
     assert 'STATIC_DIR / "terminal"' in src
-    assert '"/terminal", "/api/terminal"' in src  # auth exemption tuple
+    assert "_token_exempt(request.url.path)" in src  # auth exemption via helper
+
+
+def test_token_exemption_is_path_boundary_aware() -> None:
+    from poseidon.api.server import _token_exempt
+
+    for exempt in ("/terminal", "/terminal/", "/terminal/index.html",
+                   "/api/terminal/quote", "/api/terminal/market", "/static/app.js"):
+        assert _token_exempt(exempt), exempt
+    for protected in ("/terminalfoo", "/api/terminalx", "/api/quote/AAPL",
+                      "/api/portfolio", "/", "/ws"):
+        assert not _token_exempt(protected), protected
 
 
 def test_nav_has_terminal_entry() -> None:
