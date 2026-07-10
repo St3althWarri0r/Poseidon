@@ -130,6 +130,13 @@ and regeneration command.
   falls back to per-symbol fetches, missing symbols render `—`).
 - Crumb expiry → single transparent re-handshake + retry, then error.
 
+**Auth (addendum, decided at implementation):** Poseidon's optional bearer
+token exempts only `/static`. The embed extends the exemption to `/terminal`
+and `/api/terminal` — GET-only, keyless public market data; no account,
+position, or broker state flows through these paths. On a tokened
+non-loopback deployment the terminal is therefore readable without the
+token, which matches its data sensitivity (public quotes/news).
+
 ## Testing
 
 - **Unit (pytest):** normalizers (percent→fraction, candle drop/sort/dedupe,

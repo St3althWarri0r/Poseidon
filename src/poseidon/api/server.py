@@ -34,6 +34,7 @@ from ..core.errors import (
     VaultError,
 )
 from ..core.events import EventBus
+from ..terminal.routes import router as terminal_router
 
 if TYPE_CHECKING:
     from ..app import ApplicationKernel
@@ -202,7 +203,12 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
         @app.middleware("http")
         async def _require_token(request: Request, call_next):  # type: ignore[no-untyped-def]
-            if request.url.path.startswith("/static"):
+            # /static and the embedded market-study terminal are token-exempt:
+            # static assets carry no secrets and cannot send headers from
+            # <script>/<link>; /terminal + /api/terminal are read-only public
+            # market data (keyless Yahoo) — no account, positions, or broker
+            # state is reachable through them (spec addendum 2026-07-09).
+            if request.url.path.startswith(("/static", "/terminal", "/api/terminal")):
                 return await call_next(request)
             supplied = request.query_params.get("token")
             header = request.headers.get("Authorization", "")
@@ -730,6 +736,12 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             return
         await hub.handle(ws)
 
+    app.include_router(terminal_router)
+    terminal_bundle = STATIC_DIR / "terminal"
+    if terminal_bundle.is_dir():  # bundle is committed; guard keeps bare
+        app.mount("/terminal",    # checkouts (or stripped builds) booting
+                  StaticFiles(directory=terminal_bundle, html=True),
+                  name="terminal")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
 
