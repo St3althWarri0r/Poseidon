@@ -21,6 +21,12 @@
 - **Poseidon repo:** work on branch `feat/terminal-embed`; conventional-commit messages; do not commit the untracked `CLAUDE.md` files.
 - **Trading-Terminal repo (~/trading-terminal):** has NO local git. Edits are verified by builds locally and published at the end via GitHub MCP `push_files` + blob-SHA verification (see Task 12). Do not run `git` there.
 - Today's date for docs: 2026-07-09. Poseidon version after this feature: **2.6.0**.
+- **Deliberate deviation from CLAUDE.md's "use FakeProvider instead of mocking HTTP":**
+  that rule targets the DataRouter/provider layer. The terminal package
+  deliberately bypasses DataRouter (spec decision — study data, not trading
+  data), and its contract *is* the raw Yahoo request construction, so
+  `httpx.MockTransport`/`ASGITransport` (in-process, zero network) is the
+  correct test seam here. Do not "fix" these tests to use FakeProvider.
 
 ---
 
@@ -1994,7 +2000,9 @@ Add to the features list in `README.md` (match surrounding style):
 
 - `pyproject.toml`: `version = "2.6.0"`
 - `src/poseidon/__init__.py`: `__version__ = "2.6.0"`
-- `packaging/PKGBUILD`: `pkgver=2.6.0` (check exact var with `grep -n "^pkgver" packaging/PKGBUILD`)
+- `packaging/PKGBUILD`: per CLAUDE.md the PKGBUILD *derives* `pkgver` from
+  `pyproject.toml` — verify with `grep -n "pkgver" packaging/PKGBUILD`; only
+  edit if a hard-coded version appears there.
 
 - [ ] **Step 5: Full gate**
 
