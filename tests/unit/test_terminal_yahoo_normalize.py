@@ -110,3 +110,45 @@ def test_fundamentals_mapping_and_debt_quirk() -> None:
     assert f["perShare"]["dividendYield"] == 0.0044   # already a fraction
     assert f["perShare"]["eps"] == 7.1
     assert f["targets"]["recommendationKey"] is None
+
+
+def test_fundamentals_fallback_chains_pin() -> None:
+    # ks values win only when sd/fd are absent...
+    f = normalize_fundamentals("X", {
+        "summaryDetail": {},
+        "financialData": {},
+        "defaultKeyStatistics": {"forwardPE": 21.0, "beta": 1.3, "profitMargins": 0.21},
+    })
+    assert f["valuation"]["forwardPE"] == 21.0
+    assert f["valuation"]["beta"] == 1.3
+    assert f["financials"]["profitMargins"] == 0.21
+    # ...and the primary wins even when it is zero (?? semantics, not truthiness).
+    f2 = normalize_fundamentals("X", {
+        "summaryDetail": {"forwardPE": 0, "beta": 0.5},
+        "financialData": {"profitMargins": 0.1},
+        "defaultKeyStatistics": {"forwardPE": 9, "beta": 9, "profitMargins": 9},
+    })
+    assert f2["valuation"]["forwardPE"] == 0
+    assert f2["valuation"]["beta"] == 0.5
+    assert f2["financials"]["profitMargins"] == 0.1
+
+
+def test_candles_ragged_arrays_are_safe() -> None:
+    # Yahoo occasionally ships shorter indicator arrays than timestamps; rows
+    # beyond an array's end are gaps, never IndexErrors.
+    result = {
+        "timestamp": [1, 2, 3],
+        "indicators": {"quote": [{
+            "open": [1.0], "high": [1.5, 2.5], "low": [0.5],
+            "close": [1.2], "volume": [],
+        }]},
+    }
+    candles = normalize_candles(result)
+    assert [c["time"] for c in candles] == [1]
+    assert candles[0]["volume"] == 0
+
+
+def test_news_bool_publish_time_is_null() -> None:
+    (n,) = normalize_news([{"title": "T", "link": "https://x",
+                            "providerPublishTime": True}])
+    assert n["publishedAt"] is None
