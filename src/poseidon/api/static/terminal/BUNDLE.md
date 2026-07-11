@@ -7,5 +7,4 @@ Regenerate:
     cd <Trading-Terminal checkout>
     EMBED_DEST=<Poseidon>/src/poseidon/api/static/terminal npm run build:embed
 
-Built from Trading-Terminal commit 159a12941643f18bd5c71add4e5a6c72f1c6f92c.
-Includes unpublished local Trading-Terminal changes: embed-only "back to Poseidon" header link + BUNDLE.md-preserving regen (push pending).
+Built from Trading-Terminal commit 45990f9ccf524eebfdc885b74a1194d8bbc7e156 (v0.3.1).
