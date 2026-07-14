@@ -41,9 +41,14 @@ async def db(tmp_path):
 
 def _service(db, *, backend, fills, is_flat=True, cfg=None):
     audited: list[tuple] = []
+    load_calls: list[tuple] = []
 
-    async def _load(symbol):
-        return [f for f in fills if symbol is None or f.symbol == symbol]
+    async def _load(symbol, since=None):
+        load_calls.append((symbol, since))
+        out = [f for f in fills if symbol is None or f.symbol == symbol]
+        if since:
+            out = [f for f in out if f.at.isoformat() > since]
+        return out
 
     async def _audit(actor, action, payload):
         audited.append((actor, action, payload))
@@ -53,6 +58,7 @@ def _service(db, *, backend, fills, is_flat=True, cfg=None):
         get_backend=lambda: backend, load_fills=_load,
         is_flat=lambda s: is_flat, audit_append=_audit)
     svc.audited = audited  # type: ignore[attr-defined]
+    svc.load_calls = load_calls  # type: ignore[attr-defined]
     return svc
 
 
@@ -103,6 +109,18 @@ async def test_on_account_synced_skips_when_not_flat(db) -> None:
     await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)
     assert await _lesson_count(db) == 0
+
+
+async def test_sweep_load_is_bounded_by_watermark(db) -> None:
+    svc = _service(db, backend=FakeBackend([text_end("l1"), text_end("l2")]), fills=_fills())
+    await svc.on_account_synced("t", {})
+    await asyncio.gather(*svc._tasks)
+    await svc.on_account_synced("t", {})  # second sync
+    await asyncio.gather(*svc._tasks)
+    sweep_sinces = [since for (sym, since) in svc.load_calls if sym is None]  # type: ignore[attr-defined]
+    assert sweep_sinces[0] is None            # first sweep: no watermark yet
+    assert sweep_sinces[1] not in (None, "")  # second sweep: SQL-bounded by watermark
+    assert await _lesson_count(db) == 1       # dedup + bound -> still one lesson
 
 
 async def test_relevant_lessons_respects_inject_flag(db) -> None:

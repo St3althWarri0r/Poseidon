@@ -53,4 +53,8 @@ async def reflect_on_position(backend: ChatBackend, pos: ClosedPosition, *,
     text = (resp.text or "").strip()
     if not text:
         return None
-    return text[:max_chars].strip()
+    # Collapse to a single printable line: internal newlines/tabs/control chars
+    # would otherwise let a lesson break out of its advisory bullet when the
+    # prompt is assembled, weakening the "not instructions" framing.
+    cleaned = "".join(c for c in " ".join(text.split()) if c.isprintable())
+    return cleaned[:max_chars].strip() or None

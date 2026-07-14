@@ -37,7 +37,7 @@ _BENCHMARK = "SPY"
 class ReflectionService:
     def __init__(self, *, db: Database, router: Any, config: ReflectionConfig,
                  model: str, get_backend: Callable[[], ChatBackend | None],
-                 load_fills: Callable[[str | None], Awaitable[list[FillRecord]]],
+                 load_fills: Callable[[str | None, str | None], Awaitable[list[FillRecord]]],
                  is_flat: Callable[[str], bool],
                  audit_append: Callable[[str, str, dict[str, Any]], Awaitable[Any]]) -> None:
         self._db = db
@@ -61,13 +61,13 @@ class ReflectionService:
             return
         try:
             watermark: str = await self._db.kv_get(_WATERMARK_KEY, "")
-            fills = await self._load_fills(None)
+            # Bound the load to fills newer than the watermark in SQL, so a busy
+            # ~30s sync never reloads the whole filled-order history.
+            fills = await self._load_fills(None, watermark or None)
             newest = watermark
             candidates: list[str] = []
             for f in sorted(fills, key=lambda x: x.at.isoformat()):
                 ts = f.at.isoformat()
-                if ts <= watermark:
-                    continue
                 newest = max(newest, ts)
                 if f.side in _CLOSING_SIDES and f.symbol not in candidates:
                     candidates.append(f.symbol)
@@ -87,7 +87,7 @@ class ReflectionService:
             backend = self._get_backend()
             if backend is None:
                 return
-            ep = latest_closed_episode(await self._load_fills(symbol))
+            ep = latest_closed_episode(await self._load_fills(symbol, None))
             if ep is None:
                 return
             if await self._db.lesson_exists(symbol, ep.entered_at, ep.exited_at):

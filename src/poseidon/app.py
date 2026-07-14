@@ -903,19 +903,24 @@ class ApplicationKernel:
         p = self.portfolio.position_for(symbol)
         return p is None or p.quantity == 0
 
-    async def _load_reflection_fills(self, symbol: str | None) -> list[FillRecord]:
+    async def _load_reflection_fills(self, symbol: str | None,
+                                     since: str | None = None) -> list[FillRecord]:
         """Filled orders (account-scoped) as FillRecords threaded with the
         originating decision_id, for the reflection loop. Symbol filtering is in
-        Python — the orders table keys symbol inside the JSON payload."""
+        Python — the orders table keys symbol inside the JSON payload. `since`
+        (an ISO updated_at) bounds the per-sync sweep so it never reloads the
+        whole filled-order history on each ACCOUNT_SYNCED event."""
         from decimal import Decimal
 
         from .core.enums import AssetClass, OrderSide, OrderStatus
         from .core.models import Order
-        rows = await self.db.fetch_all(
-            "SELECT payload, decision_id FROM orders WHERE status = ? AND account_scope = ? "
-            "ORDER BY updated_at ASC",
-            (OrderStatus.FILLED.value, self.broker.account_scope),
-        )
+        sql = "SELECT payload, decision_id FROM orders WHERE status = ? AND account_scope = ?"
+        params: tuple[str, ...] = (OrderStatus.FILLED.value, self.broker.account_scope)
+        if since:
+            sql += " AND updated_at > ?"
+            params = (*params, since)
+        sql += " ORDER BY updated_at ASC"
+        rows = await self.db.fetch_all(sql, params)
         fills: list[FillRecord] = []
         for (payload, decision_id) in rows:
             order = Order.model_validate(json.loads(payload))

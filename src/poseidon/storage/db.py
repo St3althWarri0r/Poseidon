@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+-- Makes the reflection sweep's "newer than watermark" bound efficient.
+CREATE INDEX IF NOT EXISTS idx_orders_scope_status_updated
+    ON orders(account_scope, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
