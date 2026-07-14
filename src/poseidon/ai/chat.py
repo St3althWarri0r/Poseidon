@@ -17,14 +17,14 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
-import anthropic
 import structlog
 
 from ..core.config import AIConfig
 from ..core.errors import AgentError
 from ..storage.db import Database
+from .backends.base import ChatBackend, ToolResult
 from .schemas import DATA_TOOLS
 from .tools import ToolDispatcher
 
@@ -73,10 +73,10 @@ state (mode, market session, equity, positions). Trust it over memory."""
 class ChatService:
     """One persisted conversation between the operator and Claude."""
 
-    def __init__(self, config: AIConfig, client: anthropic.AsyncAnthropic,
+    def __init__(self, config: AIConfig, backend: ChatBackend,
                  dispatcher: ToolDispatcher, db: Database) -> None:
         self._config = config
-        self._client = client
+        self._backend = backend
         self._dispatcher = dispatcher
         self._db = db
         self._lock = asyncio.Lock()
@@ -131,24 +131,22 @@ class ChatService:
     async def _run_tool_loop(self, messages: list[dict[str, Any]],
                              usage: dict[str, int], tool_calls: list[str]) -> str:
         for _ in range(self._config.max_tool_iterations):
-            response = await self._create_message(messages)
-            self._record_usage(response, usage)
-            if response.stop_reason == "refusal":
+            resp = await self._backend.complete(messages, tools=DATA_TOOLS, system=CHAT_SYSTEM_PROMPT)
+            self._record_usage(resp.usage, usage)
+            if resp.stop_reason == "refusal":
                 return "I can't help with that request."
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "pause_turn":
+            messages.append(resp.assistant_message)
+            if resp.stop_reason == "pause":
                 continue
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if not tool_uses:
-                return "\n".join(b.text for b in response.content if b.type == "text").strip()
-            results: list[dict[str, Any]] = []
-            for block in tool_uses:
-                result, is_error = await self._dispatcher.dispatch(block.name, dict(block.input))
-                log.info("chat tool call", tool=block.name, error=is_error)
-                tool_calls.append(block.name)
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": result, "is_error": is_error})
-            messages.append({"role": "user", "content": results})
+            if not resp.tool_calls:
+                return resp.text.strip()
+            results: list[ToolResult] = []
+            for tc in resp.tool_calls:
+                out, is_error = await self._dispatcher.dispatch(tc.name, tc.input)
+                log.info("chat tool call", tool=tc.name, error=is_error)
+                tool_calls.append(tc.name)
+                results.append(ToolResult(tc.id, out, is_error))
+            messages.extend(self._backend.tool_result_messages(results))
         return "I hit the tool-call limit before finishing — ask me to continue."
 
     async def history(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -179,40 +177,8 @@ class ChatService:
             (role, content, datetime.now(UTC).isoformat()),
         )
 
-    async def _create_message(self, messages: list[dict[str, Any]]) -> Any:
-        try:
-            return await self._client.messages.create(
-                model=self._config.model,
-                max_tokens=self._config.max_tokens,
-                thinking={"type": "adaptive"},
-                output_config={"effort": self._config.effort},
-                # Frozen prompt + deterministic tool list: cache-stable, same
-                # discipline as the review-cycle agent (dynamic content lives
-                # only in the user turns).
-                system=cast("Any", [{
-                    "type": "text",
-                    "text": CHAT_SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }]),
-                tools=cast("Any", DATA_TOOLS),
-                messages=cast("Any", messages),
-            )
-        except anthropic.AuthenticationError as exc:
-            raise AgentError(f"Anthropic authentication failed: {exc}") from exc
-        except anthropic.RateLimitError as exc:
-            raise AgentError(f"Anthropic rate limited after SDK retries: {exc}") from exc
-        except anthropic.APIStatusError as exc:
-            raise AgentError(f"Anthropic API error {exc.status_code}: {exc.message}") from exc
-        except anthropic.APIConnectionError as exc:
-            raise AgentError(f"cannot reach Anthropic API: {exc}") from exc
-
     @staticmethod
-    def _record_usage(response: Any, usage: dict[str, int]) -> None:
-        u = getattr(response, "usage", None)
-        if u is None:
-            return
-        usage["input_tokens"] += getattr(u, "input_tokens", 0) or 0
-        usage["output_tokens"] += getattr(u, "output_tokens", 0) or 0
-        usage["cache_read_tokens"] += getattr(u, "cache_read_input_tokens", 0) or 0
-        usage["cache_write_tokens"] += getattr(u, "cache_creation_input_tokens", 0) or 0
+    def _record_usage(usage_in: dict[str, int], usage: dict[str, int]) -> None:
+        for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+            usage[k] += usage_in.get(k, 0)
         usage["api_calls"] += 1

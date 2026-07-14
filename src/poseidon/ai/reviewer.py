@@ -15,13 +15,13 @@ a human decision.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
-import anthropic
 import structlog
 
 from ..core.errors import AgentError
 from ..strategy.custom import validate_algorithm
+from .backends.base import ChatBackend, ToolResult
 
 log = structlog.get_logger(__name__)
 
@@ -85,8 +85,7 @@ fills, tick data). If the core idea cannot work as a screener, say so and \
 set convertible=false with poseidon_source=null rather than forcing it."""
 
 
-async def review_algorithm(client: anthropic.AsyncAnthropic, model: str, *,
-                           source: str, instructions: str = "",
+async def review_algorithm(backend: ChatBackend, *, source: str, instructions: str = "",
                            max_tokens: int = 8000) -> dict[str, Any]:
     """One-shot review with a single validation retry. Returns the review
     dict plus ``validation_errors`` (empty when the produced source passes)
@@ -100,25 +99,15 @@ async def review_algorithm(client: anthropic.AsyncAnthropic, model: str, *,
     usage = {"input_tokens": 0, "output_tokens": 0, "api_calls": 0}
 
     for attempt in (1, 2):
-        try:
-            response = await client.messages.create(
-                model=model, max_tokens=max_tokens,
-                system=_SYSTEM,
-                tools=cast("Any", [_REVIEW_TOOL]),
-                tool_choice=cast("Any", {"type": "tool", "name": "submit_algorithm_review"}),
-                messages=cast("Any", messages),
-            )
-        except anthropic.APIError as exc:
-            raise AgentError(f"algorithm review failed: {exc}") from exc
+        resp = await backend.complete(messages, tools=[_REVIEW_TOOL], system=_SYSTEM,
+                                      force_tool="submit_algorithm_review", max_tokens=max_tokens)
         usage["api_calls"] += 1
-        block_usage = getattr(response, "usage", None)
-        if block_usage is not None:
-            usage["input_tokens"] += getattr(block_usage, "input_tokens", 0) or 0
-            usage["output_tokens"] += getattr(block_usage, "output_tokens", 0) or 0
-        tool_use = next((b for b in response.content if b.type == "tool_use"), None)
-        if tool_use is None:
+        usage["input_tokens"] += resp.usage.get("input_tokens", 0)
+        usage["output_tokens"] += resp.usage.get("output_tokens", 0)
+        call = next((c for c in resp.tool_calls if c.name == "submit_algorithm_review"), None)
+        if call is None:
             raise AgentError("algorithm review returned no result")
-        review = dict(tool_use.input)
+        review = dict(call.input)
 
         produced = review.get("poseidon_source")
         problems = validate_algorithm(str(produced)) if produced else []
@@ -129,15 +118,9 @@ async def review_algorithm(client: anthropic.AsyncAnthropic, model: str, *,
                 log.warning("review source failed validation after retry", problems=problems)
             return review
         # One retry: hand the validator's output back.
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result", "tool_use_id": tool_use.id,
-                "content": ("The produced poseidon_source failed static validation: "
-                            + "; ".join(problems)
-                            + ". Call submit_algorithm_review again with corrected source."),
-                "is_error": True,
-            }],
-        })
+        messages.append(resp.assistant_message)
+        messages.extend(backend.tool_result_messages([ToolResult(
+            call.id,
+            "The produced poseidon_source failed static validation: " + "; ".join(problems)
+            + ". Call submit_algorithm_review again with corrected source.", is_error=True)]))
     raise AgentError("unreachable")  # pragma: no cover

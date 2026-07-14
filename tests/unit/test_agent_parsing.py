@@ -9,12 +9,14 @@ from poseidon.ai.schemas import ALL_TOOLS, SUBMIT_DECISION_TOOL
 from poseidon.core.config import AIConfig
 from poseidon.core.enums import DecisionAction, OrderSide
 
+from .backend_fakes import FakeBackend
+
 
 def make_agent() -> ClaudeAgent:
     class _Dispatcher:
         sources_used: set[str] = {"polygon"}
 
-    return ClaudeAgent(AIConfig(), "test-key", _Dispatcher())  # type: ignore[arg-type]
+    return ClaudeAgent(AIConfig(), FakeBackend([]), _Dispatcher())  # type: ignore[arg-type]
 
 
 RATIONALE = {
