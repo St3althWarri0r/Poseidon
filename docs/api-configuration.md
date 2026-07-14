@@ -17,6 +17,33 @@ The agent's system prompt bans acting on remembered or estimated market
 data; every tool it can call is wired to the live data router, and its
 final decision must arrive through a strict-schema tool call.
 
+## Local model backend (no API credit)
+
+To run the portfolio manager for free on a local, OpenAI-compatible endpoint
+(e.g. [LM Studio](https://lmstudio.ai)) instead of the Anthropic API, set the
+`ai` backend:
+
+```yaml
+ai:
+  backend: openai_compatible
+  base_url: http://localhost:1234/v1
+  model: devstral-small-2-24b-instruct-2512   # any tool-use-capable local model
+  temperature: 0.2
+  input_price_per_mtok: 0     # local = free
+  output_price_per_mtok: 0
+```
+
+The default (`backend: anthropic`) is unchanged, and it stays a one-line switch
+back. Everything below the model — the audited tool loop, the strict
+`submit_decision` schema, the risk engine — is identical; only what generates
+the trade ideas changes. Local models make **weaker** decisions than Opus:
+fine for paper experimentation, not for real money.
+
+A local brain still needs **real-time quotes** to trade (orders require fresh
+data no matter which model decides them), so enable the Alpaca IEX feed below —
+the free finnhub/twelvedata/alphavantage tiers are too delayed to clear
+`data.real_time_max_age_seconds`.
+
 ## Market data providers
 
 Configure several — failover is automatic and free. Priorities decide the
