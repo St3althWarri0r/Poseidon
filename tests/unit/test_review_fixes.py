@@ -335,10 +335,15 @@ async def test_manual_halt_persists_across_restart(tmp_path) -> None:
     from poseidon.security.vault import Vault
     from poseidon.storage.db import Database
 
-    def _fresh_circuit() -> CircuitBreaker:
-        return CircuitBreaker(error_threshold=5, window_seconds=300, cooldown_seconds=1800)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    halt_file = data_dir / "HALT"
 
-    kernel = ApplicationKernel(AppConfig(), Vault(tmp_path / "v.bin"))
+    def _fresh_circuit() -> CircuitBreaker:
+        return CircuitBreaker(error_threshold=5, window_seconds=300,
+                              cooldown_seconds=1800, halt_file=halt_file)
+
+    kernel = ApplicationKernel(AppConfig(data_dir=data_dir), Vault(tmp_path / "v.bin"))
     db = Database(tmp_path / "t.db")
     await db.open()
     kernel.db = db
@@ -348,18 +353,21 @@ async def test_manual_halt_persists_across_restart(tmp_path) -> None:
     await kernel.halt("operator hit HALT")
     assert kernel.risk.circuit.is_open
     assert await db.kv_get("circuit.manual_halt") == "operator hit HALT"
+    assert halt_file.exists()  # filesystem sentinel written too
 
-    # Restart: a brand-new CircuitBreaker starts closed; rehydration must re-open it.
+    # Restart: a brand-new breaker. The filesystem sentinel alone re-arms it
+    # immediately (before any DB rehydration runs), and the DB path does too.
     kernel.risk = SimpleNamespace(circuit=_fresh_circuit())  # type: ignore[assignment]
-    assert not kernel.risk.circuit.is_open
+    assert kernel.risk.circuit.is_open
     await kernel._restore_manual_halt()
     assert kernel.risk.circuit.is_open
 
-    # Resume clears the marker; a restart after resume stays closed.
+    # Resume clears all three; a restart after resume stays closed.
     await kernel.resume()
-    assert not kernel.risk.circuit.is_open
+    assert not halt_file.exists()
     assert not await db.kv_get("circuit.manual_halt")
     kernel.risk = SimpleNamespace(circuit=_fresh_circuit())  # type: ignore[assignment]
+    assert not kernel.risk.circuit.is_open
     await kernel._restore_manual_halt()
     assert not kernel.risk.circuit.is_open
 

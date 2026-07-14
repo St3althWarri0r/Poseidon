@@ -50,6 +50,21 @@ _MAX_BAR_AGE = {
 }
 
 
+def _bar_is_sound(bar: Bar) -> bool:
+    """Structural OHLC sanity. A malformed bar (non-positive price, high < low,
+    a high/low that doesn't bracket open/close, or negative volume) is dropped
+    before it can poison indicators, the volatility halt, or VaR — a
+    provider/feed glitch must never silently skew a risk calculation."""
+    o, h, low, c = bar.open, bar.high, bar.low, bar.close
+    if min(o, h, low, c) <= 0 or bar.volume < 0:
+        return False
+    if h < low:
+        return False
+    if h < o or h < c:  # the high must be the bar's maximum
+        return False
+    return not (low > o or low > c)  # the low must be the bar's minimum
+
+
 class _ProviderSlot:
     def __init__(self, provider: MarketDataProvider, priority: int) -> None:
         self.provider = provider
@@ -140,6 +155,14 @@ class DataRouter:
         bars = await self._route(
             DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit)
         )
+        # Drop structurally-malformed bars at the boundary so a feed glitch
+        # cannot skew an indicator/VaR/volatility calculation downstream.
+        if bars:
+            sound = [b for b in bars if _bar_is_sound(b)]
+            if len(sound) != len(bars):
+                log.warning("dropped malformed bars", symbol=symbol, timeframe=timeframe,
+                            dropped=len(bars) - len(sound), source=bars[0].source)
+            bars = sound
         # Reject a clearly-frozen feed (not normal weekend/holiday gaps).
         max_age = _MAX_BAR_AGE.get(timeframe)
         if bars and max_age is not None:

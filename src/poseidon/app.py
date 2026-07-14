@@ -122,7 +122,8 @@ class ApplicationKernel:
 
         self.router = self._build_router()
         self.broker = await self._build_broker()
-        self.risk = RiskEngine(cfg.risk, self.portfolio, self.router, self.clock, self.bus)
+        self.risk = RiskEngine(cfg.risk, self.portfolio, self.router, self.clock, self.bus,
+                               halt_file=cfg.data_dir / "HALT")
         self.approvals = ApprovalQueue(self.bus)
         self.order_manager = OrderManager(
             self.broker, self.risk, self.approvals, self.db, self.audit, self.bus, mode=cfg.mode
@@ -958,19 +959,28 @@ class ApplicationKernel:
                                 {"from": previous.value, "to": mode.value})
         log.info("operating mode changed", was=previous.value, now=mode.value)
 
+    def _halt_file(self) -> Path:
+        return self.config.data_dir / "HALT"
+
     async def halt(self, reason: str) -> None:
-        """Operator emergency halt (dashboard HALT). Persisted so it survives a
-        restart: the CircuitBreaker's manual latch lives only in memory, and
-        with systemd Restart=always a crash/reboot in autonomous mode would
-        otherwise silently re-arm trading the operator had halted."""
+        """Operator emergency halt (dashboard HALT). Durable three ways so it
+        survives a restart, a DB loss, and an unreachable dashboard: the
+        in-memory breaker latch, a DB kv marker, and a filesystem HALT sentinel
+        the breaker reads directly. With systemd Restart=always a crash/reboot
+        in autonomous mode would otherwise silently re-arm trading."""
         self.risk.circuit.force_open(reason)
+        with contextlib.suppress(OSError):
+            self._halt_file().write_text(reason, encoding="utf-8")
         await self.db.kv_set("circuit.manual_halt", reason)
         await self.audit.append("human", "trading.halted", {"reason": reason})
         log.warning("trading halted by operator", reason=reason)
 
     async def resume(self) -> None:
-        """Clear an operator halt (dashboard Resume) and its persisted marker."""
+        """Clear an operator halt (dashboard Resume): the breaker latch, the DB
+        marker, and the filesystem sentinel."""
         self.risk.circuit.force_close()
+        with contextlib.suppress(OSError):
+            self._halt_file().unlink(missing_ok=True)
         await self.db.kv_set("circuit.manual_halt", "")
         await self.audit.append("human", "trading.resumed", {})
         log.warning("trading resumed by operator")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import structlog
 
@@ -30,7 +31,8 @@ log = structlog.get_logger(__name__)
 
 class RiskEngine:
     def __init__(self, config: RiskConfig, portfolio: PortfolioState, router: DataRouter,
-                 clock: MarketClock, bus: EventBus, *, rules: list[RiskRule] | None = None) -> None:
+                 clock: MarketClock, bus: EventBus, *, rules: list[RiskRule] | None = None,
+                 halt_file: Path | None = None) -> None:
         self._config = config
         self._portfolio = portfolio
         self._router = router
@@ -41,6 +43,7 @@ class RiskEngine:
             error_threshold=config.circuit_breaker_error_threshold,
             window_seconds=config.circuit_breaker_window_seconds,
             cooldown_seconds=config.circuit_breaker_cooldown_seconds,
+            halt_file=halt_file,
         )
         self.cooldowns = TradeCooldowns(per_symbol_seconds=config.trade_cooldown_seconds)
         # Dedicated sleeves: strategy name -> fraction of equity its
