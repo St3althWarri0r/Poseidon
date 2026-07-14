@@ -137,6 +137,9 @@ class ApplicationKernel:
             await self.order_manager.orders_today_count(eastern_day_start),
             self.clock.now_eastern().date().isoformat(),
         )
+        # An operator HALT (dashboard) that was active before a restart must be
+        # re-armed — the breaker's manual latch is otherwise memory-only.
+        await self._restore_manual_halt()
         self.guardian = PositionGuardian(cfg.guardian, self.db, self)
         self.bus.subscribe(Topics.ORDER_FILLED, self.guardian.on_order_filled)
         # Unfilled guardian exits (e.g. a DAY limit that expires at the close)
@@ -927,12 +930,20 @@ class ApplicationKernel:
     async def _audit_verify_job(self) -> None:
         ok, bad_seq = await self.audit.verify_chain()
         if not ok:
-            # force_open() does not publish CIRCUIT_OPENED (unlike the
-            # error-rate auto-trip), so record this halt in the chain directly.
-            await self.audit.append("system", "circuit.opened",
-                                    {"reason": "audit chain corrupt", "bad_seq": bad_seq,
-                                     "source": "audit_verify"})
+            # Fail safe: open the breaker FIRST (synchronous, cannot fail) so
+            # the halt always fires — even when the audit store itself is the
+            # corrupt thing and the append below raises. Auditing before the
+            # halt would let a DB write failure skip the halt entirely and keep
+            # autonomous trading on an untrustworthy chain. Mirrors /api/halt,
+            # which also force_opens before it audits.
             self.risk.circuit.force_open(f"audit chain corrupt at seq {bad_seq}")
+            # force_open() does not publish CIRCUIT_OPENED (unlike the
+            # error-rate auto-trip), so record this halt in the chain directly —
+            # best effort: a write failure must not cancel the halt or the alert.
+            with contextlib.suppress(Exception):
+                await self.audit.append("system", "circuit.opened",
+                                        {"reason": "audit chain corrupt", "bad_seq": bad_seq,
+                                         "source": "audit_verify"})
             await self.bus.publish(Topics.NOTIFY, {
                 "level": "critical", "title": "Audit chain verification failed",
                 "body": f"Record {bad_seq} does not verify. Trading halted.",
@@ -946,6 +957,34 @@ class ApplicationKernel:
         await self.audit.append("human", "mode.changed",
                                 {"from": previous.value, "to": mode.value})
         log.info("operating mode changed", was=previous.value, now=mode.value)
+
+    async def halt(self, reason: str) -> None:
+        """Operator emergency halt (dashboard HALT). Persisted so it survives a
+        restart: the CircuitBreaker's manual latch lives only in memory, and
+        with systemd Restart=always a crash/reboot in autonomous mode would
+        otherwise silently re-arm trading the operator had halted."""
+        self.risk.circuit.force_open(reason)
+        await self.db.kv_set("circuit.manual_halt", reason)
+        await self.audit.append("human", "trading.halted", {"reason": reason})
+        log.warning("trading halted by operator", reason=reason)
+
+    async def resume(self) -> None:
+        """Clear an operator halt (dashboard Resume) and its persisted marker."""
+        self.risk.circuit.force_close()
+        await self.db.kv_set("circuit.manual_halt", "")
+        await self.audit.append("human", "trading.resumed", {})
+        log.warning("trading resumed by operator")
+
+    async def _restore_manual_halt(self) -> None:
+        """Rehydrate an operator HALT that was active before a restart. Called
+        from start() alongside seed_orders_today — restart must not silently
+        undo the kill switch. (The audit-corrupt auto-halt needs no marker: a
+        corrupt chain already refuses startup via verify_chain.)"""
+        reason = await self.db.kv_get("circuit.manual_halt")
+        if reason:
+            self.risk.circuit.force_open(reason)
+            await self.audit.append("system", "trading.halt_restored", {"reason": reason})
+            log.warning("restored operator trading halt from before restart", reason=reason)
 
     async def status_report(self) -> dict[str, object]:
         return {

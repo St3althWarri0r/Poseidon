@@ -13,9 +13,9 @@ import pytest
 
 from poseidon.analytics.performance import FillRecord, build_round_trips
 from poseidon.core.config import _deep_env_overrides, dashboard_token_from_env
-from poseidon.core.enums import AssetClass, OrderSide, OrderType
+from poseidon.core.enums import AssetClass, OrderSide, OrderStatus, OrderType
 from poseidon.core.errors import RiskViolation
-from poseidon.core.models import AccountSnapshot, Order, Position
+from poseidon.core.models import AccountSnapshot, OptionLeg, Order, Position
 from poseidon.data.base import MarketDataProvider
 from poseidon.portfolio.state import PortfolioState
 from poseidon.risk.rules import ReduceOnlyRule
@@ -103,6 +103,82 @@ def test_reduce_only_rejects_selling_more_than_held() -> None:
                   quantity=Decimal("150"), limit_price=Decimal("100"))
     with pytest.raises(RiskViolation, match="reduce_only"):
         ReduceOnlyRule().check(_reduce_ctx(order, state))
+
+
+# --------- multi-leg reduce-only must subtract pending closes like single-leg ----------
+# The single-leg path subtracts already-pending same-direction closing orders so
+# two exits cannot each pass alone and oversell the book into a short. The
+# multi-leg branch must apply the identical per-contract accounting, or two
+# concurrent option-spread exits on the same contracts oversell into a short.
+
+_CONTRACT = "AAPL240621C00190000"
+
+
+def _long_option(qty: str) -> Position:
+    return Position(symbol=_CONTRACT, asset_class=AssetClass.OPTION,
+                    quantity=Decimal(qty), avg_entry_price=Decimal("5"), as_of=NOW)
+
+
+def _resting(side: OrderSide, qty: str, *, filled: str = "0") -> Order:
+    # Broker open-order snapshots normalize *_to_close sides to plain buy/sell.
+    return Order(symbol=_CONTRACT, asset_class=AssetClass.OPTION, side=side,
+                 order_type=OrderType.LIMIT, quantity=Decimal(qty),
+                 filled_quantity=Decimal(filled), limit_price=Decimal("1"),
+                 status=OrderStatus.ACCEPTED)
+
+
+def _multileg_close(leg_side: OrderSide, leg_qty: int, spreads: str) -> Order:
+    return Order(symbol="AAPL", side=OrderSide.SELL_TO_CLOSE, order_type=OrderType.LIMIT,
+                 quantity=Decimal(spreads), limit_price=Decimal("1"),
+                 legs=[OptionLeg(contract_symbol=_CONTRACT, side=leg_side, quantity=leg_qty)])
+
+
+def test_reduce_only_multileg_closes_full_position_when_nothing_pending() -> None:
+    state = _portfolio()
+    state.positions = [_long_option("10")]
+    # SELL_TO_CLOSE 1 contract x 10 spreads == the whole 10-lot position.
+    ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.SELL_TO_CLOSE, 1, "10"), state))
+
+
+def test_reduce_only_multileg_blocks_oversell_against_pending_close() -> None:
+    state = _portfolio()
+    state.positions = [_long_option("10")]
+    # A prior spread exit for the full 10 is already resting at the broker.
+    state.open_orders = [_resting(OrderSide.SELL, "10")]
+    # A second identical exit would close 10 more -> oversell into a -10 short.
+    with pytest.raises(RiskViolation, match="reduce_only"):
+        ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.SELL_TO_CLOSE, 1, "10"), state))
+
+
+def test_reduce_only_multileg_subtracts_partial_pending() -> None:
+    state = _portfolio()
+    state.positions = [_long_option("10")]
+    # 6 already pending (a partially-filled resting exit leaves 6 working).
+    state.open_orders = [_resting(OrderSide.SELL, "10", filled="4")]
+    # 5 more would exceed the 4 still closable (10 held - 6 pending); reject.
+    with pytest.raises(RiskViolation, match="reduce_only"):
+        ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.SELL_TO_CLOSE, 1, "5"), state))
+    # Exactly the 4 still closable is fine.
+    ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.SELL_TO_CLOSE, 1, "4"), state))
+
+
+def test_reduce_only_multileg_pending_is_direction_matched() -> None:
+    # A resting BUY on the same contract must not consume a SELL_TO_CLOSE's
+    # closable quantity (mirrors the single-leg is_buy match).
+    state = _portfolio()
+    state.positions = [_long_option("10")]
+    state.open_orders = [_resting(OrderSide.BUY, "10")]  # opposite direction
+    ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.SELL_TO_CLOSE, 1, "10"), state))
+
+
+def test_reduce_only_multileg_buy_to_close_covers_short_with_pending() -> None:
+    # Short 10 contracts (opened via a SELL_TO_OPEN leg); a resting BUY_TO_CLOSE
+    # for 10 is pending. A second cover for 10 would flip to a +10 long.
+    state = _portfolio()
+    state.positions = [_long_option("-10")]
+    state.open_orders = [_resting(OrderSide.BUY, "10")]
+    with pytest.raises(RiskViolation, match="reduce_only"):
+        ReduceOnlyRule().check(_reduce_ctx(_multileg_close(OrderSide.BUY_TO_CLOSE, 1, "10"), state))
 
 
 # ---------------------------------------------------- loss-halt latch (finding 5)
@@ -200,3 +276,91 @@ async def test_paper_stop_order_rests_until_triggered() -> None:
     qf.set("AAPL", "165")
     await broker.order_status(stop)
     assert stop.status is OrderStatus.FILLED
+
+
+# ------------- audit-verify halt must fire even if the audit write fails -------------
+# _audit_verify_job runs when verify_chain() reports the chain corrupt. If it
+# appends to the (possibly-corrupt) audit store BEFORE opening the breaker, a DB
+# write failure there skips the halt entirely and autonomous trading continues on
+# an untrustworthy chain. The kill switch must open first (like /api/halt).
+
+async def test_audit_verify_halts_even_when_the_audit_append_fails(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.core.events import Topics
+    from poseidon.risk.circuit import CircuitBreaker
+    from poseidon.security.vault import Vault
+
+    kernel = ApplicationKernel(AppConfig(), Vault(tmp_path / "v.bin"))
+    circuit = CircuitBreaker(error_threshold=5, window_seconds=300, cooldown_seconds=1800)
+    kernel.risk = SimpleNamespace(circuit=circuit)  # type: ignore[assignment]
+
+    class _CorruptAudit:
+        async def verify_chain(self) -> tuple[bool, int | None]:
+            return (False, 7)
+
+        async def append(self, *a: object, **k: object) -> None:
+            raise RuntimeError("audit DB write failed (corrupt store)")
+
+    kernel.audit = _CorruptAudit()  # type: ignore[assignment]
+    notes: list[dict[str, object]] = []
+
+    class _Bus:
+        async def publish(self, topic: str, payload: object = None) -> None:
+            if topic == Topics.NOTIFY and isinstance(payload, dict):
+                notes.append(payload)
+
+    kernel.bus = _Bus()  # type: ignore[assignment]
+
+    # Must NOT propagate the append failure, and the halt MUST still fire.
+    await kernel._audit_verify_job()
+    assert circuit.is_open
+    assert any(n.get("level") == "critical" for n in notes)
+
+
+# ------------- operator HALT must survive a restart (kill switch persistence) -------------
+# force_open() lives only in process memory. With mode: autonomous and systemd
+# Restart=always, a crash/reboot after the operator hits HALT would silently
+# re-arm live trading. The halt is persisted and rehydrated at startup.
+
+async def test_manual_halt_persists_across_restart(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.risk.circuit import CircuitBreaker
+    from poseidon.security.audit import AuditLog
+    from poseidon.security.vault import Vault
+    from poseidon.storage.db import Database
+
+    def _fresh_circuit() -> CircuitBreaker:
+        return CircuitBreaker(error_threshold=5, window_seconds=300, cooldown_seconds=1800)
+
+    kernel = ApplicationKernel(AppConfig(), Vault(tmp_path / "v.bin"))
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    kernel.db = db
+    kernel.audit = AuditLog(db)
+    kernel.risk = SimpleNamespace(circuit=_fresh_circuit())  # type: ignore[assignment]
+
+    await kernel.halt("operator hit HALT")
+    assert kernel.risk.circuit.is_open
+    assert await db.kv_get("circuit.manual_halt") == "operator hit HALT"
+
+    # Restart: a brand-new CircuitBreaker starts closed; rehydration must re-open it.
+    kernel.risk = SimpleNamespace(circuit=_fresh_circuit())  # type: ignore[assignment]
+    assert not kernel.risk.circuit.is_open
+    await kernel._restore_manual_halt()
+    assert kernel.risk.circuit.is_open
+
+    # Resume clears the marker; a restart after resume stays closed.
+    await kernel.resume()
+    assert not kernel.risk.circuit.is_open
+    assert not await db.kv_get("circuit.manual_halt")
+    kernel.risk = SimpleNamespace(circuit=_fresh_circuit())  # type: ignore[assignment]
+    await kernel._restore_manual_halt()
+    assert not kernel.risk.circuit.is_open
+
+    await db.close()

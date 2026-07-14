@@ -536,13 +536,31 @@ class ReduceOnlyRule(RiskRule):
                 position = ctx.portfolio.position_for(leg.contract_symbol)
                 held = position.quantity if position is not None else Decimal(0)
                 available = -held if leg.side is OrderSide.BUY_TO_CLOSE else held
+                # Same as the single-leg path: unfilled same-direction closing
+                # orders already resting at the broker on this contract still
+                # consume the closable quantity, so two spread exits can't each
+                # pass alone and oversell into a short. Matched per CONTRACT
+                # symbol (open-order snapshots carry the leg's contract symbol,
+                # not the underlying) and by is_buy (brokers normalize
+                # *_to_close to plain buy/sell).
+                contract = leg.contract_symbol.upper()
+                pending = sum(
+                    (max(o.quantity - o.filled_quantity, Decimal(0))
+                     for o in ctx.portfolio.open_orders
+                     if o.symbol.upper() == contract
+                     and o.status.is_open_at_broker
+                     and o.side.is_buy == leg.side.is_buy),
+                    Decimal(0),
+                )
+                available -= pending
                 available = available if available > 0 else Decimal(0)
                 closing = leg.quantity * ctx.order.quantity  # ratio qty x spreads
                 if closing > available:
                     raise RiskViolation(
                         self.name,
                         f"{leg.side.value} {closing} {leg.contract_symbol} exceeds the "
-                        f"closable position ({available}) — the platform does not open short positions",
+                        f"closable position ({available} after {pending} already pending in "
+                        "open closing orders) — the platform does not open short positions",
                     )
             return
         if ctx.order.side not in self._closing_sides:

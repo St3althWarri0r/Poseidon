@@ -110,6 +110,12 @@ class PortfolioSyncService:
             self._state.tax_lots = lots
             self._state.dividends = dividends
             self._state.synced_at = now
+            # A DIFFERENT real account at the same broker scope (account_scope
+            # is name:paper|live and cannot tell two live accounts apart) must
+            # not inherit the prior account's loss/drawdown anchors. Detect the
+            # account_id change and drop the restored baselines so the
+            # re-baseline below re-anchors to THIS account on the same pass.
+            await self._reanchor_on_account_change(account.account_id)
             # Re-anchor for deposits/withdrawals BEFORE recording equity: the
             # peak must shift before a deposit-inflated mark can ratchet it.
             await self._apply_external_flows(broker, now)
@@ -135,6 +141,40 @@ class PortfolioSyncService:
             if was_disconnected:
                 await self._bus.publish(Topics.BROKER_RECONNECTED, {"broker": broker.name})
             await self._bus.publish(Topics.ACCOUNT_SYNCED, self._state.snapshot_dict())
+
+    async def _reanchor_on_account_change(self, account_id: str) -> None:
+        """Clear the restored loss/drawdown baselines when the connected
+        account_id differs from the one they belong to.
+
+        ``account_scope`` (name:paper|live) is identical for two different real
+        accounts at the same brokerage, so ``restore_baselines`` happily
+        restores account A's day/week/peak anchors onto account B. Left as-is
+        the loss and drawdown halts measure B against A's numbers — a bigger B
+        never halts; a smaller B latches a phantom drawdown. Here we detect the
+        change and reset the in-memory anchors plus the persisted boundary keys;
+        ``record_equity`` (peak/troughs from None) and ``_roll_baselines`` (day/
+        week from the cleared keys) then re-anchor to B's equity on this pass.
+
+        Note (minimal-fix limitation): ``equity_marks`` remain keyed by
+        ``account_scope``, so two accounts at the same scope still share an
+        equity table; this fixes the safety-critical halt anchoring, not the
+        equity-curve mixing (that needs an account_id-scoped mark key)."""
+        stored_id = await self._db.kv_get("baseline.account_id")
+        if stored_id and account_id and stored_id != account_id:
+            self._state.day_start_equity = None
+            self._state.week_start_equity = None
+            self._state.peak_equity = None
+            self._state.day_min_equity = None
+            self._state.week_min_equity = None
+            await self._db.kv_set("baseline.day.date", "")
+            await self._db.kv_set("baseline.week.key", "")
+            await self._db.kv_set("baseline.peak.equity", "")
+            await self._db.kv_set("baseline.flows.cursor", "")
+            log.warning("account changed within the same broker scope; loss/drawdown "
+                        "baselines re-anchored to the new account",
+                        was=stored_id, now=account_id)
+        if account_id:
+            await self._db.kv_set("baseline.account_id", account_id)
 
     async def _apply_external_flows(self, broker: Broker, now: datetime) -> None:
         """Shift the loss/drawdown anchors by net deposits/withdrawals.
