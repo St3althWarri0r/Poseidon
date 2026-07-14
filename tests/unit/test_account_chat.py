@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from poseidon.ai.backends.base import LLMResponse, ToolCall
 from poseidon.ai.chat import ChatService
 from poseidon.ai.schemas import DATA_TOOLS
 from poseidon.brokers.plugins.paper import PaperBroker
@@ -29,6 +29,7 @@ from poseidon.security.audit import AuditLog
 from poseidon.storage.db import Database
 
 from ..conftest import FakeProvider
+from .backend_fakes import FakeBackend, text_end, tool_use
 
 # ---------------------------------------------------------------- catalog
 
@@ -256,33 +257,17 @@ async def test_resume_orphans_orders_from_another_broker(manager) -> None:
 # ------------------------------------------------------------------ chat
 
 
-def _text_response(text: str, stop_reason: str = "end_turn") -> SimpleNamespace:
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
-        stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=10, output_tokens=5,
-                              cache_read_input_tokens=1, cache_creation_input_tokens=2),
-    )
+def _text_response(text: str, stop_reason: str = "end_turn") -> LLMResponse:
+    return text_end(text)
 
 
-def _tool_response(name: str, tool_input: dict) -> SimpleNamespace:
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="tool_use", name=name, input=tool_input, id="tu1")],
-        stop_reason="tool_use",
-        usage=SimpleNamespace(input_tokens=10, output_tokens=5,
-                              cache_read_input_tokens=0, cache_creation_input_tokens=0),
-    )
+def _tool_response(name: str, tool_input: dict) -> LLMResponse:
+    return tool_use(ToolCall("tu1", name, tool_input))
 
 
-class _StubClient:
-    def __init__(self, responses: list) -> None:
-        self.messages = self
-        self._responses = list(responses)
-        self.calls: list[dict] = []
-
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._responses.pop(0)
+# Backend stub: complete() replays queued LLMResponses and records .calls, so
+# the chat tests inspect what was sent exactly as before.
+_StubClient = FakeBackend
 
 
 class _StubDispatcher:

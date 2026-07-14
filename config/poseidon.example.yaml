@@ -21,6 +21,18 @@ ai:
   input_price_per_mtok: 5.0
   output_price_per_mtok: 25.0
   monthly_budget_usd: 0       # 0 = no ceiling
+  # --- Local model (no API credit) ---------------------------------------
+  # Run the portfolio manager on a local OpenAI-compatible endpoint (e.g. LM
+  # Studio) instead of the Anthropic API — free and unlimited, but weaker than
+  # Opus: good for paper experimentation, not real money. Still needs a
+  # real-time data provider (see the Alpaca IEX option below), because orders
+  # require fresh quotes regardless of which model decides them.
+  #   backend: openai_compatible
+  #   base_url: http://localhost:1234/v1
+  #   model: devstral-small-2-24b-instruct-2512
+  #   temperature: 0.2
+  #   input_price_per_mtok: 0     # local = free
+  #   output_price_per_mtok: 0
 
 data:
   real_time_max_age_seconds: 5
@@ -47,11 +59,15 @@ data:
       credential: alphavantage_api_key
       priority: 40
     # Optional extras:
-    # Alpaca market data — free with an Alpaca account (IEX feed).
+    # Alpaca market data — free real-time IEX feed with any Alpaca account,
+    # reusing the same `alpaca_keys` broker credential. The simplest way to get
+    # quotes fresh enough to clear real_time_max_age_seconds for live trading
+    # (the free finnhub/twelvedata/alphavantage tiers are too delayed for it).
     # Credential is JSON: {"key_id": "...", "secret_key": "..."}
     # - name: alpaca
     #   credential: alpaca_keys
     #   priority: 15
+    #   options: { feed: iex }
     # Tradier — free sandbox market data with a developer account.
     # - name: tradier_data
     #   credential: tradier_token

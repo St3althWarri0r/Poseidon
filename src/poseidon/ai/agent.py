@@ -13,19 +13,25 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, cast
+from typing import Any
 
-import anthropic
 import structlog
 
 from ..core.config import AIConfig
 from ..core.enums import AssetClass, DecisionAction, OrderSide, OrderType, TimeInForce, TradingMode
-from ..core.errors import AgentError, AgentRefusedError
+from ..core.errors import AgentRefusedError
 from ..core.models import Decision, ExitPlan, ProposedTrade, TradeRationale
+from .backends.base import ChatBackend, ToolResult
 from .schemas import ALL_TOOLS
 from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
+
+# Actions whose semantics forbid new trades. A weak local model can contradict
+# itself — set action to one of these yet leave a populated trade in the payload;
+# since execution gates on ``decision.trades``, the trade would slip through. When
+# that happens the trades are voided (see _parse_decision).
+_NO_TRADE_ACTIONS = frozenset({DecisionAction.NO_ACTION, DecisionAction.HOLD})
 
 SYSTEM_PROMPT = """\
 You are the portfolio manager for Poseidon, a private, single-user automated \
@@ -75,16 +81,11 @@ remains yours to enforce during reviews.
 
 
 class ClaudeAgent:
-    def __init__(self, config: AIConfig, api_key: str, dispatcher: ToolDispatcher) -> None:
+    def __init__(self, config: AIConfig, backend: ChatBackend, dispatcher: ToolDispatcher) -> None:
         self._config = config
+        self._backend = backend
         self._dispatcher = dispatcher
-        self._client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=3)
         self._cycle_usage: dict[str, int] = {}
-
-    @property
-    def client(self) -> anthropic.AsyncAnthropic:
-        """Shared API client (also used by the algorithm reviewer)."""
-        return self._client
 
     def last_cycle_usage(self) -> dict[str, int]:
         """Tokens accumulated during the most recent cycle — readable even when
@@ -109,85 +110,47 @@ class ClaudeAgent:
         decision_input: dict[str, Any] | None = None
 
         for iteration in range(self._config.max_tool_iterations):
-            response = await self._create_message(messages)
-            self._record_usage(response)
+            resp = await self._backend.complete(messages, tools=ALL_TOOLS, system=SYSTEM_PROMPT)
+            self._record_usage(resp.usage)
 
-            if response.stop_reason == "refusal":
+            if resp.stop_reason == "refusal":
                 raise AgentRefusedError("model declined the review request; cycle skipped")
 
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            messages.append({"role": "assistant", "content": response.content})
+            messages.append(resp.assistant_message)
 
-            if response.stop_reason == "pause_turn":
+            if resp.stop_reason == "pause":
                 continue
 
-            if not tool_uses:
+            if not resp.tool_calls:
                 # Ended without submitting — treat as an explicit no-action cycle.
-                text = next((b.text for b in response.content if b.type == "text"), "")
                 log.warning("cycle ended without submit_decision", cycle=cycle_id)
-                return self._no_action_decision(cycle_id, f"cycle ended without a decision: {text[:500]}")
+                return self._no_action_decision(
+                    cycle_id, f"cycle ended without a decision: {resp.text[:500]}")
 
-            tool_results: list[dict[str, Any]] = []
-            for block in tool_uses:
-                if block.name == "submit_decision":
-                    decision_input = dict(block.input)
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": block.id,
-                        "content": "decision recorded",
-                    })
+            results: list[ToolResult] = []
+            for tc in resp.tool_calls:
+                if tc.name == "submit_decision":
+                    decision_input = tc.input
+                    results.append(ToolResult(tc.id, "decision recorded"))
                     continue
-                result, is_error = await self._dispatcher.dispatch(block.name, dict(block.input))
+                out, is_error = await self._dispatcher.dispatch(tc.name, tc.input)
                 log.info("tool call", cycle=cycle_id, iteration=iteration,
-                         tool=block.name, error=is_error)
-                tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
-                    "content": result, "is_error": is_error,
-                })
-            messages.append({"role": "user", "content": tool_results})
+                         tool=tc.name, error=is_error)
+                results.append(ToolResult(tc.id, out, is_error))
+            messages.extend(self._backend.tool_result_messages(results))
 
             if decision_input is not None:
-                return self._parse_decision(decision_input, cycle_id, response.model)
+                return self._parse_decision(decision_input, cycle_id, resp.model)
 
         log.warning("cycle hit tool-iteration limit", cycle=cycle_id,
                     limit=self._config.max_tool_iterations)
         return self._no_action_decision(cycle_id, "tool iteration limit reached without a decision")
 
-    def _record_usage(self, response: Any) -> None:
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
+    def _record_usage(self, usage: dict[str, int]) -> None:
         u = self._cycle_usage
-        u["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-        u["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
-        u["cache_read_tokens"] += getattr(usage, "cache_read_input_tokens", 0) or 0
-        u["cache_write_tokens"] += getattr(usage, "cache_creation_input_tokens", 0) or 0
+        for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+            u[k] += usage.get(k, 0)
         u["api_calls"] += 1
-
-    async def _create_message(self, messages: list[dict[str, Any]]) -> Any:
-        try:
-            return await self._client.messages.create(
-                model=self._config.model,
-                max_tokens=self._config.max_tokens,
-                thinking={"type": "adaptive"},
-                output_config={"effort": self._config.effort},
-                # The SDK's TypedDict params don't accept dynamically built
-                # dicts; shapes are validated server-side and in our tests.
-                system=cast("Any", [{
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }]),
-                tools=cast("Any", ALL_TOOLS),
-                messages=cast("Any", messages),
-            )
-        except anthropic.AuthenticationError as exc:
-            raise AgentError(f"Anthropic authentication failed: {exc}") from exc
-        except anthropic.RateLimitError as exc:
-            raise AgentError(f"Anthropic rate limited after SDK retries: {exc}") from exc
-        except anthropic.APIStatusError as exc:
-            raise AgentError(f"Anthropic API error {exc.status_code}: {exc.message}") from exc
-        except anthropic.APIConnectionError as exc:
-            raise AgentError(f"cannot reach Anthropic API: {exc}") from exc
 
     # -- prompt & parsing -------------------------------------------------------
 
@@ -225,9 +188,28 @@ class ClaudeAgent:
         )
 
     def _parse_decision(self, payload: dict[str, Any], cycle_id: str, model: str) -> Decision:
+        if not isinstance(payload, dict):
+            # A weak local model can emit submit_decision arguments that decode to
+            # a non-object (list/scalar). Honor the "malformed -> no action, never
+            # crash" contract instead of raising out of the cycle.
+            log.error("submit_decision payload was not an object — no action", cycle=cycle_id)
+            return self._no_action_decision(cycle_id, "malformed decision payload (not an object)")
         trades: list[ProposedTrade] = []
         malformed = False
-        for t in payload.get("trades", []) or []:
+        raw_trades = payload.get("trades")
+        if not isinstance(raw_trades, list):
+            # A weak model may send trades as a single object or a scalar rather
+            # than an array; treat any non-list as no trades (flagging a truthy
+            # one malformed so it cannot read as a clean no_action).
+            if raw_trades:
+                malformed = True
+                log.error("decision trades field was not a list — voiding", cycle=cycle_id)
+            raw_trades = []
+        for t in raw_trades:
+            if not isinstance(t, dict):
+                malformed = True
+                log.error("dropping non-object trade from decision", trade=t)
+                continue
             try:
                 quantity = Decimal(str(t["quantity"]))
                 if not quantity.is_finite() or quantity <= 0:
@@ -250,7 +232,7 @@ class ClaudeAgent:
                         take_profit=Decimal(str(t["take_profit"])) if t.get("take_profit") else None,
                     )
                 )
-            except (KeyError, ValueError, InvalidOperation) as exc:
+            except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
                 malformed = True
                 log.error("dropping malformed trade from decision", trade=t, error=str(exc))
         if malformed and trades:
@@ -261,37 +243,63 @@ class ClaudeAgent:
             trades = []
         rationale: TradeRationale | None = None
         raw_rationale = payload.get("rationale")
-        if raw_rationale:
-            exit_raw = raw_rationale.get("exit_plan") or {}
-            rationale = TradeRationale(
-                thesis=raw_rationale.get("thesis", ""),
-                timing=raw_rationale.get("timing", ""),
-                expected_edge=raw_rationale.get("expected_edge", ""),
-                risk=raw_rationale.get("risk", ""),
-                reward=raw_rationale.get("reward", ""),
-                confidence=min(max(float(raw_rationale.get("confidence", 0.0)), 0.0), 1.0),
-                supporting_indicators=list(raw_rationale.get("supporting_indicators", [])),
-                supporting_news=list(raw_rationale.get("supporting_news", [])),
-                portfolio_impact=raw_rationale.get("portfolio_impact", ""),
-                exit_plan=ExitPlan(
-                    stop_loss=Decimal(str(exit_raw["stop_loss"])) if exit_raw.get("stop_loss") else None,
-                    take_profit=Decimal(str(exit_raw["take_profit"])) if exit_raw.get("take_profit") else None,
-                    time_stop=exit_raw.get("time_stop"),
-                    notes=exit_raw.get("notes"),
-                ),
-                max_expected_loss=raw_rationale.get("max_expected_loss", ""),
-                alternative_scenarios=list(raw_rationale.get("alternative_scenarios", [])),
-            )
+        if isinstance(raw_rationale, dict) and raw_rationale:
+            try:
+                exit_raw = raw_rationale.get("exit_plan")
+                exit_raw = exit_raw if isinstance(exit_raw, dict) else {}
+                rationale = TradeRationale(
+                    thesis=raw_rationale.get("thesis", ""),
+                    timing=raw_rationale.get("timing", ""),
+                    expected_edge=raw_rationale.get("expected_edge", ""),
+                    risk=raw_rationale.get("risk", ""),
+                    reward=raw_rationale.get("reward", ""),
+                    confidence=min(max(float(raw_rationale.get("confidence", 0.0)), 0.0), 1.0),
+                    supporting_indicators=list(raw_rationale.get("supporting_indicators", [])),
+                    supporting_news=list(raw_rationale.get("supporting_news", [])),
+                    portfolio_impact=raw_rationale.get("portfolio_impact", ""),
+                    exit_plan=ExitPlan(
+                        stop_loss=Decimal(str(exit_raw["stop_loss"])) if exit_raw.get("stop_loss") else None,
+                        take_profit=Decimal(str(exit_raw["take_profit"])) if exit_raw.get("take_profit") else None,
+                        time_stop=exit_raw.get("time_stop"),
+                        notes=exit_raw.get("notes"),
+                    ),
+                    max_expected_loss=raw_rationale.get("max_expected_loss", ""),
+                    alternative_scenarios=list(raw_rationale.get("alternative_scenarios", [])),
+                )
+            except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
+                # A weak model can emit a malformed rationale (non-numeric
+                # confidence, non-object exit_plan, wrong-typed lists). Leaving
+                # rationale None lets the mandatory-explainability void below drop
+                # the trades, rather than raising out of the cycle.
+                log.error("dropping malformed rationale from decision",
+                          cycle=cycle_id, error=str(exc))
+                rationale = None
         if trades and rationale is None:
             # Explainability is mandatory: trades without a rationale are void.
             log.error("decision proposed trades without rationale — voiding trades", cycle=cycle_id)
             trades = []
+        try:
+            action = DecisionAction(payload.get("action", "no_action"))
+        except ValueError:
+            # Unknown action string from a weak model — default to no action
+            # rather than raising out of the cycle.
+            log.error("unknown decision action — defaulting to no_action",
+                      cycle=cycle_id, action=payload.get("action"))
+            action = DecisionAction.NO_ACTION
+        if action in _NO_TRADE_ACTIONS and trades:
+            # action and trades must agree. A self-contradictory no_action/hold
+            # that still carries trades would otherwise execute (the cycle gates
+            # on decision.trades, never decision.action).
+            log.error("no-trade action carried trades — voiding trades",
+                      cycle=cycle_id, action=action.value)
+            trades = []
+        raw_gaps = payload.get("data_gaps")
         return Decision(
-            action=DecisionAction(payload.get("action", "no_action")),
+            action=action,
             trades=trades,
             rationale=rationale,
             data_sources=sorted(self._dispatcher.sources_used),
-            data_gaps=[str(g) for g in (payload.get("data_gaps") or [])],
+            data_gaps=[str(g) for g in raw_gaps] if isinstance(raw_gaps, list) else [],
             summary=str(payload.get("summary", "")),
             model=model,
             cycle_id=cycle_id,

@@ -42,6 +42,12 @@ class AIConfig(StrictModel):
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
     max_tokens: int = Field(default=16000, ge=1024, le=128000)
     api_key_credential: str = "anthropic_api_key"  # vault entry name
+    # Which LLM backend runs the portfolio manager. "anthropic" is the API
+    # (default, unchanged); "openai_compatible" targets a local/self-hosted
+    # OpenAI-style endpoint (e.g. LM Studio) via base_url — free, no API credit.
+    backend: Literal["anthropic", "openai_compatible"] = "anthropic"
+    base_url: str | None = None  # required when backend == "openai_compatible"
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0)  # openai_compatible path only
     max_tool_iterations: int = Field(default=24, ge=1, le=100)
     review_interval_seconds: int = Field(default=300, ge=30)
     # Metering (USD per million tokens; defaults match claude-opus-4-8).
@@ -50,6 +56,14 @@ class AIConfig(StrictModel):
     # Hard monthly spend ceiling; review cycles pause when the estimate hits
     # it (0 disables the ceiling).
     monthly_budget_usd: float = Field(default=0.0, ge=0)
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> AIConfig:
+        if self.backend == "openai_compatible" and not self.base_url:
+            raise ValueError("ai.base_url is required when ai.backend is 'openai_compatible'")
+        if self.backend == "anthropic" and not self.api_key_credential:
+            raise ValueError("ai.api_key_credential is required when ai.backend is 'anthropic'")
+        return self
 
 
 class ProviderConfig(StrictModel):

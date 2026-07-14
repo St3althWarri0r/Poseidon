@@ -20,6 +20,7 @@ import yaml
 
 from . import __version__
 from .ai.agent import ClaudeAgent
+from .ai.backends import ChatBackend, build_backend
 from .ai.chat import ChatService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
@@ -80,6 +81,7 @@ class ApplicationKernel:
         self.order_manager: OrderManager
         self.guardian: PositionGuardian
         self.agent: ClaudeAgent | None = None
+        self._backend: ChatBackend | None = None
         self.chat: ChatService | None = None
         self.strategies: StrategyEngine
         self.workshop: AlgorithmWorkshop
@@ -168,8 +170,8 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
         )
-        api_key = self.vault.get(cfg.ai.api_key_credential)
-        self.agent = ClaudeAgent(cfg.ai, api_key, dispatcher)
+        self._backend = build_backend(cfg.ai, self.vault.get)
+        self.agent = ClaudeAgent(cfg.ai, self._backend, dispatcher)
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
         # concurrent chat tool call must not inject provenance into that
@@ -181,7 +183,7 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
         )
-        self.chat = ChatService(cfg.ai, self.agent.client, chat_dispatcher, self.db)
+        self.chat = ChatService(cfg.ai, self._backend, chat_dispatcher, self.db)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
         self.sync = PortfolioSyncService(self.broker, self.portfolio, self.bus, self.db, self.clock)
         self.scheduler = Scheduler(self.clock, self.bus)
@@ -774,11 +776,10 @@ class ApplicationKernel:
         review cycle."""
         from .ai.reviewer import review_algorithm
 
-        if self.agent is None:
+        if self.agent is None or self._backend is None:
             raise ConfigError("AI agent is not initialized")
         review = await review_algorithm(
-            self.agent.client, self.config.ai.model,
-            source=source, instructions=instructions,
+            self._backend, source=source, instructions=instructions,
         )
         usage = review.pop("usage", {})
         await self.db.execute(
@@ -1054,6 +1055,9 @@ class ApplicationKernel:
             await self.broker.disconnect()
         with contextlib.suppress(Exception):
             await self.router.close()
+        if self._backend is not None:
+            with contextlib.suppress(Exception):
+                await self._backend.aclose()
         await self.bus.close()
         await self.db.close()
         log.info("shutdown complete")
