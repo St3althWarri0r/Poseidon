@@ -69,6 +69,30 @@ but stops feeding them to the model (a reviewable ledger); `enabled: false`
 turns the loop off. Use `inject: false` if you want to eyeball a weaker local
 model's lesson quality before it influences decisions.
 
+## Model tiering (a utility model for the auxiliary roles)
+
+The **trading decision** always runs on the primary `ai.model`. The tolerant
+auxiliary roles — operator chat and the reflection lessons — can optionally run
+on a cheaper/faster **utility** model:
+
+```yaml
+ai:
+  model: claude-opus-4-8                     # the money decision + reviewer
+  utility_model: claude-haiku-4-5-20251001   # operator chat + reflection lessons
+```
+
+The utility model uses the **same backend and endpoint** as the primary with only
+the model swapped (Anthropic Opus→Haiku on one account, or a smaller local model
+served at the same LM Studio endpoint). Leave `utility_model` unset — the default
+— and every role shares the primary backend exactly as before.
+
+The trading agent and the algorithm reviewer are **never** handed the utility
+backend; the money decision runs on the strong model, always. Tiering is a
+cost/latency optimization for the advisory roles (and the seam a future
+multi-analyst step can build on). On a local-only setup it is near-zero immediate
+value — a smaller local model is still $0 — so its real payoff is the Anthropic
+path.
+
 ## Market data providers
 
 Configure several — failover is automatic and free. Priorities decide the

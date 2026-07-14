@@ -34,6 +34,14 @@ ai:
     per_symbol: 2             # newest lessons per relevant ticker
     global_n: 3               # newest lessons overall (cross-ticker)
     lookback_days: 120        # ignore lessons older than this
+  # --- Model tiering (optional; cost/latency win on the Anthropic path) ---
+  # Run the tolerant auxiliary roles (operator chat + reflection lessons) on a
+  # cheaper/faster "utility" model while the trading decision and the algorithm
+  # reviewer stay on `model` above. Same backend + endpoint, model swapped.
+  # Unset = no tiering (every role uses the primary). On a local-only setup this
+  # is near-zero value (a smaller local model is still free); the real payoff is
+  # the Anthropic path (Haiku for the aux roles, Opus for the money decision).
+  #   utility_model: claude-haiku-4-5-20251001   # or a smaller local model id
   # --- Local model (no API credit) ---------------------------------------
   # Run the portfolio manager on a local OpenAI-compatible endpoint (e.g. LM
   # Studio) instead of the Anthropic API — free and unlimited, but weaker than

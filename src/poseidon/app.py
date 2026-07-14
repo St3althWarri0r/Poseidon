@@ -20,7 +20,7 @@ import yaml
 
 from . import __version__
 from .ai.agent import ClaudeAgent
-from .ai.backends import ChatBackend, build_backend
+from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
@@ -32,6 +32,7 @@ from .brokers.plugins.paper import PaperBroker
 from .brokers.registry import broker_catalog, create_broker
 from .core.clock import EASTERN, FreshnessPolicy, MarketClock, calendar_covers
 from .core.config import (
+    AIConfig,
     AppConfig,
     BrokerConfig,
     ScheduleConfig,
@@ -85,6 +86,9 @@ class ApplicationKernel:
         self.guardian: PositionGuardian
         self.agent: ClaudeAgent | None = None
         self._backend: ChatBackend | None = None
+        # Utility backend for the tolerant auxiliary roles (chat, reflection).
+        # IS the primary object unless ai.utility_model configures tiering.
+        self._utility_backend: ChatBackend | None = None
         self.chat: ChatService | None = None
         self.strategies: StrategyEngine
         self.workshop: AlgorithmWorkshop
@@ -173,15 +177,6 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
         )
-        self._backend = build_backend(cfg.ai, self.vault.get)
-        self.agent = ClaudeAgent(cfg.ai, self._backend, dispatcher)
-        # Advisory post-trade reflection loop (never gates risk / touches orders).
-        self.reflection = ReflectionService(
-            db=self.db, router=self.router, config=cfg.ai.reflection, model=cfg.ai.model,
-            get_backend=lambda: self.agent.backend if self.agent else None,
-            load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
-            audit_append=self.audit.append)
-        self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
         # concurrent chat tool call must not inject provenance into that
@@ -193,7 +188,7 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
         )
-        self.chat = ChatService(cfg.ai, self._backend, chat_dispatcher, self.db)
+        self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
         self.sync = PortfolioSyncService(self.broker, self.portfolio, self.bus, self.db, self.clock)
         self.scheduler = Scheduler(self.clock, self.bus)
@@ -213,6 +208,27 @@ class ApplicationKernel:
         log.info("Poseidon is up",
                  dashboard=f"http://{cfg.dashboard.host}:{cfg.dashboard.port}",
                  broker=self.broker.name, mode=cfg.mode.value)
+
+    def _wire_ai(self, ai_cfg: AIConfig, dispatcher: ToolDispatcher,
+                 chat_dispatcher: ToolDispatcher) -> None:
+        """Construct the AI roles and bind each to its model tier.
+
+        INVARIANT: the trading agent (the money decision) and the algorithm
+        reviewer always use the PRIMARY backend; the advisory chat and reflection
+        roles use the utility backend. With no ``ai.utility_model`` the utility
+        backend IS the primary object, so every role shares one backend exactly
+        as before — this is the default that ships.
+        """
+        self._backend, self._utility_backend = build_backends(ai_cfg, self.vault.get)
+        self.agent = ClaudeAgent(ai_cfg, self._backend, dispatcher)
+        # Advisory post-trade reflection loop (never gates risk / touches orders).
+        self.reflection = ReflectionService(
+            db=self.db, router=self.router, config=ai_cfg.reflection, model=ai_cfg.model,
+            get_backend=lambda: self._utility_backend,
+            load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
+            audit_append=self.audit.append)
+        self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
+        self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
         providers = []
@@ -1110,6 +1126,11 @@ class ApplicationKernel:
         if self._backend is not None:
             with contextlib.suppress(Exception):
                 await self._backend.aclose()
+        # Close the utility backend only when tiering made it a distinct instance,
+        # so a no-tiering run does not double-close the shared backend.
+        if self._utility_backend is not None and self._utility_backend is not self._backend:
+            with contextlib.suppress(Exception):
+                await self._utility_backend.aclose()
         await self.bus.close()
         await self.db.close()
         log.info("shutdown complete")
