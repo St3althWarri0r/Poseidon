@@ -1,7 +1,7 @@
 # Maintainer: local build — CachyOS/Arch native package for Poseidon
 # Build & install:  cd packaging && makepkg -si
 pkgname=poseidon
-pkgver=2.6.0
+pkgver=2.7.0
 pkgrel=1
 pkgdesc="Autonomous AI trading platform with Claude as the portfolio manager"
 arch=('any')
@@ -31,6 +31,8 @@ package() {
   cd "$startdir/.."
   install -Dm644 packaging/poseidon.desktop \
     "$pkgdir/usr/share/applications/poseidon.desktop"
+  install -Dm644 packaging/poseidon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/poseidon.svg"
   install -Dm644 config/poseidon.example.yaml \
     "$pkgdir/usr/share/poseidon/poseidon.example.yaml"
   # The stock unit points at the venv install; the system package uses /usr/bin.

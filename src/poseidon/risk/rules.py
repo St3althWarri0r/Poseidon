@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import abc
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -513,69 +514,113 @@ class CooldownRule(RiskRule):
             )
 
 
+_CLOSING_SIDES = (OrderSide.SELL, OrderSide.SELL_TO_CLOSE, OrderSide.BUY_TO_CLOSE)
+
+
+def reduce_only_breach(
+    order: Order,
+    held_for: Callable[[str], Decimal],
+    open_orders: Iterable[Order],
+) -> str | None:
+    """The reduce-only invariant as a pure function, so it can be enforced against
+    EITHER the synced portfolio snapshot (``ReduceOnlyRule`` in the engine) or the
+    broker's LIVE positions + open orders (the ``OrderManager`` submit-time
+    backstop, F022). Returns a violation message, or None when the close stays
+    within what is held. ``held_for(symbol)`` is the signed position quantity for
+    a symbol (0 if flat); ``open_orders`` is the set resting at the broker.
+
+    A closing order may only reduce an existing same-direction position — it can
+    never exceed what is held and flip the book short."""
+    open_list = list(open_orders)
+    if order.legs:
+        # Multi-leg option order: the parent symbol is the underlying, never
+        # itself a position (public.com submits only the legs). Validate each
+        # closing leg against its own contract position; opening legs are gated
+        # by the size/exposure/leverage rules like any other open.
+        for leg in order.legs:
+            if leg.side not in _CLOSING_SIDES:
+                continue
+            held = held_for(leg.contract_symbol)
+            available = -held if leg.side is OrderSide.BUY_TO_CLOSE else held
+            # Same as the single-leg path: unfilled same-direction closing orders
+            # already resting at the broker on this contract still consume the
+            # closable quantity, so two spread exits can't each pass alone and
+            # oversell into a short. Matched per CONTRACT symbol (open-order
+            # snapshots carry the leg's contract symbol, not the underlying) and
+            # by is_buy (brokers normalize *_to_close to plain buy/sell).
+            contract = leg.contract_symbol.upper()
+            pending = sum(
+                (max(o.quantity - o.filled_quantity, Decimal(0))
+                 for o in open_list
+                 if o.symbol.upper() == contract
+                 and o.status.is_open_at_broker
+                 and o.side.is_buy == leg.side.is_buy),
+                Decimal(0),
+            )
+            available -= pending
+            available = available if available > 0 else Decimal(0)
+            closing = leg.quantity * order.quantity  # ratio qty x spreads
+            if closing > available:
+                return (
+                    f"{leg.side.value} {closing} {leg.contract_symbol} exceeds the "
+                    f"closable position ({available} after {pending} already pending in "
+                    "open closing orders) — the platform does not open short positions"
+                )
+        return None
+    if order.side not in _CLOSING_SIDES:
+        return None  # opening orders are gated by the size/exposure/leverage rules
+    held = held_for(order.symbol)
+    # BUY_TO_CLOSE covers a short (held < 0); the others close a long.
+    available = -held if order.side is OrderSide.BUY_TO_CLOSE else held
+    # A position only shrinks when an exit FILLS, so unfilled same-direction
+    # orders still open at the broker already consume the closable quantity.
+    # Without subtracting them, a resting exit (e.g. an unfilled guardian stop)
+    # plus a second exit (review cycle / manual ticket) each pass alone and
+    # together oversell the book into a short. Direction is matched via is_buy
+    # because broker open-order snapshots normalize *_to_close sides to plain
+    # buy/sell (e.g. alpaca._row_to_order).
+    symbol = order.symbol.upper()
+    pending = sum(
+        (max(o.quantity - o.filled_quantity, Decimal(0))
+         for o in open_list
+         if o.symbol.upper() == symbol
+         and o.status.is_open_at_broker
+         and o.side.is_buy == order.side.is_buy),
+        Decimal(0),
+    )
+    available -= pending
+    available = available if available > 0 else Decimal(0)
+    if order.quantity > available:
+        return (
+            f"{order.side.value} {order.quantity} {order.symbol} exceeds the "
+            f"closable position ({available} after {pending} already pending in open "
+            "closing orders) — the platform does not open short positions"
+        )
+    return None
+
+
 class ReduceOnlyRule(RiskRule):
     """The platform does not open short positions via a plain SELL / *_to_close.
     A closing order may only reduce an existing same-direction position; it can
     never exceed what is held and flip the book short. This rule is deliberately
     NOT exempted for risk-reducing sides — it is what makes the size/exposure/
     leverage/loss-halt exemptions on those sides safe. Opening sides (BUY,
-    BUY_TO_OPEN, SELL_TO_OPEN) are left to the full risk gate."""
+    BUY_TO_OPEN, SELL_TO_OPEN) are left to the full risk gate.
+
+    Enforced here against the synced snapshot; the OrderManager applies the same
+    invariant (via ``reduce_only_breach``) against LIVE broker state at submit as
+    a backstop for the between-syncs concurrent-exit window (F022)."""
 
     name = "reduce_only"
-    _closing_sides = (OrderSide.SELL, OrderSide.SELL_TO_CLOSE, OrderSide.BUY_TO_CLOSE)
 
     def check(self, ctx: RiskContext) -> None:
-        if ctx.order.legs:
-            # Multi-leg option order: the parent symbol is the underlying, never
-            # itself a position (public.com submits only the legs). Validate each
-            # closing leg against its own contract position; opening legs are
-            # gated by the size/exposure/leverage rules like any other open.
-            for leg in ctx.order.legs:
-                if leg.side not in self._closing_sides:
-                    continue
-                position = ctx.portfolio.position_for(leg.contract_symbol)
-                held = position.quantity if position is not None else Decimal(0)
-                available = -held if leg.side is OrderSide.BUY_TO_CLOSE else held
-                available = available if available > 0 else Decimal(0)
-                closing = leg.quantity * ctx.order.quantity  # ratio qty x spreads
-                if closing > available:
-                    raise RiskViolation(
-                        self.name,
-                        f"{leg.side.value} {closing} {leg.contract_symbol} exceeds the "
-                        f"closable position ({available}) — the platform does not open short positions",
-                    )
-            return
-        if ctx.order.side not in self._closing_sides:
-            return  # opening orders are gated by the size/exposure/leverage rules
-        position = ctx.portfolio.position_for(ctx.order.symbol)
-        held = position.quantity if position is not None else Decimal(0)
-        # BUY_TO_CLOSE covers a short (held < 0); the others close a long.
-        available = -held if ctx.order.side is OrderSide.BUY_TO_CLOSE else held
-        # A position only shrinks when an exit FILLS, so unfilled same-direction
-        # orders still open at the broker already consume the closable quantity.
-        # Without subtracting them, a resting exit (e.g. an unfilled guardian
-        # stop) plus a second exit (review cycle / manual ticket) each pass
-        # alone and together oversell the book into a short. Direction is
-        # matched via is_buy because broker open-order snapshots normalize
-        # *_to_close sides to plain buy/sell (e.g. alpaca._row_to_order).
-        symbol = ctx.order.symbol.upper()
-        pending = sum(
-            (max(o.quantity - o.filled_quantity, Decimal(0))
-             for o in ctx.portfolio.open_orders
-             if o.symbol.upper() == symbol
-             and o.status.is_open_at_broker
-             and o.side.is_buy == ctx.order.side.is_buy),
-            Decimal(0),
-        )
-        available -= pending
-        available = available if available > 0 else Decimal(0)
-        if ctx.order.quantity > available:
-            raise RiskViolation(
-                self.name,
-                f"{ctx.order.side.value} {ctx.order.quantity} {ctx.order.symbol} exceeds the "
-                f"closable position ({available} after {pending} already pending in open "
-                f"closing orders) — the platform does not open short positions",
-            )
+        def held_for(symbol: str) -> Decimal:
+            position = ctx.portfolio.position_for(symbol)
+            return position.quantity if position is not None else Decimal(0)
+
+        msg = reduce_only_breach(ctx.order, held_for, ctx.portfolio.open_orders)
+        if msg is not None:
+            raise RiskViolation(self.name, msg)
 
 
 ALL_RULES: list[RiskRule] = [

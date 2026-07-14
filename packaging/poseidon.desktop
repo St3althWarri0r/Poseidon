@@ -1,9 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Poseidon
-Comment=Autonomous AI trading platform
-Exec=poseidon app
-Icon=utilities-terminal
+GenericName=AI Trading Platform
+Comment=Start Poseidon and open the trading dashboard
+Exec=poseidon-launch
+Icon=poseidon
 Terminal=false
+StartupNotify=true
 Categories=Office;Finance;
-Keywords=trading;portfolio;stocks;
+Keywords=trading;portfolio;stocks;poseidon;

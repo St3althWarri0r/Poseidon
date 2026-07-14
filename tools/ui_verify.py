@@ -269,13 +269,16 @@ class FakeKernel:
         self.sync = FakeSync()
         self.mode = TradingMode.APPROVAL
         self.portfolio = PortfolioState()
+        # Large balances on purpose: an Alpaca paper account holds ~$42M, which
+        # used to spill past the Equity/Cash tiles. Keeping it here makes the
+        # tile-overflow check below a permanent regression guard.
         self.portfolio.account = AccountSnapshot(
-            broker="paper", account_id="SIM-1", equity=Decimal("118472.55"),
-            cash=Decimal("24880.10"), buying_power=Decimal("24880.10"),
-            day_pnl=Decimal("642.18"), as_of=NOW)
+            broker="paper", account_id="SIM-1", equity=Decimal("42126536.54"),
+            cash=Decimal("42126536.54"), buying_power=Decimal("42126536.54"),
+            day_pnl=Decimal("76536.54"), as_of=NOW)
         self.portfolio.synced_at = NOW
-        self.portfolio.day_start_equity = Decimal("117830.37")
-        self.portfolio.peak_equity = Decimal("119510.00")
+        self.portfolio.day_start_equity = Decimal("42050000.00")
+        self.portfolio.peak_equity = Decimal("42300000.00")
 
         def mk(s, q, avg, mv, pnl):  # noqa: ANN001
             return Position(symbol=s, quantity=Decimal(q), avg_entry_price=Decimal(avg),
@@ -375,6 +378,19 @@ async def drive() -> None:
         check("nav: terminal entry present",
               await page.locator('nav a[href="/terminal/"]').count() == 1)
         await page.screenshot(path=f"{SHOTS}/v-overview.png")
+
+        # A large balance ($42M) must fit its tile, not spill past it — checked
+        # at a narrow viewport (tightest tiles), which also exercises the
+        # resize -> refit path. No .tile-value may overflow its box.
+        await page.set_viewport_size({"width": 820, "height": 1000})
+        await page.wait_for_timeout(300)
+        overflow = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('.tile-value'))"
+            ".filter(el => el.scrollWidth - el.clientWidth > 1)"
+            ".map(el => (el.id || el.className) + '=' + el.textContent)")
+        check("overview tiles fit large balances (no overflow)", overflow == [],
+              f"overflowing: {overflow}")
+        await page.set_viewport_size({"width": 1600, "height": 1000})
 
         # -- Portfolio: Close button, notional, Fill column, fills tape ---
         await page.click('a[data-view="portfolio"]')

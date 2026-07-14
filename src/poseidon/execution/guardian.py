@@ -78,7 +78,23 @@ class PositionGuardian:
         if order.side.is_buy and order.decision_id:
             await self._register_plan_for(order)
         elif order.side.is_risk_reducing:
-            await self._maybe_deactivate(order.symbol, "position reduced/closed")
+            position = self._kernel.portfolio.position_for(order.symbol)  # type: ignore[attr-defined]
+            still_open = position is not None and position.quantity > 0
+            if order.strategy == "guardian" and still_open:
+                # The guardian's own exit only PARTIALLY closed (the rest
+                # canceled/expired). _trigger_exit already latched the plan
+                # inactive, and a partial-then-terminal exit is routed to
+                # ORDER_FILLED (not ORDER_UPDATED), so the on_order_update
+                # re-arm never fires. Re-arm here or the residual has no stop
+                # between review cycles.
+                await self._rearm(order.symbol)
+                await self._kernel.bus.publish(Topics.NOTIFY, {  # type: ignore[attr-defined]
+                    "level": "warning", "title": f"Guardian exit partial: {order.symbol}",
+                    "body": f"Exit filled {order.filled_quantity}; {position.quantity} still "
+                            "held — stop re-armed for the remainder. Review the position.",
+                })
+            else:
+                await self._maybe_deactivate(order.symbol, "position reduced/closed")
 
     async def _register_plan_for(self, order: Order) -> None:
         row = await self._db.fetch_one(

@@ -324,14 +324,13 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     @app.post("/api/halt")
     async def halt(body: dict[str, Any] | None = None) -> JSONResponse:
         reason = (body or {}).get("reason", "manual halt from dashboard")
-        kernel.risk.circuit.force_open(str(reason))
-        await kernel.audit.append("human", "trading.halted", {"reason": reason})
+        # Routed through the kernel so the halt is persisted (survives a restart).
+        await kernel.halt(str(reason))
         return JSONResponse({"ok": True})
 
     @app.post("/api/resume")
     async def resume() -> JSONResponse:
-        kernel.risk.circuit.force_close()
-        await kernel.audit.append("human", "trading.resumed", {})
+        await kernel.resume()
         return JSONResponse({"ok": True})
 
     @app.post("/api/cycle")

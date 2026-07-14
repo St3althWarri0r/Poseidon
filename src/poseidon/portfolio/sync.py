@@ -110,6 +110,12 @@ class PortfolioSyncService:
             self._state.tax_lots = lots
             self._state.dividends = dividends
             self._state.synced_at = now
+            # A DIFFERENT real account at the same broker scope (account_scope
+            # is name:paper|live and cannot tell two live accounts apart) must
+            # not inherit the prior account's loss/drawdown anchors. Detect the
+            # account_id change and drop the restored baselines so the
+            # re-baseline below re-anchors to THIS account on the same pass.
+            await self._reanchor_on_account_change(account.account_id)
             # Re-anchor for deposits/withdrawals BEFORE recording equity: the
             # peak must shift before a deposit-inflated mark can ratchet it.
             await self._apply_external_flows(broker, now)
@@ -120,6 +126,15 @@ class PortfolioSyncService:
                 await self._db.kv_set("baseline.peak.equity", str(self._state.peak_equity))
 
             await self._roll_baselines(now, broker.account_scope)
+            # Persist the flow-adjusted / intraday troughs (mirrors the peak at
+            # 125-126) so a same-day restart restores the true session low instead
+            # of rebuilding a pre-deposit low from raw marks — a phantom drawdown
+            # that would latch the loss/drawdown halts. Written AFTER
+            # _roll_baselines because that resets the troughs at a day/week boundary.
+            if self._state.day_min_equity is not None:
+                await self._db.kv_set("baseline.day.min", str(self._state.day_min_equity))
+            if self._state.week_min_equity is not None:
+                await self._db.kv_set("baseline.week.min", str(self._state.week_min_equity))
             await self._db.execute(
                 "INSERT OR REPLACE INTO equity_marks (at, equity, cash, day_pnl, broker) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -135,6 +150,42 @@ class PortfolioSyncService:
             if was_disconnected:
                 await self._bus.publish(Topics.BROKER_RECONNECTED, {"broker": broker.name})
             await self._bus.publish(Topics.ACCOUNT_SYNCED, self._state.snapshot_dict())
+
+    async def _reanchor_on_account_change(self, account_id: str) -> None:
+        """Clear the restored loss/drawdown baselines when the connected
+        account_id differs from the one they belong to.
+
+        ``account_scope`` (name:paper|live) is identical for two different real
+        accounts at the same brokerage, so ``restore_baselines`` happily
+        restores account A's day/week/peak anchors onto account B. Left as-is
+        the loss and drawdown halts measure B against A's numbers — a bigger B
+        never halts; a smaller B latches a phantom drawdown. Here we detect the
+        change and reset the in-memory anchors plus the persisted boundary keys;
+        ``record_equity`` (peak/troughs from None) and ``_roll_baselines`` (day/
+        week from the cleared keys) then re-anchor to B's equity on this pass.
+
+        Note (minimal-fix limitation): ``equity_marks`` remain keyed by
+        ``account_scope``, so two accounts at the same scope still share an
+        equity table; this fixes the safety-critical halt anchoring, not the
+        equity-curve mixing (that needs an account_id-scoped mark key)."""
+        stored_id = await self._db.kv_get("baseline.account_id")
+        if stored_id and account_id and stored_id != account_id:
+            self._state.day_start_equity = None
+            self._state.week_start_equity = None
+            self._state.peak_equity = None
+            self._state.day_min_equity = None
+            self._state.week_min_equity = None
+            await self._db.kv_set("baseline.day.date", "")
+            await self._db.kv_set("baseline.week.key", "")
+            await self._db.kv_set("baseline.peak.equity", "")
+            await self._db.kv_set("baseline.day.min", "")
+            await self._db.kv_set("baseline.week.min", "")
+            await self._db.kv_set("baseline.flows.cursor", "")
+            log.warning("account changed within the same broker scope; loss/drawdown "
+                        "baselines re-anchored to the new account",
+                        was=stored_id, now=account_id)
+        if account_id:
+            await self._db.kv_set("baseline.account_id", account_id)
 
     async def _apply_external_flows(self, broker: Broker, now: datetime) -> None:
         """Shift the loss/drawdown anchors by net deposits/withdrawals.
@@ -191,6 +242,11 @@ class PortfolioSyncService:
             self._state.day_min_equity = equity  # clear the intraday loss/drawdown latch
             await self._db.kv_set("baseline.day.date", eastern_date.isoformat())
             await self._db.kv_set("baseline.day.equity", str(equity))
+            # Persist the reset trough in the SAME boundary block as its date/equity
+            # key, so a crash cannot leave a new-day date paired with a stale trough
+            # (which restore would read as a phantom drawdown, F020). The same-day
+            # ratchet is persisted separately in sync_once.
+            await self._db.kv_set("baseline.day.min", str(equity))
             # New ISO week?
             week_key = f"{eastern_date.isocalendar().year}-W{eastern_date.isocalendar().week}"
             stored_week = await self._db.kv_get("baseline.week.key")
@@ -199,6 +255,7 @@ class PortfolioSyncService:
                 self._state.week_min_equity = equity  # clear the weekly loss latch
                 await self._db.kv_set("baseline.week.key", week_key)
                 await self._db.kv_set("baseline.week.equity", str(equity))
+                await self._db.kv_set("baseline.week.min", str(equity))
 
     async def restore_baselines(self) -> None:
         """Reload baselines and peak equity from the DB — at startup and
@@ -229,15 +286,24 @@ class PortfolioSyncService:
                     # Restore the session trough so the intraday loss/drawdown
                     # halt latch survives a restart — record_equity would
                     # otherwise seed it with the (possibly recovered) current
-                    # equity and silently clear the halt. If the stored date is
-                    # stale, _roll_baselines resets this on the first sync.
-                    self._state.day_min_equity = await self._min_mark_since(
-                        scope, date.fromisoformat(day_date))
+                    # equity and silently clear the halt. Prefer the persisted
+                    # flow-adjusted trough (baseline.day.min) over the raw-marks
+                    # rebuild, which resurrects a pre-deposit low as a phantom
+                    # drawdown (F020); fall back to _min_mark_since for installs
+                    # with no persisted trough yet. If the stored date is stale,
+                    # _roll_baselines resets this on the first sync.
+                    stored_day_min = await self._db.kv_get("baseline.day.min")
+                    self._state.day_min_equity = (
+                        Decimal(stored_day_min) if stored_day_min
+                        else await self._min_mark_since(scope, date.fromisoformat(day_date)))
                 if week_equity and week_key:
                     self._state.week_start_equity = Decimal(week_equity)
                     year_s, _, week_s = week_key.partition("-W")
                     monday = date.fromisocalendar(int(year_s), int(week_s), 1)
-                    self._state.week_min_equity = await self._min_mark_since(scope, monday)
+                    stored_week_min = await self._db.kv_get("baseline.week.min")
+                    self._state.week_min_equity = (
+                        Decimal(stored_week_min) if stored_week_min
+                        else await self._min_mark_since(scope, monday))
                 # Prefer the flow-adjusted peak persisted by sync_once — the
                 # raw MAX(equity_marks) fallback would resurrect a
                 # pre-withdrawal peak as a phantom drawdown.
@@ -251,6 +317,8 @@ class PortfolioSyncService:
                 await self._db.kv_set("baseline.day.date", "")
                 await self._db.kv_set("baseline.week.key", "")
                 await self._db.kv_set("baseline.peak.equity", "")
+                await self._db.kv_set("baseline.day.min", "")
+                await self._db.kv_set("baseline.week.min", "")
                 await self._db.kv_set("baseline.flows.cursor", "")
             if peak is None:
                 row = await self._db.fetch_one(

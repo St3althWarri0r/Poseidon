@@ -197,7 +197,13 @@ class Broker(abc.ABC):
         try:
             return response.json()
         except ValueError as exc:
-            raise BrokerError(self.name, "invalid JSON in response") from exc
+            # An unparseable body arrives AFTER a <400 status, i.e. after the
+            # broker received the request — a post-send failure. On a
+            # non-idempotent submit the outcome is unknown, so raise it
+            # ambiguous + non-retryable (never auto-resubmitted) exactly like
+            # the timeout / 5xx branches above; auto-retrying could double-fill.
+            raise BrokerError(self.name, "invalid JSON in response",
+                              retryable=idempotent, ambiguous=not idempotent) from exc
 
 
 class UnsupportedBroker(Broker):

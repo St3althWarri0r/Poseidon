@@ -27,10 +27,14 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import structlog
+
 from ...core.enums import BrokerCapability, OrderStatus
 from ...core.errors import BrokerError, OrderRejectedError
 from ...core.models import AccountSnapshot, Fill, Order, Position, Quote, TaxLot
 from ..base import Broker
+
+log = structlog.get_logger(__name__)
 
 QuoteFn = Callable[[str], Awaitable[Quote]]
 
@@ -351,15 +355,28 @@ class PaperBroker(Broker):
             "open_orders": [o.model_dump(mode="json") for o in self._open_orders.values()],
             "fills": [f.model_dump(mode="json") for f in self._fills],
         }
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(self._state_file)
+        # Best effort: persistence is a durability nicety, but the in-memory
+        # book is the authoritative session state. If the write fails (e.g.
+        # ENOSPC) mid-fill, swallowing it here keeps the book/order-ledger
+        # consistent and avoids escaping a raw OSError (a non-BrokerError) that
+        # would abort the review cycle. A failed save just loses on-disk
+        # durability until the next successful one.
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            tmp.replace(self._state_file)
+        except OSError as exc:
+            log.warning("paper broker could not persist state; continuing in-memory", error=str(exc))
 
     def _load_state(self) -> None:
         if self._state_file is None or not self._state_file.exists():
             return
-        state = json.loads(self._state_file.read_text(encoding="utf-8"))
+        try:
+            state = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            raise BrokerError(self.name, f"corrupt paper state file {self._state_file}: {exc}",
+                              retryable=False) from exc
         self._cash = Decimal(state.get("cash", str(_DEFAULT_CASH)))
         self._positions = state.get("positions", {})
         self._lots = state.get("lots", [])

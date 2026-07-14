@@ -258,6 +258,12 @@ class SchwabBroker(Broker):
         return result
 
     async def submit_order(self, order: Order) -> Order:
+        if order.legs:
+            # This plugin only builds a SINGLE-leg orderStrategyType. Fail loud
+            # rather than silently dropping the other legs and submitting a
+            # naked leg whose real risk differs from what the engine vetted.
+            raise BrokerError(self.name, "Schwab plugin does not support multi-leg option orders",
+                              retryable=False)
         is_option = order.asset_class is AssetClass.OPTION
         body: dict[str, Any] = {
             "orderType": {

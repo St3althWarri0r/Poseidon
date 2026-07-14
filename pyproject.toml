@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poseidon"
-version = "2.6.0"
+version = "2.7.0"
 description = "Autonomous AI trading platform with Claude as the portfolio manager. Private, single-user, Linux-native."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -55,6 +55,7 @@ dev = [
 
 [project.scripts]
 poseidon = "poseidon.cli:main"
+poseidon-launch = "poseidon.launcher:main"  # GUI double-click launcher (packaging/poseidon.desktop)
 
 [project.entry-points."poseidon.brokers"]
 # Third-party broker plugins register here; built-ins are discovered internally.

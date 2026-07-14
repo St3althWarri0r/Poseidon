@@ -25,11 +25,16 @@ obvious filesystem/network/exec primitives at runtime.
 These layers stop imports and forbidden-builtin calls, but the in-process
 restricted-builtins sandbox is NOT a complete boundary: attribute/object-graph
 traversal (e.g. via a ``str.format`` template like ``"{0.__class__}"``) can
-still read reachable module globals without importing or calling anything —
-the static screen exists specifically to catch those read/exfil escapes, and
-true isolation would require out-of-process execution. This matters because
-AI-authored drafts can be test-run/backtested by the operator *before*
-activation, so untrusted code runs even before approval. Activation is the
+still read reachable module globals without importing or calling anything. The
+static screen flags the NAIVE forms of this — a literal traversal template, and
+a direct ``.format``/``.format_map`` call on a non-literal template — as friendly
+early feedback, but it is a lint-level guardrail, NOT a security boundary:
+aliasing the bound method (``f = tmpl.format; f(ctx)``), ``getattr``, and other
+reflective forms bypass it by construction. This class of read-escape is
+ultimately contained by the restricted-builtins sandbox below and, for full
+isolation, out-of-process execution — never by the static screen alone. This matters because AI-authored
+drafts can be test-run/backtested by the operator *before* activation, so
+untrusted code runs even before approval. Activation is the
 trust decision for letting an algorithm's signals feed live review cycles,
 and only the operator can activate.
 """
@@ -170,6 +175,20 @@ def validate_algorithm(source: str) -> list[str]:
             # attribute name itself must not be a forbidden builtin.
             elif isinstance(fn, ast.Attribute) and fn.attr in _FORBIDDEN_CALLS:
                 problems.append(f"call to '.{fn.attr}()' is not allowed in an algorithm")
+            # Best-effort lint (NOT a boundary — aliasing the bound method or getattr
+            # bypasses it; see the module docstring): flag a direct .format/.format_map
+            # call on a template the static screen cannot read as a literal (a name, a
+            # concatenation, a chr()-assembled string), which can do the same
+            # '{0.__func__.__globals__}' field traversal the literal-constant screen
+            # below only catches for plain string literals.
+            elif (isinstance(fn, ast.Attribute) and fn.attr in {"format", "format_map"}
+                  and not (isinstance(fn.value, ast.Constant)
+                           and isinstance(fn.value.value, str))):
+                problems.append(
+                    f"'.{fn.attr}()' on a non-literal template is not allowed — a "
+                    "runtime-assembled format string can traverse the object graph "
+                    "the static screen cannot read"
+                )
             # Indirect call through subscription: ([open][0])(...),
             # __builtins__['__import__'](...) — a classic validator bypass.
             elif isinstance(fn, ast.Subscript):

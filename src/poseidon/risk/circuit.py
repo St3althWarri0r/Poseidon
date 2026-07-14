@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from pathlib import Path
 
 import structlog
 
@@ -21,13 +22,18 @@ log = structlog.get_logger(__name__)
 
 class CircuitBreaker:
     def __init__(self, *, error_threshold: int, window_seconds: float,
-                 cooldown_seconds: float) -> None:
+                 cooldown_seconds: float, halt_file: Path | None = None) -> None:
         self._threshold = error_threshold
         self._window = window_seconds
         self._cooldown = cooldown_seconds
         self._errors: deque[float] = deque()
         self._open_until = 0.0
         self._manual_reason: str | None = None
+        # Out-of-band kill switch: if this file exists the breaker reads open,
+        # independent of process/DB state. An operator (or a cron/watchdog) can
+        # `touch` it to halt all trading even when the dashboard or DB is
+        # unreachable; checked fresh on every is_open read.
+        self._halt_file = halt_file
 
     def record_error(self, reason: str = "") -> bool:
         """Record an execution-path error. Returns True if this trip opened
@@ -53,14 +59,21 @@ class CircuitBreaker:
         self._open_until = 0.0
         self._errors.clear()
 
+    def _halt_file_present(self) -> bool:
+        return self._halt_file is not None and self._halt_file.exists()
+
     @property
     def is_open(self) -> bool:
-        return self._manual_reason is not None or time.monotonic() < self._open_until
+        return (self._manual_reason is not None
+                or self._halt_file_present()
+                or time.monotonic() < self._open_until)
 
     @property
     def reason(self) -> str | None:
         if self._manual_reason:
             return self._manual_reason
+        if self._halt_file_present():
+            return f"filesystem HALT active ({self._halt_file})"
         if time.monotonic() < self._open_until:
             remaining = int(self._open_until - time.monotonic())
             return f"error-rate trip, {remaining}s of cooldown remaining"

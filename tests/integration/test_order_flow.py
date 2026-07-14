@@ -78,7 +78,7 @@ async def stack(tmp_path):
     session_patch = patch.object(MarketClock, "session", return_value=MarketSession.REGULAR)
     session_patch.start()
     yield {"manager": manager, "approvals": approvals, "broker": broker, "db": db,
-           "audit": audit, "sync": sync, "risk": risk, "bus": bus}
+           "audit": audit, "sync": sync, "risk": risk, "bus": bus, "portfolio": portfolio}
     session_patch.stop()
     await bus.close()
     await db.close()
@@ -198,3 +198,199 @@ class TestManualTrading:
         order = await stack["manager"].submit_manual(self._manual(qty="5000"))
         assert order.status is OrderStatus.REJECTED_RISK
         assert order.status_reason
+
+
+async def test_f018_ambiguous_submit_reserves_exposure(tmp_path) -> None:
+    # An ambiguous submit failure leaves the order possibly-live at the broker,
+    # so it must reserve in-flight exposure (promote to _pending) or the NEXT
+    # opening trade validates as if it does not exist and stacks past the caps.
+    from poseidon.core.config import RiskConfig
+    from poseidon.core.errors import BrokerError
+    from poseidon.core.models import AccountSnapshot, Position
+
+    bus = EventBus()
+    router = DataRouter([(FakeProvider(name="feed", price="100"), 10)], FreshnessPolicy())
+    broker = PaperBroker(credentials={}, options={
+        "starting_cash": "100000", "state_file": str(tmp_path / "paper.json")})
+    broker.set_quote_fn(lambda s: router.quote(s, allow_delayed=True))
+    await broker.connect()
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    now = datetime.now(UTC)
+    portfolio = PortfolioState()
+    portfolio.account = AccountSnapshot(
+        broker="paper", account_id="t", equity=Decimal("100000"),
+        cash=Decimal("100000"), buying_power=Decimal("500000"), as_of=now)
+    # $150k held -> gross 150k, so a 2.0x/$200k cap leaves exactly $50k headroom.
+    portfolio.positions = [Position(symbol="HELD", quantity=Decimal("1500"),
+                                    avg_entry_price=Decimal("100"), as_of=now)]
+    portfolio.synced_at = now
+    config = RiskConfig(max_leverage=2.0, max_portfolio_exposure_pct=2.0,
+                        max_position_pct=1.0, max_order_notional=Decimal("100000"),
+                        news_blackout_minutes_before_econ=0)
+    risk = RiskEngine(config, portfolio, router, MarketClock(), bus)
+    manager = OrderManager(broker, risk, ApprovalQueue(bus), db, AuditLog(db), bus,
+                           mode=TradingMode.AUTONOMOUS)
+    try:
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            # A ($40k) validates (150k+40k=190k<200k), then submit raises ambiguous.
+            a = Order(symbol="AAA", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("400"), limit_price=Decimal("100"))
+            with patch.object(broker, "submit_order", side_effect=BrokerError(
+                    "paper", "post-send timeout", retryable=False, ambiguous=True)):
+                a = await manager.submit_manual(a)
+            assert a.status is OrderStatus.ERROR
+            # F018-specific: a possibly-live ambiguous order is promoted to the
+            # DURABLE _pending reservation (released only when a sync proves it
+            # gone), not left in the 15-min-blind-pruned _validated_notional stash.
+            assert a.id in risk._pending
+            assert a.id not in risk._validated_notional
+
+            # B ($40k): post-fix, A's ambiguous reservation counts, so
+            # 150k+40k+40k=230k > 200k and B is rejected. Pre-fix A reserved
+            # nothing, so B passes and the two stack past the 2.0x cap.
+            b = Order(symbol="BBB", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("400"), limit_price=Decimal("100"))
+            b = await manager.submit_manual(b)
+            assert b.status is OrderStatus.REJECTED_RISK, f"expected reject, got {b.status}"
+    finally:
+        await db.close()
+        await bus.close()
+
+
+async def test_f022_concurrent_market_exit_blocks_oversell(stack) -> None:
+    # Two exits race on a 100-share long. A guardian MARKET SELL 100 fills
+    # (position -> 0) but no re-sync happens, so a racing SELL 40 still validates
+    # against the stale synced held=100. The submit-time backstop reads LIVE
+    # positions() (=0) and rejects it at the RISK layer before the broker —
+    # closing the between-syncs oversell window (F022).
+    m = stack["manager"]
+    buy = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.MARKET,
+                quantity=Decimal("100"))
+    await m.submit_manual(buy)
+    await stack["sync"].sync_once()
+    assert stack["portfolio"].position_for("AAPL").quantity == Decimal("100")
+
+    # Guardian's own MARKET exit fills the whole position (paper position -> 0).
+    exit1 = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                  quantity=Decimal("100"), strategy="guardian")
+    await m.submit_manual(exit1)
+    # NO re-sync: the synced snapshot still shows held=100, open_orders=[].
+    assert stack["portfolio"].position_for("AAPL").quantity == Decimal("100")
+
+    # Racing second exit: stale validation would pass (held 100), but the
+    # live-state backstop (positions()=0) rejects it. Pre-fix it reaches the
+    # broker and comes back REJECTED_BROKER (paper: insufficient position).
+    exit2 = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                  quantity=Decimal("40"))
+    exit2 = await m.submit_manual(exit2)
+    assert exit2.status is OrderStatus.REJECTED_RISK, f"got {exit2.status}"
+    assert "reduce_only" in (exit2.status_reason or "")
+
+
+async def test_f022_lone_full_exit_is_not_trapped(stack) -> None:
+    # The backstop must NEVER block a legitimate lone exit of the true position:
+    # its own order is not yet at the broker, so live held=100 and working=0 give
+    # available=100 >= the SELL 100 — it fills. (Guards the never-trap-an-exit
+    # half of the reduce-only invariant against a future over-eager backstop.)
+    m = stack["manager"]
+    await m.submit_manual(Order(symbol="AAPL", side=OrderSide.BUY,
+                                order_type=OrderType.MARKET, quantity=Decimal("100")))
+    await stack["sync"].sync_once()
+    exit_order = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                       quantity=Decimal("100"))
+    exit_order = await m.submit_manual(exit_order)
+    assert exit_order.status is OrderStatus.FILLED, f"lone exit trapped: {exit_order.status}"
+
+
+def _risk_stack(tmp_path, mode):
+    # Real OrderManager + RiskEngine + PaperBroker with $150k held (gross 150k) and a
+    # 2.0x / $200k cap -> exactly $50k headroom. Caller closes db + bus.
+    from poseidon.core.config import RiskConfig
+    from poseidon.core.models import AccountSnapshot, Position
+
+    bus = EventBus()
+    router = DataRouter([(FakeProvider(name="feed", price="100"), 10)], FreshnessPolicy())
+    broker = PaperBroker(credentials={}, options={
+        "starting_cash": "100000", "state_file": str(tmp_path / "paper.json")})
+    broker.set_quote_fn(lambda s: router.quote(s, allow_delayed=True))
+    now = datetime.now(UTC)
+    portfolio = PortfolioState()
+    portfolio.account = AccountSnapshot(broker="paper", account_id="t", equity=Decimal("100000"),
+                                        cash=Decimal("100000"), buying_power=Decimal("500000"),
+                                        as_of=now)
+    portfolio.positions = [Position(symbol="HELD", quantity=Decimal("1500"),
+                                    avg_entry_price=Decimal("100"), as_of=now)]
+    portfolio.synced_at = now
+    config = RiskConfig(max_leverage=2.0, max_portfolio_exposure_pct=2.0, max_position_pct=1.0,
+                        max_order_notional=Decimal("100000"), news_blackout_minutes_before_econ=0)
+    db = Database(tmp_path / "t.db")
+    risk = RiskEngine(config, portfolio, router, MarketClock(), bus)
+    approvals = ApprovalQueue(bus)
+    manager = OrderManager(broker, risk, approvals, db, AuditLog(db), bus, mode=mode)
+    return manager, risk, approvals, broker, db, bus
+
+
+def _buy_decision(symbol: str) -> Decision:
+    return Decision(
+        action=DecisionAction.BUY,
+        trades=[ProposedTrade(symbol=symbol, side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                              quantity=Decimal("400"), limit_price=Decimal("100"), strategy="m")],
+        rationale=TradeRationale(thesis="t", timing="now", expected_edge="e", risk="r", reward="w",
+                                 confidence=0.8, portfolio_impact="s", exit_plan=ExitPlan(),
+                                 max_expected_loss="$100"),
+        cycle_id="t", created_at=datetime.now(UTC))
+
+
+async def test_f021_approval_decline_releases_reservation(tmp_path) -> None:
+    # F021 regression (adversarial review): a risk-increasing order validated in
+    # APPROVAL mode stages its notional; a human DECLINE / TTL expiry must release it,
+    # or the phantom reservation wrongly blocks the next legitimate order for 15 min.
+    import asyncio
+
+    manager, risk, approvals, broker, db, bus = _risk_stack(tmp_path, TradingMode.APPROVAL)
+    await broker.connect()
+    await db.open()
+    try:
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            # A ($40k) validates + stages, reaches the approval gate, human DECLINES.
+            task_a = asyncio.create_task(manager.execute_decision(_buy_decision("AAA")))
+            for _ in range(400):
+                await asyncio.sleep(0.005)
+                if approvals.pending():
+                    break
+            else:
+                raise AssertionError("order A never reached the approval queue")
+            a = approvals.pending()[0].order
+            approvals.resolve(a.id, approved=False)
+            result_a = (await task_a)[0]
+            assert result_a.status is OrderStatus.REJECTED_HUMAN
+            # The declined order released its staged reservation (pre-fix it leaked).
+            assert a.id not in risk._validated_notional, "declined order leaked its reservation"
+            # And a fresh $40k BUY validates cleanly (150k + 40k = 190k < 200k); pre-fix
+            # A's phantom $40k made this 230k > 200k and it was wrongly rejected.
+            await risk.validate_order(Order(symbol="BBB", side=OrderSide.BUY,
+                order_type=OrderType.LIMIT, quantity=Decimal("400"), limit_price=Decimal("100")))
+    finally:
+        await db.close()
+        await bus.close()
+
+
+async def test_f022_backstop_fails_closed_on_positions_error(tmp_path) -> None:
+    # F022 regression (adversarial review): the live-state backstop is the safety net;
+    # a NON-BrokerError from positions() must fail CLOSED (RiskViolation), not escape
+    # _guard_reduce_only unhandled and disarm the exit.
+    from poseidon.core.errors import RiskViolation
+
+    manager, risk, approvals, broker, db, bus = _risk_stack(tmp_path, TradingMode.AUTONOMOUS)
+    await broker.connect()
+    await db.open()
+    try:
+        sell = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                     quantity=Decimal("10"))
+        with patch.object(broker, "positions", side_effect=KeyError("bad broker payload")), \
+                pytest.raises(RiskViolation, match="reduce_only"):
+            await manager._guard_reduce_only(sell, [])
+    finally:
+        await db.close()
+        await bus.close()
