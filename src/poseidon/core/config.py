@@ -76,6 +76,11 @@ class AIConfig(StrictModel):
     monthly_budget_usd: float = Field(default=0.0, ge=0)
     # Post-trade reflection → lesson-memory loop (advisory; see ReflectionConfig).
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
+    # reflection). Same backend + endpoint as the primary, model swapped. None =
+    # no tiering (all roles use the primary). The trading decision always uses
+    # the primary model.
+    utility_model: str | None = None
 
     @model_validator(mode="after")
     def _check_backend(self) -> AIConfig:
