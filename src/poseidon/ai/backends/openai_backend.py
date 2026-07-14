@@ -71,6 +71,11 @@ class OpenAICompatibleBackend:
             data = r.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise AgentError(f"local model backend error: {exc}") from exc
+        if not isinstance(data, dict):
+            # A 2xx body that is valid JSON but not an object (null, a list, a
+            # bare scalar) would raise AttributeError on the structural access
+            # below and escape the AgentError channel the callers handle.
+            raise AgentError(f"local model backend returned non-object JSON body: {type(data).__name__}")
 
         choice = (data.get("choices") or [{}])[0]
         msg = dict(choice.get("message") or {})
@@ -83,6 +88,13 @@ class OpenAICompatibleBackend:
                 args = json.loads(fn.get("arguments") or "{}")
             except (json.JSONDecodeError, TypeError):
                 log.warning("dropping tool call with unparseable arguments", name=fn.get("name"))
+                continue
+            if not isinstance(args, dict):
+                # Valid JSON that is not an object ('[]', '5', '"x"') is not a
+                # usable argument mapping. submit_decision bypasses the dispatcher,
+                # so a non-dict here would reach _parse_decision directly; drop it
+                # rather than forward a non-mapping.
+                log.warning("dropping tool call with non-object arguments", name=fn.get("name"))
                 continue
             calls.append(ToolCall(id=tc.get("id", ""), name=fn.get("name", ""), input=args))
         usage = data.get("usage") or {}

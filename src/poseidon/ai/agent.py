@@ -27,6 +27,12 @@ from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
 
+# Actions whose semantics forbid new trades. A weak local model can contradict
+# itself — set action to one of these yet leave a populated trade in the payload;
+# since execution gates on ``decision.trades``, the trade would slip through. When
+# that happens the trades are voided (see _parse_decision).
+_NO_TRADE_ACTIONS = frozenset({DecisionAction.NO_ACTION, DecisionAction.HOLD})
+
 SYSTEM_PROMPT = """\
 You are the portfolio manager for Poseidon, a private, single-user automated \
 trading platform. You manage the user's brokerage account with discipline, patience, \
@@ -182,9 +188,28 @@ class ClaudeAgent:
         )
 
     def _parse_decision(self, payload: dict[str, Any], cycle_id: str, model: str) -> Decision:
+        if not isinstance(payload, dict):
+            # A weak local model can emit submit_decision arguments that decode to
+            # a non-object (list/scalar). Honor the "malformed -> no action, never
+            # crash" contract instead of raising out of the cycle.
+            log.error("submit_decision payload was not an object — no action", cycle=cycle_id)
+            return self._no_action_decision(cycle_id, "malformed decision payload (not an object)")
         trades: list[ProposedTrade] = []
         malformed = False
-        for t in payload.get("trades", []) or []:
+        raw_trades = payload.get("trades")
+        if not isinstance(raw_trades, list):
+            # A weak model may send trades as a single object or a scalar rather
+            # than an array; treat any non-list as no trades (flagging a truthy
+            # one malformed so it cannot read as a clean no_action).
+            if raw_trades:
+                malformed = True
+                log.error("decision trades field was not a list — voiding", cycle=cycle_id)
+            raw_trades = []
+        for t in raw_trades:
+            if not isinstance(t, dict):
+                malformed = True
+                log.error("dropping non-object trade from decision", trade=t)
+                continue
             try:
                 quantity = Decimal(str(t["quantity"]))
                 if not quantity.is_finite() or quantity <= 0:
@@ -207,7 +232,7 @@ class ClaudeAgent:
                         take_profit=Decimal(str(t["take_profit"])) if t.get("take_profit") else None,
                     )
                 )
-            except (KeyError, ValueError, InvalidOperation) as exc:
+            except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
                 malformed = True
                 log.error("dropping malformed trade from decision", trade=t, error=str(exc))
         if malformed and trades:
@@ -218,37 +243,63 @@ class ClaudeAgent:
             trades = []
         rationale: TradeRationale | None = None
         raw_rationale = payload.get("rationale")
-        if raw_rationale:
-            exit_raw = raw_rationale.get("exit_plan") or {}
-            rationale = TradeRationale(
-                thesis=raw_rationale.get("thesis", ""),
-                timing=raw_rationale.get("timing", ""),
-                expected_edge=raw_rationale.get("expected_edge", ""),
-                risk=raw_rationale.get("risk", ""),
-                reward=raw_rationale.get("reward", ""),
-                confidence=min(max(float(raw_rationale.get("confidence", 0.0)), 0.0), 1.0),
-                supporting_indicators=list(raw_rationale.get("supporting_indicators", [])),
-                supporting_news=list(raw_rationale.get("supporting_news", [])),
-                portfolio_impact=raw_rationale.get("portfolio_impact", ""),
-                exit_plan=ExitPlan(
-                    stop_loss=Decimal(str(exit_raw["stop_loss"])) if exit_raw.get("stop_loss") else None,
-                    take_profit=Decimal(str(exit_raw["take_profit"])) if exit_raw.get("take_profit") else None,
-                    time_stop=exit_raw.get("time_stop"),
-                    notes=exit_raw.get("notes"),
-                ),
-                max_expected_loss=raw_rationale.get("max_expected_loss", ""),
-                alternative_scenarios=list(raw_rationale.get("alternative_scenarios", [])),
-            )
+        if isinstance(raw_rationale, dict) and raw_rationale:
+            try:
+                exit_raw = raw_rationale.get("exit_plan")
+                exit_raw = exit_raw if isinstance(exit_raw, dict) else {}
+                rationale = TradeRationale(
+                    thesis=raw_rationale.get("thesis", ""),
+                    timing=raw_rationale.get("timing", ""),
+                    expected_edge=raw_rationale.get("expected_edge", ""),
+                    risk=raw_rationale.get("risk", ""),
+                    reward=raw_rationale.get("reward", ""),
+                    confidence=min(max(float(raw_rationale.get("confidence", 0.0)), 0.0), 1.0),
+                    supporting_indicators=list(raw_rationale.get("supporting_indicators", [])),
+                    supporting_news=list(raw_rationale.get("supporting_news", [])),
+                    portfolio_impact=raw_rationale.get("portfolio_impact", ""),
+                    exit_plan=ExitPlan(
+                        stop_loss=Decimal(str(exit_raw["stop_loss"])) if exit_raw.get("stop_loss") else None,
+                        take_profit=Decimal(str(exit_raw["take_profit"])) if exit_raw.get("take_profit") else None,
+                        time_stop=exit_raw.get("time_stop"),
+                        notes=exit_raw.get("notes"),
+                    ),
+                    max_expected_loss=raw_rationale.get("max_expected_loss", ""),
+                    alternative_scenarios=list(raw_rationale.get("alternative_scenarios", [])),
+                )
+            except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
+                # A weak model can emit a malformed rationale (non-numeric
+                # confidence, non-object exit_plan, wrong-typed lists). Leaving
+                # rationale None lets the mandatory-explainability void below drop
+                # the trades, rather than raising out of the cycle.
+                log.error("dropping malformed rationale from decision",
+                          cycle=cycle_id, error=str(exc))
+                rationale = None
         if trades and rationale is None:
             # Explainability is mandatory: trades without a rationale are void.
             log.error("decision proposed trades without rationale — voiding trades", cycle=cycle_id)
             trades = []
+        try:
+            action = DecisionAction(payload.get("action", "no_action"))
+        except ValueError:
+            # Unknown action string from a weak model — default to no action
+            # rather than raising out of the cycle.
+            log.error("unknown decision action — defaulting to no_action",
+                      cycle=cycle_id, action=payload.get("action"))
+            action = DecisionAction.NO_ACTION
+        if action in _NO_TRADE_ACTIONS and trades:
+            # action and trades must agree. A self-contradictory no_action/hold
+            # that still carries trades would otherwise execute (the cycle gates
+            # on decision.trades, never decision.action).
+            log.error("no-trade action carried trades — voiding trades",
+                      cycle=cycle_id, action=action.value)
+            trades = []
+        raw_gaps = payload.get("data_gaps")
         return Decision(
-            action=DecisionAction(payload.get("action", "no_action")),
+            action=action,
             trades=trades,
             rationale=rationale,
             data_sources=sorted(self._dispatcher.sources_used),
-            data_gaps=[str(g) for g in (payload.get("data_gaps") or [])],
+            data_gaps=[str(g) for g in raw_gaps] if isinstance(raw_gaps, list) else [],
             summary=str(payload.get("summary", "")),
             model=model,
             cycle_id=cycle_id,
