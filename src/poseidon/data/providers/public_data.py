@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ...core.enums import OptionRight
@@ -198,13 +198,13 @@ class PublicDataProvider(MarketDataProvider):
                         symbol=symbol.upper(),
                         open=Decimal(str(row["open"])), high=Decimal(str(row["high"])),
                         low=Decimal(str(row["low"])), close=Decimal(str(row["close"])),
-                        volume=int(float(row.get("volume", 0))),
+                        volume=int(float(row.get("volume", 0) or 0)),  # explicit null -> 0
                         # Public reports the session-close instant (20:00Z for
                         # daily bars), so start already marks the bar end.
                         start=start, end=start, source=self.name,
                     )
                 )
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation, TypeError):
                 continue
         if not bars:
             raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")

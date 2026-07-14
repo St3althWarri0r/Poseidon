@@ -214,6 +214,9 @@ class OrderManager:
             order.status = OrderStatus.REJECTED_RISK
             order.status_reason = f"required live data unavailable: {exc}"
             await self._persist(order)
+            await self._audit.append("risk", "order.rejected",
+                                     {"order_id": order.id, "reason": str(exc),
+                                      "cause": "data_unavailable"})
             await self._bus.publish(Topics.ORDER_REJECTED,
                                     {"order": order.model_dump(mode="json"), "reason": str(exc)})
             return order
@@ -242,6 +245,15 @@ class OrderManager:
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = f"post-approval re-check failed: {exc}"
                 await self._persist(order)
+                # The approval was just audited; the rejection of that same
+                # human-approved order must also enter the chain (and reach the
+                # dashboard), or the log shows an approved order that vanishes.
+                await self._audit.append("risk", "order.rejected",
+                                         {"order_id": order.id, "reason": str(exc),
+                                          "stage": "post_approval"})
+                await self._bus.publish(Topics.ORDER_REJECTED,
+                                        {"order": order.model_dump(mode="json"),
+                                         "reason": order.status_reason})
                 return order
 
         order.status = OrderStatus.APPROVED
@@ -314,6 +326,22 @@ class OrderManager:
         # rare and this is a single-user platform, so serializing submissions
         # is acceptable and safer than a narrow window).
         async with self._submit_lock:
+            # Re-check the emergency HALT / circuit breaker: it may have tripped
+            # during the validate->submit window (an operator HALT / filesystem
+            # sentinel, or the error-rate breaker opening from a sibling order's
+            # failures, or a long approval wait). validate_order checked it, but
+            # that was before the approval gate and the guard/preflight
+            # round-trips — the HALT must block a real order right up to submit.
+            if self._risk.circuit.is_open:
+                order.status = OrderStatus.REJECTED_RISK
+                order.status_reason = f"halted before submit: {self._risk.circuit.reason}"
+                await self._persist(order)
+                await self._audit.append("risk", "order.rejected",
+                                         {"order_id": order.id, "reason": order.status_reason})
+                await self._bus.publish(Topics.ORDER_REJECTED,
+                                        {"order": order.model_dump(mode="json"),
+                                         "reason": order.status_reason})
+                return order
             try:
                 await self._guard_duplicate(order)
             except DuplicateOrderError as exc:

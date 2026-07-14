@@ -16,7 +16,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .enums import (
     AssetClass,
@@ -334,6 +334,19 @@ class ProposedTrade(PoseidonModel):
     # never arms one symbol's stop against another's price.
     stop_loss: Money | None = None
     take_profit: Money | None = None
+
+    @model_validator(mode="after")
+    def _require_prices_for_type(self) -> ProposedTrade:
+        # A limit / stop-limit trade needs a limit_price; a stop / stop-limit
+        # needs a stop_price. Without this a price-less LIMIT proposal reaches
+        # a broker that fills it AT MARKET, bypassing SlippageProtectionRule's
+        # fat-finger guard. Rejected here voids the whole decision in
+        # _parse_decision (coupled legs must not partially execute).
+        if self.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and self.limit_price is None:
+            raise ValueError(f"{self.order_type.value} order requires a limit_price")
+        if self.order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and self.stop_price is None:
+            raise ValueError(f"{self.order_type.value} order requires a stop_price")
+        return self
 
 
 class Decision(PoseidonModel):

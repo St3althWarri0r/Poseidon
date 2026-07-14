@@ -94,7 +94,14 @@ class TradierBroker(Broker):
         b = payload.get("balances") or {}
         margin = b.get("margin") or {}
         cash_block = b.get("cash") or {}
-        buying_power = margin.get("stock_buying_power") or cash_block.get("cash_available") or b.get("total_cash", 0)
+        # stock_buying_power can legitimately be 0 (a maxed-out margin account);
+        # an `or` chain would treat that as missing and over-report buying power
+        # to BuyingPowerRule, so take the first field that is present (not None).
+        buying_power = next(
+            (v for v in (margin.get("stock_buying_power"), cash_block.get("cash_available"),
+                         b.get("total_cash")) if v is not None),
+            0,
+        )
         return AccountSnapshot(
             broker=self.name, account_id=self._account_id,
             equity=Decimal(str(b.get("total_equity", 0))),
@@ -115,11 +122,18 @@ class TradierBroker(Broker):
             cost = Decimal(str(p.get("cost_basis", 0)))
             symbol = p.get("symbol", "")
             asset_class = AssetClass.OPTION if len(symbol) > 12 else AssetClass.EQUITY
+            avg = (cost / qty) if qty else Decimal(0)
+            # Tradier cost_basis is the TOTAL dollar cost; for options that is
+            # already x100 per contract, but the domain model and
+            # PortfolioState._position_notional expect the per-share premium
+            # (they re-apply the x100 multiplier), so divide it back out — else
+            # option exposure reads 100x too high and blocks legit trades.
+            if asset_class is AssetClass.OPTION and qty:
+                avg = avg / Decimal(100)
             result.append(
                 Position(
                     symbol=symbol, asset_class=asset_class, quantity=qty,
-                    avg_entry_price=(cost / qty) if qty else Decimal(0),
-                    broker=self.name, as_of=now,
+                    avg_entry_price=avg, broker=self.name, as_of=now,
                 )
             )
         return result
@@ -145,7 +159,13 @@ class TradierBroker(Broker):
                 raise BrokerError(self.name, f"invalid option side {order.side}", retryable=False)
             # Tradier wants the underlying in `symbol` and the OCC in `option_symbol`.
             occ = order.symbol.upper()
-            root = occ[: next(i for i, c in enumerate(occ) if c.isdigit())]
+            # A digit-less symbol would make a bare next() raise StopIteration
+            # (not a BrokerError) and abort the whole review cycle — reject it
+            # cleanly instead.
+            idx = next((i for i, c in enumerate(occ) if c.isdigit()), -1)
+            if idx <= 0:
+                raise BrokerError(self.name, f"invalid OCC option symbol {occ!r}", retryable=False)
+            root = occ[:idx]
             data["symbol"] = root
             data["option_symbol"] = occ
             data["side"] = _OPTION_SIDES[order.side]

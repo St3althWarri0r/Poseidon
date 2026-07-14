@@ -249,9 +249,18 @@ class IBKRBroker(Broker):
             "DELETE",
             f"{self._base}/iserver/account/{self._account_id}/order/{order.broker_order_id}",
         )
-        order.status = OrderStatus.CANCELED
-        order.updated_at = datetime.now(UTC)
-        return order
+        # Cancel is asynchronous at IBKR: the DELETE only queues the request and
+        # an in-flight fill can still land. Adopt the broker's authoritative
+        # status (order_status exposes cum_fill) instead of hard-setting
+        # CANCELED, so a last-moment fill is never recorded as a zero-fill
+        # cancel that leaves a real position untracked and mis-audited.
+        try:
+            return await self.order_status(order)
+        except BrokerError:
+            order.status = OrderStatus.ACCEPTED
+            order.status_reason = "cancel requested — awaiting broker confirmation"
+            order.updated_at = datetime.now(UTC)
+            return order
 
     async def order_status(self, order: Order) -> Order:
         if not order.broker_order_id:

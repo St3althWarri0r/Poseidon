@@ -270,6 +270,18 @@ class DataRouter:
                     log_fn("provider failed, failing over",
                            provider=slot.provider.name, capability=capability, error=str(exc))
                     continue
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    # A provider returned an unparseable value (e.g.
+                    # Decimal("N/A") -> InvalidOperation, float(None) ->
+                    # TypeError, or a model ValidationError on inf/nan). These
+                    # are NOT PoseidonErrors, so without this they would escape
+                    # failover entirely and violate the DataError contract.
+                    # Treat as a provider failure and fail over.
+                    slot.record_failure()
+                    errors.append(f"{slot.provider.name}: malformed data ({exc})")
+                    log.warning("provider returned malformed data, failing over",
+                                provider=slot.provider.name, capability=capability, error=str(exc))
+                    continue
                 slot.record_success((time.monotonic() - started) * 1000)
                 return result
         raise AllProvidersFailedError(

@@ -7,7 +7,7 @@ parameter.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ...core.errors import ProviderError, ProviderRateLimitError
@@ -77,7 +77,10 @@ class TwelveDataProvider(MarketDataProvider):
                         start=start, end=bar_end(start, timeframe), source=self.name,
                     )
                 )
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation, TypeError):
+                # A non-numeric/empty OHLC string makes Decimal(...) raise
+                # InvalidOperation (an ArithmeticError, NOT a ValueError) — skip
+                # the one malformed row, don't let it abort the whole request.
                 continue
         bars.reverse()
         if not bars:
