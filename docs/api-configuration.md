@@ -44,6 +44,31 @@ data no matter which model decides them), so enable the Alpaca IEX feed below �
 the free finnhub/twelvedata/alphavantage tiers are too delayed to clear
 `data.real_time_max_age_seconds`.
 
+## Reflection → lesson-memory loop
+
+When a position closes, Poseidon can distill a short **advisory lesson** (was the
+call right, the realized return and alpha vs SPY, one actionable takeaway) and
+re-inject the relevant recent lessons into future review cycles — a learning
+loop on top of the audited decision record.
+
+```yaml
+ai:
+  reflection:
+    enabled: true        # write a lesson when a position closes
+    inject: true         # feed relevant lessons into future cycle prompts
+    max_injected: 8      # hard cap on lessons per cycle prompt
+    per_symbol: 2        # newest lessons per relevant ticker
+    global_n: 3          # newest lessons overall (cross-ticker)
+    lookback_days: 120   # ignore lessons older than this
+```
+
+Lessons are **advisory context only**: they never gate or bypass the risk
+engine, never enter the order path, and are kept out of the tamper-evident audit
+chain (their own `trade_lessons` table). `inject: false` keeps writing lessons
+but stops feeding them to the model (a reviewable ledger); `enabled: false`
+turns the loop off. Use `inject: false` if you want to eyeball a weaker local
+model's lesson quality before it influences decisions.
+
 ## Market data providers
 
 Configure several — failover is automatic and free. Priorities decide the

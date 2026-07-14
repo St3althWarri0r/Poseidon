@@ -20,10 +20,13 @@ import json
 import os
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+from ..core.models import TradeLesson
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -48,6 +51,9 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+-- Makes the reflection sweep's "newer than watermark" bound efficient.
+CREATE INDEX IF NOT EXISTS idx_orders_scope_status_updated
+    ON orders(account_scope, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +135,33 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     content TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Advisory post-trade lessons (reflection memory). NOT the tamper-evident
+-- audit chain: this is retrospective prose fed back to the AI as context.
+CREATE TABLE IF NOT EXISTS trade_lessons (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT '',
+    decision_id TEXT,
+    entered_at TEXT NOT NULL,
+    exited_at TEXT NOT NULL,
+    realized_return REAL NOT NULL,
+    alpha REAL,
+    holding_days REAL NOT NULL,
+    lesson TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trade_lessons_symbol ON trade_lessons(symbol, created_at);
 """
+
+
+def _row_to_lesson(r: tuple[Any, ...]) -> TradeLesson:
+    return TradeLesson(
+        id=r[0], symbol=r[1], strategy=r[2], decision_id=r[3],
+        entered_at=datetime.fromisoformat(r[4]), exited_at=datetime.fromisoformat(r[5]),
+        realized_return=r[6], alpha=r[7], holding_days=r[8], lesson=r[9],
+        model=r[10], created_at=datetime.fromisoformat(r[11]))
 
 
 class Database:
@@ -244,3 +276,50 @@ class Database:
     async def kv_get(self, key: str, default: Any = None) -> Any:
         row = await self.fetch_one("SELECT value FROM kv WHERE key = ?", (key,))
         return json.loads(row[0]) if row else default
+
+    # -- trade lessons (advisory reflection memory; NOT the audit chain) -------
+
+    async def add_trade_lesson(self, lesson: TradeLesson) -> None:
+        await self.execute(
+            "INSERT OR REPLACE INTO trade_lessons (id, symbol, strategy, decision_id, "
+            "entered_at, exited_at, realized_return, alpha, holding_days, lesson, model, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (lesson.id, lesson.symbol, lesson.strategy, lesson.decision_id,
+             lesson.entered_at.isoformat(), lesson.exited_at.isoformat(),
+             lesson.realized_return, lesson.alpha, lesson.holding_days,
+             lesson.lesson, lesson.model, lesson.created_at.isoformat()),
+        )
+
+    async def lesson_exists(self, symbol: str, entered_at: datetime,
+                            exited_at: datetime) -> bool:
+        row = await self.fetch_one(
+            "SELECT 1 FROM trade_lessons WHERE symbol = ? AND entered_at = ? "
+            "AND exited_at = ? LIMIT 1",
+            (symbol, entered_at.isoformat(), exited_at.isoformat()),
+        )
+        return row is not None
+
+    async def recent_lessons(self, symbols: list[str], *, per_symbol: int,
+                             global_n: int, lookback_days: int, limit: int,
+                             now: datetime) -> list[TradeLesson]:
+        cutoff = (now - timedelta(days=lookback_days)).isoformat()
+        picked: dict[str, TradeLesson] = {}
+        # Up to `per_symbol` newest lessons for each requested symbol.
+        for symbol in symbols:
+            rows = await self.fetch_all(
+                "SELECT * FROM trade_lessons WHERE symbol = ? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (symbol, cutoff, per_symbol),
+            )
+            for r in rows:
+                picked[r[0]] = _row_to_lesson(r)
+        # Plus up to `global_n` newest lessons overall (cross-ticker).
+        rows = await self.fetch_all(
+            "SELECT * FROM trade_lessons WHERE created_at >= ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (cutoff, global_n),
+        )
+        for r in rows:
+            picked[r[0]] = _row_to_lesson(r)
+        ordered = sorted(picked.values(), key=lambda lsn: lsn.exited_at, reverse=True)
+        return ordered[:limit]

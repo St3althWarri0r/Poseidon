@@ -365,6 +365,46 @@ class Decision(PoseidonModel):
     created_at: datetime | None = None
 
 
+class TradeLesson(PoseidonModel):
+    """A distilled, ADVISORY lesson from a closed position.
+
+    Advisory context only: never gates or bypasses the risk engine, and is kept
+    out of the tamper-evident audit chain (it lives in its own trade_lessons
+    table). Retrospective — it must not assert a current market price.
+    """
+
+    id: str
+    symbol: str
+    strategy: str = ""
+    decision_id: str | None = None
+    entered_at: datetime
+    exited_at: datetime
+    realized_return: float
+    alpha: float | None = None
+    holding_days: float
+    lesson: str
+    model: str = ""
+    created_at: datetime
+
+
+class ClosedPosition(PoseidonModel):
+    """The Reflector's input view of a just-closed position episode."""
+
+    symbol: str
+    strategy: str = ""
+    decision_id: str | None = None
+    is_short: bool
+    quantity: Decimal
+    entry_price: Decimal
+    exit_price: Decimal
+    entered_at: datetime
+    exited_at: datetime
+    realized_return: float
+    alpha: float | None = None
+    holding_days: float
+    thesis: str = ""
+
+
 # --------------------------------------------------------------------------
 # Misc runtime records
 # --------------------------------------------------------------------------

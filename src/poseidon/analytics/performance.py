@@ -30,6 +30,7 @@ class FillRecord:
     price: Decimal
     at: datetime
     strategy: str = ""
+    decision_id: str = ""  # originating entry decision (for reflection linkage)
     multiplier: Decimal = Decimal(1)  # OCC contract multiplier (100 for options)
 
 
@@ -44,6 +45,7 @@ class RoundTrip:
     exited_at: datetime
     is_short: bool = False
     multiplier: Decimal = Decimal(1)
+    decision_id: str = ""  # carried from the entry lot (reflection linkage)
 
     @property
     def pnl(self) -> Decimal:
@@ -81,7 +83,7 @@ def build_round_trips(fills: list[FillRecord]) -> list[RoundTrip]:
                 RoundTrip(symbol=symbol, strategy=lot.strategy or f.strategy,
                           quantity=matched, entry_price=lot.price, exit_price=f.price,
                           entered_at=lot.at, exited_at=f.at, is_short=is_short,
-                          multiplier=lot.multiplier)
+                          multiplier=lot.multiplier, decision_id=lot.decision_id)
             )
             lot.quantity -= matched
             remaining -= matched
@@ -92,7 +94,7 @@ def build_round_trips(fills: list[FillRecord]) -> list[RoundTrip]:
         symbol = f.symbol.upper()
         lot = FillRecord(symbol=symbol, side=f.side, quantity=f.quantity,
                          price=f.price, at=f.at, strategy=f.strategy,
-                         multiplier=f.multiplier)
+                         decision_id=f.decision_id, multiplier=f.multiplier)
         if f.side in (OrderSide.BUY, OrderSide.BUY_TO_OPEN):
             long_lots[symbol].append(lot)
         elif f.side is OrderSide.SELL_TO_OPEN:

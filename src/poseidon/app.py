@@ -22,6 +22,7 @@ from . import __version__
 from .ai.agent import ClaudeAgent
 from .ai.backends import ChatBackend, build_backend
 from .ai.chat import ChatService
+from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
 from .analytics.performance import FillRecord, build_round_trips, compute_performance
@@ -70,6 +71,8 @@ class ApplicationKernel:
         self.bus = EventBus()
         self.clock = MarketClock()
         self.portfolio = PortfolioState()
+        # Advisory reflection loop; the real service is built in start().
+        self.reflection: ReflectionService | None = None
 
         # populated in start()
         self.db: Database
@@ -172,6 +175,13 @@ class ApplicationKernel:
         )
         self._backend = build_backend(cfg.ai, self.vault.get)
         self.agent = ClaudeAgent(cfg.ai, self._backend, dispatcher)
+        # Advisory post-trade reflection loop (never gates risk / touches orders).
+        self.reflection = ReflectionService(
+            db=self.db, router=self.router, config=cfg.ai.reflection, model=cfg.ai.model,
+            get_backend=lambda: self.agent.backend if self.agent else None,
+            load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
+            audit_append=self.audit.append)
+        self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
         # concurrent chat tool call must not inject provenance into that
@@ -668,6 +678,9 @@ class ApplicationKernel:
                 # Trusted attribution for sleeve caps: only symbols a sleeved
                 # strategy actually signalled this cycle get its cap.
                 self.risk.set_cycle_attribution(list(signals))
+                lessons = (await self.reflection.relevant_lessons(
+                    self.config.all_watchlist_symbols())
+                    if self.reflection is not None else None)
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -675,6 +688,7 @@ class ApplicationKernel:
                     strategy_signals=[s.as_dict() for s in signals],
                     market_session=self.clock.session().value,
                     market_regime=await self._regime_line(),
+                    trade_lessons=lessons,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -884,6 +898,44 @@ class ApplicationKernel:
         report = compute_performance(equity_points, trips).as_dict()
         report["open_exit_plans"] = await self.guardian.active_plans()
         return report
+
+    def _symbol_is_flat(self, symbol: str) -> bool:
+        p = self.portfolio.position_for(symbol)
+        return p is None or p.quantity == 0
+
+    async def _load_reflection_fills(self, symbol: str | None,
+                                     since: str | None = None) -> list[FillRecord]:
+        """Filled orders (account-scoped) as FillRecords threaded with the
+        originating decision_id, for the reflection loop. Symbol filtering is in
+        Python — the orders table keys symbol inside the JSON payload. `since`
+        (an ISO updated_at) bounds the per-sync sweep so it never reloads the
+        whole filled-order history on each ACCOUNT_SYNCED event."""
+        from decimal import Decimal
+
+        from .core.enums import AssetClass, OrderSide, OrderStatus
+        from .core.models import Order
+        sql = "SELECT payload, decision_id FROM orders WHERE status = ? AND account_scope = ?"
+        params: tuple[str, ...] = (OrderStatus.FILLED.value, self.broker.account_scope)
+        if since:
+            sql += " AND updated_at > ?"
+            params = (*params, since)
+        sql += " ORDER BY updated_at ASC"
+        rows = await self.db.fetch_all(sql, params)
+        fills: list[FillRecord] = []
+        for (payload, decision_id) in rows:
+            order = Order.model_validate(json.loads(payload))
+            if order.filled_quantity <= 0 or order.avg_fill_price is None:
+                continue
+            if symbol is not None and order.symbol != symbol:
+                continue
+            fills.append(FillRecord(
+                symbol=order.symbol, side=OrderSide(order.side),
+                quantity=Decimal(str(order.filled_quantity)),
+                price=Decimal(str(order.avg_fill_price)),
+                at=order.updated_at or datetime.now(UTC),
+                strategy=order.strategy, decision_id=decision_id or "",
+                multiplier=Decimal(100) if order.asset_class is AssetClass.OPTION else Decimal(1)))
+        return fills
 
     async def send_daily_report(self) -> None:
         """End-of-day digest through the notification channels."""

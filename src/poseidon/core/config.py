@@ -37,6 +37,24 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ReflectionConfig(StrictModel):
+    """Post-trade reflection → lesson-memory loop (advisory).
+
+    Defaults give the closed loop: write a lesson on each close and re-inject
+    relevant lessons into future cycles. ``inject: false`` makes it a reviewed
+    ledger (written but not fed to the model); ``enabled: false`` turns it off.
+    Lessons are advisory context only — they never gate or bypass the risk
+    engine, and they are kept out of the tamper-evident audit chain.
+    """
+
+    enabled: bool = True
+    inject: bool = True
+    max_injected: int = Field(default=8, ge=0)
+    per_symbol: int = Field(default=2, ge=0)
+    global_n: int = Field(default=3, ge=0)
+    lookback_days: int = Field(default=120, ge=1)
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -56,6 +74,8 @@ class AIConfig(StrictModel):
     # Hard monthly spend ceiling; review cycles pause when the estimate hits
     # it (0 disables the ceiling).
     monthly_budget_usd: float = Field(default=0.0, ge=0)
+    # Post-trade reflection → lesson-memory loop (advisory; see ReflectionConfig).
+    reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
 
     @model_validator(mode="after")
     def _check_backend(self) -> AIConfig:
