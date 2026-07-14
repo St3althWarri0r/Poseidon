@@ -60,9 +60,11 @@ class OpenAICompatibleBackend:
         }
         if tools:
             payload["tools"] = _to_openai_tools(tools)
-            payload["tool_choice"] = (
-                {"type": "function", "function": {"name": force_tool}} if force_tool else "auto"
-            )
+            # LM Studio (and many OpenAI-compatible servers) accept tool_choice
+            # only as a string ("auto"/"required"/"none"), NOT a specific-function
+            # object. force_tool is only used where exactly one tool is offered
+            # (the algorithm reviewer), so "required" forces that single tool.
+            payload["tool_choice"] = "required" if force_tool else "auto"
         try:
             r = await self._client.post("/chat/completions", json=payload)
             r.raise_for_status()

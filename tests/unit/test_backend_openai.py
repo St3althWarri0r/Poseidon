@@ -63,7 +63,8 @@ async def test_force_tool_sets_tool_choice() -> None:
     await b.complete([{"role": "user", "content": "x"}],
                      tools=[{"name": "rev", "description": "", "input_schema": {"type": "object"}}],
                      system="s", force_tool="rev")
-    assert captured["body"]["tool_choice"] == {"type": "function", "function": {"name": "rev"}}
+    # LM Studio only accepts string tool_choice; "required" forces the sole tool.
+    assert captured["body"]["tool_choice"] == "required"
 
 
 async def test_plain_text_end() -> None:
