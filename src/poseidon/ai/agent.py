@@ -87,6 +87,11 @@ class ClaudeAgent:
         self._dispatcher = dispatcher
         self._cycle_usage: dict[str, int] = {}
 
+    @property
+    def backend(self) -> ChatBackend:
+        """The shared chat backend (read-only) — used by the reflection loop."""
+        return self._backend
+
     def last_cycle_usage(self) -> dict[str, int]:
         """Tokens accumulated during the most recent cycle — readable even when
         the cycle aborted before producing a Decision, so already-billed usage
