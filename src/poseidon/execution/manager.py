@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -40,6 +41,7 @@ from ..core.errors import (
 from ..core.events import EventBus, Topics
 from ..core.models import Decision, Order, ProposedTrade
 from ..risk.engine import RiskEngine
+from ..risk.rules import reduce_only_breach
 from ..security.audit import AuditLog
 from ..storage.db import Database
 from .approvals import ApprovalQueue
@@ -244,6 +246,9 @@ class OrderManager:
             except (RiskViolation, CircuitBreakerOpen, DataError) as exc:
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = f"post-approval re-check failed: {exc}"
+                # Staged at the first gate; drop that reservation now it will not
+                # submit, or it over-counts exposure against later orders (F021).
+                self._risk.release_validated(order.id)
                 await self._persist(order)
                 # The approval was just audited; the rejection of that same
                 # human-approved order must also enter the chain (and reach the
@@ -314,6 +319,7 @@ class OrderManager:
         if reason is not None:
             order.status = OrderStatus.REJECTED_BROKER
             order.status_reason = reason
+            self._risk.release_validated(order.id)  # validated but never submitted (F021)
             await self._persist(order)
             await self._audit.append("system", "order.capability_rejected",
                                      {"order_id": order.id, "reason": reason})
@@ -335,6 +341,7 @@ class OrderManager:
             if self._risk.circuit.is_open:
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = f"halted before submit: {self._risk.circuit.reason}"
+                self._risk.release_validated(order.id)  # (F021)
                 await self._persist(order)
                 await self._audit.append("risk", "order.rejected",
                                          {"order_id": order.id, "reason": order.status_reason})
@@ -343,7 +350,8 @@ class OrderManager:
                                          "reason": order.status_reason})
                 return order
             try:
-                await self._guard_duplicate(order)
+                live_open = await self._guard_duplicate(order)
+                await self._guard_reduce_only(order, live_open)
             except DuplicateOrderError as exc:
                 # Terminal rejection, not an escape: an escaping exception
                 # would leave the row APPROVED forever (blocking broker
@@ -351,8 +359,23 @@ class OrderManager:
                 # decision's remaining trades.
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = str(exc)
+                self._risk.release_validated(order.id)  # (F021)
                 await self._persist(order)
                 await self._audit.append("system", "order.duplicate_rejected",
+                                         {"order_id": order.id, "reason": str(exc)})
+                await self._bus.publish(Topics.ORDER_REJECTED,
+                                        {"order": order.model_dump(mode="json"),
+                                         "reason": str(exc)})
+                return order
+            except RiskViolation as exc:
+                # Live-state reduce-only breach caught at submit (F022): a racing
+                # exit reduced the true position after this order validated against
+                # a staler snapshot. Terminal reject, mirroring the duplicate path.
+                order.status = OrderStatus.REJECTED_RISK
+                order.status_reason = str(exc)
+                self._risk.release_validated(order.id)
+                await self._persist(order)
+                await self._audit.append("risk", "order.reduce_only_rejected",
                                          {"order_id": order.id, "reason": str(exc)})
                 await self._bus.publish(Topics.ORDER_REJECTED,
                                         {"order": order.model_dump(mode="json"),
@@ -365,6 +388,7 @@ class OrderManager:
             if preflight_reason is not None:
                 order.status = OrderStatus.REJECTED_BROKER
                 order.status_reason = preflight_reason
+                self._risk.release_validated(order.id)  # (F021)
                 await self._persist(order)
                 await self._audit.append("system", "order.preflight_rejected",
                                          {"order_id": order.id, "reason": preflight_reason})
@@ -390,9 +414,21 @@ class OrderManager:
                                 f"submit outcome unknown ({exc}); not resubmitted — will be "
                                 "reconciled against the broker, or verify at the brokerage"
                             )
+                            # Possibly live and consuming buying power: reserve its
+                            # validated notional as in-flight exposure (promote
+                            # _validated_notional -> _pending) so the next opening
+                            # trade in this decision cannot stack past the caps as if
+                            # it did not exist; _reconcile_pending releases it once a
+                            # sync proves it gone (F018).
+                            self._risk.note_order_submitted(order)
                         else:
                             order.status = OrderStatus.ERROR if exc.retryable else OrderStatus.REJECTED_BROKER
                             order.status_reason = str(exc)
+                            # Definitive non-submit (broker rejected, or retries
+                            # exhausted on a retryable error = never reached the
+                            # matching engine per brokers/base): drop the stash so it
+                            # does not over-count exposure against later orders (F021).
+                            self._risk.release_validated(order.id)
                         await self._persist(order)
                         await self._audit.append("system", "order.submit_failed",
                                                  {"order_id": order.id, "error": str(exc),
@@ -416,7 +452,7 @@ class OrderManager:
         self._spawn_poller(order, broker)
         return order
 
-    async def _guard_duplicate(self, order: Order) -> None:
+    async def _guard_duplicate(self, order: Order) -> list[Order]:
         row = await self._db.fetch_one(
             "SELECT status FROM orders WHERE client_order_id = ? AND id != ?",
             (order.client_order_id, order.id),
@@ -424,12 +460,51 @@ class OrderManager:
         if row is not None:
             raise DuplicateOrderError(f"client_order_id {order.client_order_id} already used")
         # Same-cycle guard: identical open order (symbol+side+qty) at the broker.
-        for open_order in await self._safe_open_orders():
+        # Return the live open orders so the reduce-only backstop reuses this one
+        # broker round-trip (a single consistent snapshot for both checks).
+        open_orders = await self._safe_open_orders()
+        for open_order in open_orders:
             if (open_order.symbol == order.symbol and open_order.side == order.side
                     and open_order.quantity == order.quantity):
                 raise DuplicateOrderError(
                     f"an identical open order for {order.symbol} already exists at the broker"
                 )
+        return open_orders
+
+    async def _guard_reduce_only(self, order: Order, open_orders: list[Order]) -> None:
+        """Live-state reduce-only backstop, run under ``_submit_lock``. The engine's
+        ``ReduceOnlyRule`` validates against the synced portfolio snapshot, which
+        can be up to 120s stale, so two exits that race between syncs can both pass
+        it and oversell a long into a short (F022). Because ``_submit_lock``
+        serializes submissions, by the time a second exit reaches here the first is
+        already broker-observable — filled (reflected in ``positions()``), resting
+        (in ``open_orders``), or rejected — so re-checking the invariant against
+        LIVE broker state closes the window. Held comes from a live
+        ``positions()`` fetch, NOT the synced snapshot, because a synchronous
+        market-exit fill is gone from ``open_orders`` yet reflected in
+        ``positions()``.
+
+        Residuals (documented, not fully closed): (1) on a real broker whose
+        position feed lags a just-filled MARKET exit, ``positions()`` may still
+        show the pre-exit quantity — this shrinks the oversell window to broker
+        propagation latency rather than eliminating it (airtight only for the
+        synchronous PaperBroker). (2) on a ``positions()`` error it fails closed
+        (rejects the exit), which during a broker position-feed outage is in
+        tension with never-trap-an-exit; the alternative (fall back to the synced
+        held) would reopen the window during that outage."""
+        if not (order.side.is_risk_reducing
+                or any(leg.side.is_risk_reducing for leg in order.legs)):
+            return  # opening order: reduce-only does not apply; skip the positions() fetch
+        try:
+            positions = await self._broker.positions()
+        except BrokerError as exc:
+            raise RiskViolation(
+                "reduce_only", f"cannot verify live position to bound this close: {exc}"
+            ) from exc
+        held = {p.symbol.upper(): p.quantity for p in positions}
+        msg = reduce_only_breach(order, lambda s: held.get(s.upper(), Decimal(0)), open_orders)
+        if msg is not None:
+            raise RiskViolation("reduce_only", f"live reduce-only breach at submit: {msg}")
 
     async def _safe_open_orders(self) -> list[Order]:
         try:

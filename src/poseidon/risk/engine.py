@@ -61,9 +61,10 @@ class RiskEngine:
         # stack past the gross/leverage/options/position/sector caps.
         # order_id -> (client_order_id, SYMBOL, notional, is_option, submitted_at)
         self._pending: dict[str, tuple[str, str, Decimal, bool, datetime]] = {}
-        # order_id -> (notional, is_option, validated_at); staged at validation,
-        # promoted to _pending on submit (or pruned if never submitted).
-        self._validated_notional: dict[str, tuple[Decimal, bool, datetime]] = {}
+        # order_id -> (SYMBOL, notional, is_option, validated_at); staged at
+        # validation, promoted to _pending on submit, released on a pre-submit
+        # rejection, or pruned after 15 min if neither happens.
+        self._validated_notional: dict[str, tuple[str, Decimal, bool, datetime]] = {}
 
     # -- accounting ----------------------------------------------------------
 
@@ -94,8 +95,17 @@ class RiskEngine:
         if validated is not None and not order.side.is_risk_reducing:
             self._pending[order.id] = (
                 order.client_order_id, order.symbol.upper(),
-                validated[0], validated[1], datetime.now(UTC),
+                validated[1], validated[2], datetime.now(UTC),
             )
+
+    def release_validated(self, order_id: str) -> None:
+        """Drop a staged validation reservation for an order validated but then
+        rejected BEFORE submission (capability / duplicate / preflight /
+        circuit-halt / post-approval re-check / broker reject). Without this the
+        stash keeps counting as in-flight exposure against later orders until the
+        15-min prune. An ambiguous submit (possibly live) is the one exception —
+        it is promoted to _pending via note_order_submitted instead (F018)."""
+        self._validated_notional.pop(order_id, None)
 
     def _reconcile_pending(self) -> None:
         """Release a reservation once a portfolio sync taken after submission
@@ -158,12 +168,28 @@ class RiskEngine:
                 log.warning("economic calendar unavailable; blackout rule will pass empty")
         order_sector, position_sectors = await self._gather_sectors(order)
 
-        pending_gross = sum((n for _c, _s, n, _o, _t in self._pending.values()), Decimal(0))
-        pending_options = sum(
-            (n for _c, _s, n, is_opt, _t in self._pending.values() if is_opt), Decimal(0)
-        )
+        # In-flight exposure = submitted-but-unsynced (_pending) PLUS validated-
+        # but-not-yet-submitted (_validated_notional). Summing BOTH closes the
+        # window where two genuinely concurrent pipelines (a manual dashboard
+        # order and a review-cycle order) each validate before either submits and
+        # so each sees zero pending. Staging at validation is what makes this
+        # correct: the read->rules->stage span below is await-free, so two
+        # validators cannot interleave within it. The order's OWN stash is
+        # excluded, or approval-mode re-validation would count it against itself.
+        pending_gross = Decimal(0)
+        pending_options = Decimal(0)
         pending_by_symbol: dict[str, Decimal] = {}
-        for _c, sym, n, _o, _t in self._pending.values():
+        for _c, sym, n, is_opt, _t in self._pending.values():
+            pending_gross += n
+            if is_opt:
+                pending_options += n
+            pending_by_symbol[sym] = pending_by_symbol.get(sym, Decimal(0)) + n
+        for oid, (sym, n, is_opt, _t) in self._validated_notional.items():
+            if oid == order.id:
+                continue
+            pending_gross += n
+            if is_opt:
+                pending_options += n
             pending_by_symbol[sym] = pending_by_symbol.get(sym, Decimal(0)) + n
 
         ctx = RiskContext(
@@ -196,16 +222,26 @@ class RiskEngine:
                      "detail": str(violation), "at": datetime.now(UTC).isoformat()},
                 )
                 raise
-        # All rules passed: stage this order's notional so it counts as
-        # in-flight exposure the moment it is submitted (note_order_submitted
-        # promotes it to _pending). Approval-mode re-validation refreshes it.
+        # All rules passed: stage this order's notional (with its symbol) so it
+        # counts as in-flight exposure from validation time — the pending sums
+        # above already fold in _validated_notional, so a concurrent validator
+        # sees it before it submits. note_order_submitted promotes it to
+        # _pending; a pre-submit rejection calls release_validated.
         now = datetime.now(UTC)
-        self._validated_notional[order.id] = (
-            ctx.notional, order.asset_class is AssetClass.OPTION, now,
-        )
-        # Prune stashes validated but never submitted (e.g. rejected downstream).
+        # Only risk-INCREASING orders reserve exposure: a risk-reducing exit
+        # shrinks the book, so it must not count toward pending_gross (and
+        # note_order_submitted never promotes it to _pending either). The
+        # oversell concern for concurrent exits is handled separately by the
+        # manager's live-state reduce-only backstop (F022), not this reservation.
+        if not order.side.is_risk_reducing:
+            self._validated_notional[order.id] = (
+                order.symbol.upper(), ctx.notional,
+                order.asset_class is AssetClass.OPTION, now,
+            )
+        # Prune stashes validated but never submitted (belt-and-suspenders behind
+        # release_validated: e.g. a pipeline that died before it could reject).
         cutoff = now - timedelta(minutes=15)
-        for oid in [o for o, (_n, _is, at) in self._validated_notional.items() if at < cutoff]:
+        for oid in [o for o, (_s, _n, _is, at) in self._validated_notional.items() if at < cutoff]:
             del self._validated_notional[oid]
         return quote
 
