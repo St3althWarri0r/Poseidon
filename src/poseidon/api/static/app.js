@@ -194,6 +194,30 @@ function renderRuntime(s) {
 
 /* ================= portfolio ================= */
 
+// Scale a stat tile's value down so a long number (e.g. a $42M paper balance)
+// fits its tile instead of spilling past the box. Resets to the CSS base size,
+// then, if the single-line text is wider than the tile, shrinks the font
+// proportionally to fit — capped at the base and floored for legibility.
+// Depends on white-space:nowrap (style.css) so scrollWidth reflects the real
+// text width rather than a wrapped height.
+function fitTileValue(el) {
+  if (!el) return;
+  const base = el.classList.contains("tile-value-sm") ? 19 : 25;
+  el.style.fontSize = base + "px";
+  const avail = el.clientWidth;
+  if (avail > 0 && el.scrollWidth > avail) {
+    el.style.fontSize = Math.max(13, Math.floor((base * avail) / el.scrollWidth)) + "px";
+  }
+}
+function fitTiles() {
+  $$(".tile-value").forEach(fitTileValue);
+}
+let _fitFrame = 0;
+window.addEventListener("resize", () => {
+  cancelAnimationFrame(_fitFrame);
+  _fitFrame = requestAnimationFrame(fitTiles);
+});
+
 let lastPortfolio = null;
 
 async function refreshPortfolio() {
@@ -213,6 +237,7 @@ async function refreshPortfolio() {
   $("#t-dd").textContent = fmtPct(p.drawdown_pct);
   $("#t-exposure").textContent = fmtUsd(p.gross_exposure);
   $("#t-exposure-sub").textContent = "options " + fmtUsd(p.options_exposure);
+  fitTiles(); // scale any large balances (e.g. a $42M paper account) to fit their tiles
 
   const positions = p.positions || [];
   const countEl = $("#positions-count");
