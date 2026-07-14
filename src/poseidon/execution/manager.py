@@ -232,6 +232,11 @@ class OrderManager:
             if not approved:
                 order.status = OrderStatus.REJECTED_HUMAN
                 order.status_reason = f"not approved ({entry.resolver})"
+                # Validated (staged) before the approval gate; a human decline or a
+                # TTL expiry must drop that reservation, or it phantom-counts as
+                # in-flight exposure and wrongly blocks later orders until the 15-min
+                # prune (F021 — mirrors the seven sibling pre-submit reject paths).
+                self._risk.release_validated(order.id)
                 await self._persist(order)
                 await self._audit.append("human", "order.rejected",
                                          {"order_id": order.id, "resolver": entry.resolver})
@@ -484,20 +489,24 @@ class OrderManager:
         market-exit fill is gone from ``open_orders`` yet reflected in
         ``positions()``.
 
-        Residuals (documented, not fully closed): (1) on a real broker whose
-        position feed lags a just-filled MARKET exit, ``positions()`` may still
-        show the pre-exit quantity — this shrinks the oversell window to broker
-        propagation latency rather than eliminating it (airtight only for the
-        synchronous PaperBroker). (2) on a ``positions()`` error it fails closed
-        (rejects the exit), which during a broker position-feed outage is in
-        tension with never-trap-an-exit; the alternative (fall back to the synced
-        held) would reopen the window during that outage."""
+        Residuals (documented, not fully closed): (1) on a real broker whose feeds
+        lag, this reduces to broker eventual-consistency latency by two paths —
+        (1a) ``positions()`` lagging a just-filled MARKET exit still shows the
+        pre-exit quantity, and (1b) ``open_orders()`` lagging a just-submitted
+        RESTING exit under-counts the pending close — either shrinks the oversell
+        window to propagation latency rather than eliminating it (airtight only for
+        the synchronous PaperBroker). (2) on a ``positions()`` error it fails CLOSED
+        (rejects the exit), which during a broker position-feed outage is in tension
+        with never-trap-an-exit; the alternative (fall back to the synced held)
+        would reopen the window during that outage."""
         if not (order.side.is_risk_reducing
                 or any(leg.side.is_risk_reducing for leg in order.legs)):
             return  # opening order: reduce-only does not apply; skip the positions() fetch
         try:
             positions = await self._broker.positions()
-        except BrokerError as exc:
+        except Exception as exc:  # noqa: BLE001 — this backstop IS the safety net; it
+            # must fail CLOSED (reject the close) on ANY positions() failure, never let
+            # an unhandled non-BrokerError escape up the submit path and disarm the exit.
             raise RiskViolation(
                 "reduce_only", f"cannot verify live position to bound this close: {exc}"
             ) from exc

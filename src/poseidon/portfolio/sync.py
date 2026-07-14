@@ -242,6 +242,11 @@ class PortfolioSyncService:
             self._state.day_min_equity = equity  # clear the intraday loss/drawdown latch
             await self._db.kv_set("baseline.day.date", eastern_date.isoformat())
             await self._db.kv_set("baseline.day.equity", str(equity))
+            # Persist the reset trough in the SAME boundary block as its date/equity
+            # key, so a crash cannot leave a new-day date paired with a stale trough
+            # (which restore would read as a phantom drawdown, F020). The same-day
+            # ratchet is persisted separately in sync_once.
+            await self._db.kv_set("baseline.day.min", str(equity))
             # New ISO week?
             week_key = f"{eastern_date.isocalendar().year}-W{eastern_date.isocalendar().week}"
             stored_week = await self._db.kv_get("baseline.week.key")
@@ -250,6 +255,7 @@ class PortfolioSyncService:
                 self._state.week_min_equity = equity  # clear the weekly loss latch
                 await self._db.kv_set("baseline.week.key", week_key)
                 await self._db.kv_set("baseline.week.equity", str(equity))
+                await self._db.kv_set("baseline.week.min", str(equity))
 
     async def restore_baselines(self) -> None:
         """Reload baselines and peak equity from the DB — at startup and

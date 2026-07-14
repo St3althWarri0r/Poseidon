@@ -176,6 +176,11 @@ class RiskEngine:
         # correct: the read->rules->stage span below is await-free, so two
         # validators cannot interleave within it. The order's OWN stash is
         # excluded, or approval-mode re-validation would count it against itself.
+        # LOAD-BEARING: this await-free mutual-exclusion (and _submit_lock, an
+        # asyncio.Lock) both assume the dashboard and review-cycle pipelines share ONE
+        # event loop — true today (a single asyncio.run in cli.py; uvicorn started via
+        # create_task on that loop). Moving the dashboard to a thread / second loop
+        # would silently reopen this window; keep the pipelines co-loop'd.
         pending_gross = Decimal(0)
         pending_options = Decimal(0)
         pending_by_symbol: dict[str, Decimal] = {}
@@ -233,6 +238,12 @@ class RiskEngine:
         # note_order_submitted never promotes it to _pending either). The
         # oversell concern for concurrent exits is handled separately by the
         # manager's live-state reduce-only backstop (F022), not this reservation.
+        # NOTE (latent, unreachable today): this keys on the ORDER-level side, while
+        # ctx.notional and reduce_only_breach key on per-LEG sides. A multi-leg order
+        # with a risk-reducing order side but SELL_TO_OPEN legs would be sized but not
+        # reserved — harmless while nothing populates order.legs (no production path
+        # does), but key this on "opens exposure" before enabling a leg-submitting
+        # broker plugin.
         if not order.side.is_risk_reducing:
             self._validated_notional[order.id] = (
                 order.symbol.upper(), ctx.notional,
