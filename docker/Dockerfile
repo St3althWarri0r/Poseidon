@@ -6,9 +6,11 @@ FROM python:3.12-slim AS build
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-# Bundled example algorithms are force-included into the wheel (pyproject.toml)
-# so first-run seeding works; the build needs them present in the context.
+# The wheel force-includes BOTH examples/algorithms and config/poseidon.example.yaml
+# (pyproject.toml [tool.hatch.build.targets.wheel.force-include]), so both must be
+# present in the build context or the wheel build fails on a missing forced include.
 COPY examples ./examples
+COPY config ./config
 RUN pip install --no-cache-dir --prefix=/install .
 
 FROM python:3.12-slim
