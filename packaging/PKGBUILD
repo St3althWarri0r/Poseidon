@@ -31,6 +31,8 @@ package() {
   cd "$startdir/.."
   install -Dm644 packaging/poseidon.desktop \
     "$pkgdir/usr/share/applications/poseidon.desktop"
+  install -Dm644 packaging/poseidon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/poseidon.svg"
   install -Dm644 config/poseidon.example.yaml \
     "$pkgdir/usr/share/poseidon/poseidon.example.yaml"
   # The stock unit points at the venv install; the system package uses /usr/bin.

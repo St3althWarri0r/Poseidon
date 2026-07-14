@@ -55,6 +55,7 @@ dev = [
 
 [project.scripts]
 poseidon = "poseidon.cli:main"
+poseidon-launch = "poseidon.launcher:main"  # GUI double-click launcher (packaging/poseidon.desktop)
 
 [project.entry-points."poseidon.brokers"]
 # Third-party broker plugins register here; built-ins are discovered internally.
