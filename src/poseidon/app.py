@@ -676,6 +676,13 @@ class ApplicationKernel:
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
+                # Meter tokens already billed for the refusing call before returning
+                # (run_cycle records usage before it raises), mirroring the
+                # AgentError/DataError branch below so the monthly AI budget is not
+                # silently under-counted on repeated refusals.
+                await self._record_ai_usage(
+                    self.agent.last_cycle_usage(), "refused",
+                    cycle_id=f"refused-{uuid.uuid4().hex[:8]}")
                 return
             except (AgentError, DataError) as exc:
                 log.error("review cycle failed", error=str(exc))

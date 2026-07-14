@@ -53,9 +53,19 @@ def try_start_service() -> bool:
     return result.returncode == 0
 
 
-def open_window(url: str) -> int:
+def open_window(url: str, *, token_in_url: bool = False) -> int:
     """Open the dashboard as a desktop window. Blocks until closed (native
-    window) or hands off to the browser process. Returns an exit code."""
+    window) or hands off to the browser process. Returns an exit code.
+
+    Tradeoff (F019): the pywebview path loads ``url`` in-process, so a
+    ``?token=`` in it never touches a command line. Both browser fallbacks —
+    ``--app=`` (Popen) and the last-resort ``webbrowser.open`` — put ``url`` in
+    the child's argv, where the token is world-readable via /proc/<pid>/cmdline
+    until the window closes. ``token_in_url`` lets the caller flag that case so
+    we warn the operator and steer them to the leak-free native window.
+    Eliminating the argv exposure entirely needs an out-of-band handoff
+    (one-time token -> cookie) touching the server, the SPA and the websocket —
+    disproportionate to this low-severity, loopback-default risk."""
     try:
         import webview  # optional dependency: poseidon[gui]
     except ImportError:
@@ -68,6 +78,17 @@ def open_window(url: str) -> int:
             return 0
         except Exception as exc:  # missing GTK/Qt backend, no display, …
             print(f"native window unavailable ({exc}); falling back to a browser window")
+    if token_in_url:
+        # Reached only when the native window is unavailable: the auth token is
+        # about to ride the browser's argv (visible via /proc/<pid>/cmdline to
+        # other local UIDs) for the life of the window. Covers both the --app
+        # Popen and the webbrowser.open fallbacks below.
+        print(
+            "WARNING: no native window available, so the dashboard opens in a browser "
+            "process with the auth token in its command line — readable via "
+            "/proc/<pid>/cmdline by other local users until the window closes. "
+            "Install the native window ('pip install poseidon[gui]') to avoid this."
+        )
     for name in _APP_BROWSERS:
         binary = shutil.which(name)
         if binary:
@@ -106,4 +127,4 @@ def launch(url: str, token: str | None = None) -> int:
         from urllib.parse import quote
 
         url = f"{url}/?token={quote(token, safe='')}"
-    return open_window(url)
+    return open_window(url, token_in_url=bool(token))

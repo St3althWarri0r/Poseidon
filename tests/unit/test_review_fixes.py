@@ -372,3 +372,153 @@ async def test_manual_halt_persists_across_restart(tmp_path) -> None:
     assert not kernel.risk.circuit.is_open
 
     await db.close()
+
+
+# ------------------- format-string traversal via runtime assembly (F023) -------------------
+# The literal-constant screen in validate_algorithm only inspected whole ast.Constant
+# strings, so a '{0.__class__.__init__.__globals__}' template ASSEMBLED at runtime
+# (chr()/concatenation) evaded it and could still reach module globals via .format(ctx)
+# with no dunder attribute node, no '__builtins__' name, and no subscript call in the AST.
+# The guard now also flags .format/.format_map called on a NON-literal template.
+
+_FORMAT_EVASIONS = [
+    # chr(46) == '.', so no single string literal ever contains the dunder walk.
+    ("async def scan(ctx):\n"
+     "    d = chr(46)\n"
+     "    t = '{0' + d + '__class__' + d + '__init__' + d + '__globals__}'\n"
+     "    t.format(ctx)\n"
+     "    return []\n"),
+    # plain concatenation of individually-benign literals into a traversal template.
+    ("async def scan(ctx):\n"
+     "    t = '{0' + '.' + '__class__}'\n"
+     "    return [t.format(ctx)]\n"),
+    # .format_map on a name-bound, runtime-built template.
+    ("async def scan(ctx):\n"
+     "    tmpl = chr(123) + '0.__class__' + chr(125)\n"
+     "    tmpl.format_map({})\n"
+     "    return []\n"),
+]
+
+
+@pytest.mark.parametrize("src", _FORMAT_EVASIONS)
+def test_algorithm_blocks_runtime_assembled_format_traversal(src: str) -> None:
+    # Pre-fix these return [] (the literal screen never sees an assembled template),
+    # so validation passes and CustomAlgorithm constructs — the read/exfil path is live.
+    assert validate_algorithm(src), "runtime-assembled .format/.format_map must be flagged"
+    with pytest.raises(ValueError):
+        CustomAlgorithm(algo_name="fmt", source=src, symbols=["AAPL"])
+
+
+def test_legit_literal_format_is_still_allowed() -> None:
+    # .format on a plain string LITERAL is benign (a literal that actually traverses is
+    # still caught by the existing constant screen); only non-literal templates are the
+    # new residual, so a normal formatted label must not be flagged.
+    src = ("async def scan(ctx):\n"
+           "    label = '{:.2f}'.format(1.23456)\n"
+           "    return [{'symbol': 'AAPL', 'direction': 'long', 'strength': 0.5,\n"
+           "             'evidence': {'label': label}}]\n")
+    assert validate_algorithm(src) == []
+    CustomAlgorithm(algo_name="ok", source=src, symbols=["AAPL"])  # no raise
+
+
+def test_bundled_example_algorithms_still_validate() -> None:
+    # Acceptance guard: the new .format guard must not false-positive on any shipped
+    # starter algorithm (they use f-strings / no .format), or first-boot seeding breaks.
+    from pathlib import Path
+
+    import poseidon
+
+    root = Path(poseidon.__file__).resolve().parent
+    algo_dir = root / "examples" / "algorithms"
+    if not algo_dir.is_dir():
+        algo_dir = root.parents[1] / "examples" / "algorithms"
+    files = sorted(algo_dir.glob("*.py"))
+    assert files, "no bundled example algorithms found to validate"
+    for f in files:
+        assert validate_algorithm(f.read_text()) == [], f"bundled example {f.name} must stay valid"
+
+
+# ------------------- dashboard token in browser argv warning (F019) -------------------
+# The pywebview window loads the URL in-process, but both browser fallbacks put the
+# ?token= in the child's argv (/proc/<pid>/cmdline, world-readable). open_window now
+# warns when a token rides the fallback — and stays silent when there is no token.
+
+def test_open_window_warns_when_token_rides_browser_argv(monkeypatch, capsys) -> None:
+    import sys
+
+    from poseidon import gui
+
+    monkeypatch.setitem(sys.modules, "webview", None)  # force the browser fallback path
+    launched: list[object] = []
+    monkeypatch.setattr(gui.shutil, "which", lambda name: "/usr/bin/fakebrowser")
+    monkeypatch.setattr(gui.subprocess, "Popen", lambda *a, **k: launched.append(a[0]))
+
+    assert gui.open_window("http://127.0.0.1:8321/?token=SECRET", token_in_url=True) == 0
+    warned = capsys.readouterr().out
+    assert launched, "a browser process was launched (fallback taken)"
+    assert "/proc" in warned and "token" in warned.lower()
+
+    # No token in the URL -> no leak, so no warning.
+    assert gui.open_window("http://127.0.0.1:8321/", token_in_url=False) == 0
+    assert "/proc" not in capsys.readouterr().out
+
+
+# ------------------- refused review cycle still meters AI usage (F001/F003) -------------------
+# A review cycle that ends in AgentRefusedError has already billed Anthropic tokens
+# (run_cycle records usage before it raises). The handler must meter them like the
+# AgentError/DataError sibling, or the monthly budget silently under-counts and cycles
+# keep running past the ceiling.
+
+async def test_refused_cycle_still_meters_ai_usage(tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.core.enums import TradingMode
+    from poseidon.core.errors import AgentRefusedError
+    from poseidon.security.vault import Vault
+    from poseidon.storage.db import Database
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    kernel = ApplicationKernel(AppConfig(data_dir=data_dir), Vault(tmp_path / "v.bin"))
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    kernel.db = db
+
+    class _RefusingAgent:
+        async def run_cycle(self, **kw: object) -> object:
+            raise AgentRefusedError("model declined")
+
+        def last_cycle_usage(self) -> dict[str, int]:
+            return {"input_tokens": 1234, "output_tokens": 56, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0, "api_calls": 3}
+
+    class _NoStrategies:
+        enabled_names: list[str] = []
+
+        async def scan_all(self, router: object, portfolio: object) -> list[object]:
+            return []
+
+    kernel.agent = _RefusingAgent()  # type: ignore[assignment]
+    kernel.strategies = _NoStrategies()  # type: ignore[assignment]
+    kernel.risk = SimpleNamespace(set_cycle_attribution=lambda *_: None)  # type: ignore[assignment]
+    kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
+    kernel.router = None  # type: ignore[assignment]
+
+    async def _not_over() -> bool:
+        return False
+
+    async def _no_regime() -> None:
+        return None
+
+    kernel._over_ai_budget = _not_over  # type: ignore[method-assign]
+    kernel._regime_line = _no_regime  # type: ignore[method-assign]
+
+    await kernel.run_review_cycle()
+
+    rows = await db.fetch_all("SELECT cycle_id, input_tokens, api_calls FROM ai_usage")
+    assert len(rows) == 1, "a refused cycle must record exactly one ai_usage row"
+    assert str(rows[0][0]).startswith("refused-")
+    assert rows[0][1] == 1234 and rows[0][2] == 3  # the real billed tokens, not zero
+    await db.close()
