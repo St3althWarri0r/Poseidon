@@ -318,5 +318,5 @@ class Database:
         )
         for r in rows:
             picked[r[0]] = _row_to_lesson(r)
-        ordered = sorted(picked.values(), key=lambda l: l.exited_at, reverse=True)
+        ordered = sorted(picked.values(), key=lambda lsn: lsn.exited_at, reverse=True)
         return ordered[:limit]

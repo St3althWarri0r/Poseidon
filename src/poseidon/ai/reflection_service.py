@@ -39,7 +39,7 @@ class ReflectionService:
                  model: str, get_backend: Callable[[], ChatBackend | None],
                  load_fills: Callable[[str | None], Awaitable[list[FillRecord]]],
                  is_flat: Callable[[str], bool],
-                 audit_append: Callable[[str, str, dict[str, Any]], Awaitable[None]]) -> None:
+                 audit_append: Callable[[str, str, dict[str, Any]], Awaitable[Any]]) -> None:
         self._db = db
         self._router = router
         self._config = config
@@ -50,7 +50,7 @@ class ReflectionService:
         self._audit_append = audit_append
         self._tasks: set[asyncio.Task[None]] = set()
 
-    async def on_account_synced(self, _event: Any = None) -> None:
+    async def on_account_synced(self, _topic: str, _payload: object) -> None:
         """Post-sync sweep: reflect on any position that just went flat.
 
         Driven by closing fills past a persisted watermark (a fully-closed

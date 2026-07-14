@@ -71,6 +71,8 @@ class ApplicationKernel:
         self.bus = EventBus()
         self.clock = MarketClock()
         self.portfolio = PortfolioState()
+        # Advisory reflection loop; the real service is built in start().
+        self.reflection: ReflectionService | None = None
 
         # populated in start()
         self.db: Database
@@ -676,6 +678,9 @@ class ApplicationKernel:
                 # Trusted attribution for sleeve caps: only symbols a sleeved
                 # strategy actually signalled this cycle get its cap.
                 self.risk.set_cycle_attribution(list(signals))
+                lessons = (await self.reflection.relevant_lessons(
+                    self.config.all_watchlist_symbols())
+                    if self.reflection is not None else None)
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -683,8 +688,7 @@ class ApplicationKernel:
                     strategy_signals=[s.as_dict() for s in signals],
                     market_session=self.clock.session().value,
                     market_regime=await self._regime_line(),
-                    trade_lessons=await self.reflection.relevant_lessons(
-                        self.config.all_watchlist_symbols()),
+                    trade_lessons=lessons,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -903,6 +907,8 @@ class ApplicationKernel:
         """Filled orders (account-scoped) as FillRecords threaded with the
         originating decision_id, for the reflection loop. Symbol filtering is in
         Python — the orders table keys symbol inside the JSON payload."""
+        from decimal import Decimal
+
         from .core.enums import AssetClass, OrderSide, OrderStatus
         from .core.models import Order
         rows = await self.db.fetch_all(

@@ -40,7 +40,7 @@ async def test_recent_relevant_caps_and_scopes(db: Database) -> None:
     await db.add_trade_lesson(_lesson("IWM", day=1))  # older than lookback below
     out = await db.recent_lessons(
         ["SPY"], per_symbol=2, global_n=2, lookback_days=10, limit=8, now=now)
-    syms = [l.symbol for l in out]
+    syms = [ls.symbol for ls in out]
     assert syms.count("SPY") == 2          # per_symbol cap, most-recent first
     assert "QQQ" in syms                    # recent global reaches the cross-ticker lesson
     assert "IWM" not in syms                # dropped by lookback_days

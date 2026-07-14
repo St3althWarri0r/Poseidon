@@ -92,7 +92,7 @@ async def test_reflect_episode_fail_open_on_backend_error(db) -> None:
 
 async def test_on_account_synced_reflects_flat_symbol_and_advances_watermark(db) -> None:
     svc = _service(db, backend=FakeBackend([text_end("lesson")]), fills=_fills())
-    await svc.on_account_synced({})
+    await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)  # drain the background reflection task
     assert await _lesson_count(db) == 1
     assert await db.kv_get("reflection.fill_watermark", "") != ""
@@ -100,7 +100,7 @@ async def test_on_account_synced_reflects_flat_symbol_and_advances_watermark(db)
 
 async def test_on_account_synced_skips_when_not_flat(db) -> None:
     svc = _service(db, backend=FakeBackend([text_end("lesson")]), fills=_fills(), is_flat=False)
-    await svc.on_account_synced({})
+    await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)
     assert await _lesson_count(db) == 0
 

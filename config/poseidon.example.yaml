@@ -21,6 +21,19 @@ ai:
   input_price_per_mtok: 5.0
   output_price_per_mtok: 25.0
   monthly_budget_usd: 0       # 0 = no ceiling
+  # --- Reflection -> lesson-memory loop (advisory; never gates risk) ------
+  # When a position closes, distill a short lesson (realized return + alpha vs
+  # SPY) and re-inject the relevant recent lessons into future review cycles.
+  # Lessons are advisory context only and are kept out of the tamper-evident
+  # audit chain. Defaults give the closed loop; inject:false = write-only
+  # ledger you can review; enabled:false turns it off.
+  reflection:
+    enabled: true             # write a lesson when a position closes
+    inject: true              # feed relevant lessons into future cycle prompts
+    max_injected: 8           # hard cap on lessons per cycle prompt
+    per_symbol: 2             # newest lessons per relevant ticker
+    global_n: 3               # newest lessons overall (cross-ticker)
+    lookback_days: 120        # ignore lessons older than this
   # --- Local model (no API credit) ---------------------------------------
   # Run the portfolio manager on a local OpenAI-compatible endpoint (e.g. LM
   # Studio) instead of the Anthropic API — free and unlimited, but weaker than

@@ -49,10 +49,10 @@ class ReflectionConfig(StrictModel):
 
     enabled: bool = True
     inject: bool = True
-    max_injected: int = Field(8, ge=0)
-    per_symbol: int = Field(2, ge=0)
-    global_n: int = Field(3, ge=0)
-    lookback_days: int = Field(120, ge=1)
+    max_injected: int = Field(default=8, ge=0)
+    per_symbol: int = Field(default=2, ge=0)
+    global_n: int = Field(default=3, ge=0)
+    lookback_days: int = Field(default=120, ge=1)
 
 
 class AIConfig(StrictModel):
