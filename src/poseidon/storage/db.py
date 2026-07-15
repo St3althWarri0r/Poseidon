@@ -20,13 +20,13 @@ import json
 import os
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from ..core.models import TradeLesson
+from ..core.models import AnalysisPacket, TradeLesson
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -153,6 +153,16 @@ CREATE TABLE IF NOT EXISTS trade_lessons (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trade_lessons_symbol ON trade_lessons(symbol, created_at);
+
+CREATE TABLE IF NOT EXISTS analysis_packets (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_packets_symbol ON analysis_packets(symbol, as_of);
 """
 
 
@@ -162,6 +172,11 @@ def _row_to_lesson(r: tuple[Any, ...]) -> TradeLesson:
         entered_at=datetime.fromisoformat(r[4]), exited_at=datetime.fromisoformat(r[5]),
         realized_return=r[6], alpha=r[7], holding_days=r[8], lesson=r[9],
         model=r[10], created_at=datetime.fromisoformat(r[11]))
+
+
+def _row_to_packet(row: Any) -> AnalysisPacket:
+    # columns: id, symbol, as_of, model, payload, created_at
+    return AnalysisPacket.model_validate_json(row[4])
 
 
 class Database:
@@ -322,4 +337,35 @@ class Database:
         for r in rows:
             picked[r[0]] = _row_to_lesson(r)
         ordered = sorted(picked.values(), key=lambda lsn: lsn.exited_at, reverse=True)
+        return ordered[:limit]
+
+    # -- analysis packets (advisory debate packet; NOT the audit chain) --------
+
+    async def add_analysis_packet(self, packet: AnalysisPacket) -> None:
+        await self.execute(
+            "INSERT OR REPLACE INTO analysis_packets "
+            "(id, symbol, as_of, model, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (packet.id, packet.symbol, packet.as_of.isoformat(), packet.model,
+             packet.model_dump_json(), datetime.now(UTC).isoformat()),
+        )
+
+    async def packet_fresh(self, symbol: str, *, refresh_hours: int,
+                           now: datetime) -> bool:
+        cutoff = (now - timedelta(hours=refresh_hours)).isoformat()
+        row = await self.fetch_one(
+            "SELECT 1 FROM analysis_packets WHERE symbol = ? AND as_of >= ? LIMIT 1",
+            (symbol, cutoff))
+        return row is not None
+
+    async def recent_packets(self, symbols: list[str], *, refresh_hours: int,
+                             limit: int, now: datetime) -> list[AnalysisPacket]:
+        cutoff = (now - timedelta(hours=refresh_hours)).isoformat()
+        picked: dict[str, AnalysisPacket] = {}
+        for symbol in symbols:                       # freshest packet per symbol
+            row = await self.fetch_one(
+                "SELECT * FROM analysis_packets WHERE symbol = ? AND as_of >= ? "
+                "ORDER BY as_of DESC LIMIT 1", (symbol, cutoff))
+            if row is not None:
+                picked[symbol] = _row_to_packet(row)
+        ordered = sorted(picked.values(), key=lambda p: p.as_of, reverse=True)
         return ordered[:limit]
