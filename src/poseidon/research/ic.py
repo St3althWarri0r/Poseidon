@@ -2,10 +2,13 @@
 sliced past window, so look-ahead leakage is impossible at the factor boundary."""
 from __future__ import annotations
 
+import math
 import statistics
+from dataclasses import dataclass
 from datetime import date
 
 from ..core.models import Bar
+from .factors import Factor
 
 
 def visible_bars(bars: list[Bar], as_of: date) -> list[Bar]:
@@ -58,3 +61,70 @@ def rebalance_dates(history: dict[str, list[Bar]], every: int) -> list[date]:
     dates = sorted({b.end.date() for bars in history.values() for b in bars})
     step = max(1, every)
     return dates[::step]
+
+
+@dataclass(frozen=True)
+class ICResult:
+    factor: str
+    horizon: int
+    ic_mean: float
+    ic_std: float
+    ir: float
+    t_stat: float
+    hit_rate: float
+    n_periods: int
+    ic_by_horizon: dict[int, float]
+
+
+def _ic_series(factor: Factor, history: dict[str, list[Bar]], dates: list[date],
+               horizon: int, min_cross: int) -> list[float]:
+    series: list[float] = []
+    for t in dates:
+        vals: list[float] = []
+        fwds: list[float] = []
+        for bars in history.values():
+            vis = visible_bars(bars, t)
+            if len(vis) < factor.min_bars:
+                continue
+            v = factor.fn(vis)
+            if v is None:
+                continue
+            r = forward_return(bars, t, horizon)
+            if r is None:
+                continue
+            vals.append(v)
+            fwds.append(r)
+        if len(vals) >= min_cross:
+            ic = spearman(vals, fwds)
+            if ic is not None:
+                series.append(ic)
+    return series
+
+
+def _effective_n(n_periods: int, horizon: int, rebalance_every: int) -> int:
+    """Count of NON-OVERLAPPING forward windows among n_periods rebalances. When
+    rebalance_every < horizon the windows overlap and the IC series autocorrelates, so
+    the t-stat must use independent observations, not the raw period count."""
+    if n_periods <= 0:
+        return 0
+    stride = max(1, math.ceil(horizon / max(1, rebalance_every)))
+    return math.ceil(n_periods / stride)
+
+
+def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: int,
+                    rebalance_every: int, horizons: list[int],
+                    min_cross: int = 5) -> ICResult:
+    dates = rebalance_dates(history, rebalance_every)
+    ic = _ic_series(factor, history, dates, horizon, min_cross)
+    n = len(ic)
+    ic_mean = statistics.fmean(ic) if ic else 0.0
+    ic_std = statistics.stdev(ic) if n >= 2 else 0.0
+    ir = ic_mean / ic_std if ic_std else 0.0
+    n_eff = _effective_n(n, horizon, rebalance_every)   # independent (non-overlapping) samples
+    t_stat = ir * math.sqrt(n_eff) if n_eff else 0.0
+    hit_rate = sum(1 for x in ic if x > 0) / n if n else 0.0
+    by_h: dict[int, float] = {}
+    for h in horizons:
+        s = _ic_series(factor, history, dates, h, min_cross)
+        by_h[h] = statistics.fmean(s) if s else 0.0
+    return ICResult(factor.name, horizon, ic_mean, ic_std, ir, t_stat, hit_rate, n, by_h)
