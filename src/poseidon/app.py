@@ -20,6 +20,7 @@ import yaml
 
 from . import __version__
 from .ai.agent import ClaudeAgent
+from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
 from .ai.reflection_service import ReflectionService
@@ -74,6 +75,10 @@ class ApplicationKernel:
         self.portfolio = PortfolioState()
         # Advisory reflection loop; the real service is built in start().
         self.reflection: ReflectionService | None = None
+        # Advisory analyst-firm -> debate-packet loop; the real service is
+        # built in start(). Packets it produces are injected into the PM's
+        # cycle prompt only — never the risk engine, the order path, or chat.
+        self.analysis: AnalysisService | None = None
 
         # populated in start()
         self.db: Database
@@ -214,10 +219,10 @@ class ApplicationKernel:
         """Construct the AI roles and bind each to its model tier.
 
         INVARIANT: the trading agent (the money decision) and the algorithm
-        reviewer always use the PRIMARY backend; the advisory chat and reflection
-        roles use the utility backend. With no ``ai.utility_model`` the utility
-        backend IS the primary object, so every role shares one backend exactly
-        as before — this is the default that ships.
+        reviewer always use the PRIMARY backend; the advisory chat, reflection,
+        and analysis roles use the utility backend. With no ``ai.utility_model``
+        the utility backend IS the primary object, so every role shares one
+        backend exactly as before — this is the default that ships.
         """
         self._backend, self._utility_backend = build_backends(ai_cfg, self.vault.get)
         self.agent = ClaudeAgent(ai_cfg, self._backend, dispatcher)
@@ -228,6 +233,16 @@ class ApplicationKernel:
             load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
             audit_append=self.audit.append)
         self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
+        # Advisory analyst firm -> debate packet (never gates risk / touches
+        # orders). Packets are injected into the PM's cycle prompt only — see
+        # ai/agent.py's _cycle_prompt analysis_block.
+        self.analysis = AnalysisService(
+            db=self.db, router=self.router, config=ai_cfg.analysis, model=ai_cfg.model,
+            get_backend=lambda: self._utility_backend,
+            watchlist=lambda: self.config.all_watchlist_symbols(),
+            audit_append=self.audit.append, scan=None)  # v1: no untrusted text flows yet
+            # (context=""); wire ai/tools.py's injection scanner here when the per-role
+            # news/fundamentals retrieval fast-follow lands.
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
@@ -598,6 +613,8 @@ class ApplicationKernel:
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
+        if self.analysis is not None:
+            self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
 
     def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
@@ -697,6 +714,9 @@ class ApplicationKernel:
                 lessons = (await self.reflection.relevant_lessons(
                     self.config.all_watchlist_symbols())
                     if self.reflection is not None else None)
+                packets = (await self.analysis.relevant_packets(
+                    self.config.all_watchlist_symbols())
+                    if self.analysis is not None else [])
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -705,6 +725,7 @@ class ApplicationKernel:
                     market_session=self.clock.session().value,
                     market_regime=await self._regime_line(),
                     trade_lessons=lessons,
+                    analysis_packets=packets,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))

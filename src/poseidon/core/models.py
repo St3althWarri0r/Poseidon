@@ -363,6 +363,11 @@ class Decision(PoseidonModel):
     cycle_id: str = ""
     usage: dict[str, int] = Field(default_factory=dict)  # tokens used this cycle
     created_at: datetime | None = None
+    # Explainability trace: ids ONLY (never packet prose) of the ADVISORY
+    # AnalysisPacket(s) that informed this cycle's prompt. Kept ids-only so
+    # advisory research prose never enters the hash-chained audit chain — see
+    # AnalysisPacket and ai/agent.py's analysis_block.
+    analysis_packet_ids: list[str] = Field(default_factory=list)
 
 
 class TradeLesson(PoseidonModel):
