@@ -170,12 +170,13 @@ class AlgorithmWorkshop:
         log.info("algorithm activated", name=record["name"])
         return await self.get(algo_id)
 
-    async def deactivate(self, algo_id: str, *, archive: bool = False) -> dict[str, Any]:
+    async def deactivate(self, algo_id: str, *, archive: bool = False,
+                         actor: str = "human") -> dict[str, Any]:
         record = await self.get(algo_id)
         self._engine.remove_strategy(f"algo:{record['name']}")
         self._sleeve_caps.pop(f"algo:{record['name']}", None)
         await self._set_status(algo_id, "archived" if archive else "draft")
-        await self._audit.append("human", "algorithm.deactivated",
+        await self._audit.append(actor, "algorithm.deactivated",
                                  {"id": algo_id, "name": record["name"]})
         return await self.get(algo_id)
 

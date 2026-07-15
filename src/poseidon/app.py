@@ -205,8 +205,11 @@ class ApplicationKernel:
             db=self.db, config=cfg.strategy_health,
             load_trips=self._load_strategy_trips,
             audit_append=self.audit.append,
-            notify=lambda level, data: self.bus.publish(
-                Topics.NOTIFY, {"level": level, "title": "strategy health", **data}),
+            notify=lambda level, data: self.bus.publish(Topics.NOTIFY, {
+                "level": level,
+                "title": f"strategy health: {data.get('strategy')} -> {data.get('state')}",
+                "body": f"rolling-window return {data.get('window_return', 0.0):+.2%}",
+            }),
             retire=self._retire_strategy)
         self.scheduler = Scheduler(self.clock, self.bus)
         self._register_jobs()
@@ -980,8 +983,8 @@ class ApplicationKernel:
         orders."""
         try:
             for algo in await self.workshop.list_all():
-                if algo.get("name") == strategy and algo.get("status") == "active":
-                    await self.workshop.deactivate(algo["id"], archive=False)
+                if f"algo:{algo.get('name')}" == strategy and algo.get("status") == "active":
+                    await self.workshop.deactivate(algo["id"], archive=False, actor="system")
                     return True
         except Exception as exc:
             log.warning("auto-retire failed", strategy=strategy, error=str(exc))

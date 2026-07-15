@@ -69,6 +69,15 @@ def _down_one(state: HealthState) -> HealthState:
     return _LADDER[max(0, _LADDER.index(state) - 1)]
 
 
+def is_downgrade(old: HealthState, new: HealthState) -> bool:
+    """True iff `new` is strictly worse than `old` on the health ladder. A
+    hysteresis recovery (e.g. retire_recommended -> decaying) moves to a state
+    that is still a member of the "bad" states but is an IMPROVEMENT, not a
+    downgrade — callers deciding whether to warn must check this, not just
+    membership in the bad-state set."""
+    return _LADDER.index(new) > _LADDER.index(old)
+
+
 def advance(state: HealthState, decline_streak: int, recover_streak: int,
             signal: Signal, cfg: StrategyHealthConfig) -> tuple[HealthState, int, int]:
     """Hysteresis transition. Only DYING escalates toward retirement."""

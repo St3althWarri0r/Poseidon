@@ -12,7 +12,7 @@ import structlog
 from ..core.config import StrategyHealthConfig
 from ..core.models import StrategyHealth
 from ..storage.db import Database
-from .decay import HealthState, advance, assess
+from .decay import HealthState, advance, assess, is_downgrade
 from .performance import RoundTrip
 
 log = structlog.get_logger(__name__)
@@ -66,7 +66,7 @@ class StrategyHealthService:
             return
         await self._audit("system", "strategy.health_changed",
                           {"strategy": strategy, "from": state.value, "to": new_state.value})
-        if new_state in _DOWNGRADES:
+        if new_state in _DOWNGRADES and is_downgrade(state, new_state):
             await self._notify("warning", {"strategy": strategy, "state": new_state.value,
                                            "window_return": round(a.window_return, 4)})
         if (self._config.auto_retire and new_state is HealthState.RETIRE_RECOMMENDED):
