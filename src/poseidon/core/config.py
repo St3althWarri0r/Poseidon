@@ -55,6 +55,25 @@ class ReflectionConfig(StrictModel):
     lookback_days: int = Field(default=120, ge=1)
 
 
+class AnalysisConfig(StrictModel):
+    """Advisory analyst-firm → debate packet (upstream of the PM; never gates risk).
+
+    OFF by default: it is call-heavy and only worth enabling deliberately. When
+    enabled, a scheduled sweep precomputes one packet per active-watchlist symbol
+    on the utility model; inject re-feeds the freshest packet into review cycles.
+    Advisory only — the packet never reaches the risk engine or the order path.
+    """
+
+    enabled: bool = False
+    inject: bool = True
+    debate_rounds: int = Field(default=2, ge=1, le=4)
+    risk_rounds: int = Field(default=1, ge=1, le=3)
+    refresh_hours: int = Field(default=24, ge=1)
+    max_injected: int = Field(default=3, ge=0)
+    max_render_chars: int = Field(default=1200, ge=200)
+    max_symbols_per_sweep: int = Field(default=8, ge=1)
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -76,6 +95,8 @@ class AIConfig(StrictModel):
     monthly_budget_usd: float = Field(default=0.0, ge=0)
     # Post-trade reflection → lesson-memory loop (advisory; see ReflectionConfig).
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
+    # Advisory analyst-firm → debate packet (advisory; see AnalysisConfig).
+    analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses
