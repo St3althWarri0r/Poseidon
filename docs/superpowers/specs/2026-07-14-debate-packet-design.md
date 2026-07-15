@@ -116,9 +116,11 @@ returning a structured model, so each is unit-testable in isolation:
   than recall numbers — the anti-confabulation borrow (analysis §3.3), a free win.
 - **`analysts.py`** — `run_analysts(backend, snapshot, context) -> list[AnalystReport]`:
   the four analysts run **concurrently** (`asyncio.gather`), each a single backend
-  call producing a structured `AnalystReport`. The sentiment analyst reads only
-  trusted news tone + snapshot price/volume momentum in v1 (no external feed); the
-  external news text it consumes passes the injection scanner.
+  call producing a structured `AnalystReport`. **v1 scope:** the analysts reason
+  over the **pinned snapshot + domain priors** (news/fundamentals *retrieval* is
+  the first fast-follow, flagged via `data_gaps`); the scanned `context` seam is
+  built so per-role live data — passed through the injection scanner — plugs in
+  without reshaping the pipeline.
 - **`debate.py`** — `run_debate(backend, reports, rounds) -> DebateVerdict`: bull
   and bear alternate for `rounds` turns (NL sub-loop over the structured reports),
   then a facilitator emits a structured `DebateVerdict`.
@@ -209,16 +211,18 @@ into the scheduler, the review cycle, or the order path. Errors subclass
 
 ## 6. Scope / YAGNI
 - **No external social/prediction-market feed in v1** (analysis §4.4 attack
-  surface). Sentiment = news tone + snapshot momentum from trusted data; the
-  external news text is injection-scanned, and a hardened social connector can
-  reuse that scanned path later as its own project.
+  surface), and **v1 analysts read no external feeds at all** — they reason over
+  the pinned snapshot + priors. Per-role live-data retrieval (financials, news,
+  real sentiment) is the first fast-follow through the scanned `context` seam; a
+  hardened social connector reuses that same path later as its own project.
 - **No LangGraph/LangChain** — native SDK calls (analysis §4.2).
 - **No intra-cycle / on-demand computation** — scheduled precompute only (§4.5).
 - **The risk lens is advisory** — it never becomes a second risk gate (§4.1).
 - **Honest framing for release notes:** it is the full-firm *structure* (4
-  analysts + multi-round debate + risk lens), but **live social sentiment is
-  deferred** — v1 uses a news-tone + snapshot-momentum proxy, so don't advertise
-  social. Value tracks the utility model; on a weak local model the packet is
+  analysts + multi-round debate + risk lens), but v1 analysts reason over the
+  **pinned snapshot + priors** — external per-role data (news, fundamentals) and
+  live social sentiment are deferred fast-follows, so don't advertise news/social.
+  Value tracks the utility model; on a weak local model the packet is
   weaker (but advisory, so the PM discounts it). The payoff is real explainability
   + the Anthropic path; do not oversell it.
 
