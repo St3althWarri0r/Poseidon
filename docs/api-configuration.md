@@ -93,6 +93,77 @@ multi-analyst step can build on). On a local-only setup it is near-zero immediat
 value — a smaller local model is still $0 — so its real payoff is the Anthropic
 path.
 
+## Advisory analyst firm (debate packet)
+
+A background "research firm" precomputes an explainable analysis packet per
+watchlist symbol: four analysts (fundamentals, technical, news, sentiment) each
+write a structured report, a bull and a bear debate them into a facilitator
+verdict, and a three-voice advisory risk lens (risk-seeking / balanced /
+risk-averse, plus a synthesis) adds a final read. The freshest packet for each
+symbol is fed into the next review-cycle prompt so the portfolio manager gets
+one more explainable, citable input.
+
+```yaml
+ai:
+  analysis:
+    enabled: false            # opt-in; off by default
+    inject: true               # feed the freshest packet into review cycles
+    debate_rounds: 2           # bull/bear exchanges before the facilitator verdict
+    risk_rounds: 1              # risk-lens exchanges before its synthesis
+    refresh_hours: 24           # reuse a packet younger than this instead of rerunning the firm
+    max_injected: 3             # hard cap on packets per cycle prompt
+    max_render_chars: 1200      # per-packet truncation bound in the prompt
+    max_symbols_per_sweep: 8    # symbols swept per tick — keep low on a local endpoint
+```
+
+**Advisory only — the risk lens is not the risk engine.** The three risk
+voices produce commentary, never an approval, a size, or a gate; Poseidon's
+deterministic `RiskEngine` (caps, VaR, drawdown halt, reduce-only, circuit
+breaker) stays the sole pre-trade check. Nothing the firm produces — packet or
+risk lens — ever reaches `RiskEngine`, `OrderManager`, the `submit_decision`
+tool schema, or the chat dispatcher; it can only shift what the portfolio
+manager proposes, never approve or size a trade itself. Only a packet's *id*
+lands on a decision's explainability trace, never its prose, and the prose
+itself stays out of the tamper-evident audit chain — packets live in their own
+`analysis_packets` table, and the audit chain gets only a one-line
+`analysis_packet_written` marker, the same treatment as trade lessons.
+
+**Off the execution hot path.** A full run is roughly 12–25 model calls per
+symbol (four analysts, a multi-round bull/bear debate, then a multi-round risk
+lens), so it runs on a scheduled background sweep (the `analysis_sweep` job),
+never inside the review cycle. Turning on `ai.analysis.enabled` adds a default
+daily pre-market sweep schedule unless you define your own for that job. The
+review cycle itself only reads whatever packet is already cached and still
+fresh (`refresh_hours`); a slow, failing, or unavailable model just degrades
+the sweep — packets stop refreshing, symbols fall back to no packet — and
+never blocks or slows a fill, an exit, or a review cycle.
+
+**OFF by default.** `ai.analysis.enabled` defaults to `false` — call-heavy
+infrastructure that is only worth enabling deliberately.
+
+**Local-serialization caveat.** The firm runs on the utility model/backend
+(the same tiering as chat and reflection, above), which is $0 on a local
+setup — but most local OpenAI-compatible servers (e.g. LM Studio) serve one
+generation at a time, so the sweep's concurrent per-symbol calls still queue
+up server-side. A sweep is effectively its ~12–25 calls **times** the number
+of symbols, back-to-back; a high `max_symbols_per_sweep` on a local endpoint
+can take hours and leave packets perpetually stale. This fails open (no fresh
+packet just means the PM proceeds without one), so it's a value problem, not a
+safety one — hence the low shipped default. Raise `max_symbols_per_sweep`
+only on the faster Anthropic utility path.
+
+**Honest framing.** This ships the full firm's *structure* — four analyst
+roles, a multi-round debate, a risk lens — but v1's analysts reason only over
+the pinned live snapshot (quote + 30-day bars, cited verbatim to reduce
+hallucinated numbers) and their own priors. External per-role data (real news,
+fundamentals) and live social sentiment are **not** wired in yet: the "news"
+and "sentiment" analysts currently read that same price/volume snapshot as the
+other two, with no outside feed. Per-role retrieval is a deferred fast-follow —
+don't advertise this as a firm with live news or social coverage. Packet
+quality tracks the utility model: a weak local model produces a weaker packet,
+but it stays advisory, so the portfolio manager can discount it. The real
+payoff today is explainability plus a $0 local path — not live intel.
+
 ## Market data providers
 
 Configure several — failover is automatic and free. Priorities decide the

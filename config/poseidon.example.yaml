@@ -42,6 +42,21 @@ ai:
   # is near-zero value (a smaller local model is still free); the real payoff is
   # the Anthropic path (Haiku for the aux roles, Opus for the money decision).
   #   utility_model: claude-haiku-4-5-20251001   # or a smaller local model id
+  # --- Advisory analyst firm -> debate packet (opt-in; upstream of the PM) -----
+  # A background "research firm" (4 analysts -> bull/bear debate -> advisory risk
+  # lens) precomputes an explainable packet per watchlist symbol on the utility
+  # model and feeds the freshest one into review cycles. ADVISORY ONLY: it never
+  # gates or places an order and stays out of the audit chain. OFF by default;
+  # call-heavy, so keep max_symbols_per_sweep low on a local endpoint.
+  analysis:
+    enabled: false
+    inject: true
+    debate_rounds: 2
+    risk_rounds: 1
+    refresh_hours: 24
+    max_injected: 3
+    max_render_chars: 1200
+    max_symbols_per_sweep: 8
   # --- Local model (no API credit) ---------------------------------------
   # Run the portfolio manager on a local OpenAI-compatible endpoint (e.g. LM
   # Studio) instead of the Anthropic API — free and unlimited, but weaker than

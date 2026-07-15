@@ -650,6 +650,13 @@ class ApplicationKernel:
                 ScheduleConfig(name="risk-metrics", job="risk_metrics",
                                every_seconds=900, only_market_hours=True)
             )
+        if self.config.ai.analysis.enabled and not any(
+            s.job == "analysis_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                ScheduleConfig(name="default-analysis-sweep", job="analysis_sweep",
+                               cron="30 8 * * *")  # daily pre-market (America/New_York)
+            )
         return schedules
 
     def _register_probes(self) -> None:
