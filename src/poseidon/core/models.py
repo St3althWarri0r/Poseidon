@@ -363,6 +363,11 @@ class Decision(PoseidonModel):
     cycle_id: str = ""
     usage: dict[str, int] = Field(default_factory=dict)  # tokens used this cycle
     created_at: datetime | None = None
+    # Explainability trace: ids ONLY (never packet prose) of the ADVISORY
+    # AnalysisPacket(s) that informed this cycle's prompt. Kept ids-only so
+    # advisory research prose never enters the hash-chained audit chain — see
+    # AnalysisPacket and ai/agent.py's analysis_block.
+    analysis_packet_ids: list[str] = Field(default_factory=list)
 
 
 class TradeLesson(PoseidonModel):
@@ -385,6 +390,79 @@ class TradeLesson(PoseidonModel):
     lesson: str
     model: str = ""
     created_at: datetime
+
+
+class AnalystReport(PoseidonModel):
+    """One analyst's structured slice. Advisory; never an order or a gate."""
+
+    role: str          # fundamentals | technical | news | sentiment
+    summary: str
+    stance: str        # bullish | bearish | neutral
+    confidence: float  # 0..1
+    key_points: list[str] = []
+    data_gaps: list[str] = []
+    sources: list[str] = []
+
+
+class DebateVerdict(PoseidonModel):
+    """Facilitator's structured read of the bull/bear debate. Advisory."""
+
+    direction: str     # long | short | avoid
+    conviction: float  # 0..1
+    bull_case: str
+    bear_case: str
+    synthesis: str
+    rounds: int
+
+
+class RiskLens(PoseidonModel):
+    """Three ADVISORY risk voices + a synthesis.
+
+    NOT the risk engine: this cannot approve, size, or block a trade. The
+    deterministic RiskEngine remains the sole pre-trade gate.
+    """
+
+    aggressive: str
+    neutral: str
+    conservative: str
+    synthesis: str
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse to a single printable line so injected prose can't break out of
+    its advisory bullet (same discipline as trade lessons)."""
+    flat = "".join(c for c in " ".join(text.split()) if c.isprintable())
+    return flat[:limit].strip()
+
+
+class AnalysisPacket(PoseidonModel):
+    """Explainable advisory research packet, injected into the PM cycle prompt.
+
+    Advisory only: injected as context, never passed to the risk engine or order
+    path, and kept out of the tamper-evident audit chain (its own table).
+    """
+
+    id: str
+    symbol: str
+    as_of: datetime
+    model: str = ""
+    reports: list[AnalystReport]
+    verdict: DebateVerdict
+    risk_lens: RiskLens
+    snapshot_digest: str = ""
+
+    def render(self, max_chars: int) -> str:
+        """A bounded, single-block rendering for the cycle prompt. The header
+        (symbol + direction + conviction) is always kept; the prose bodies are
+        truncated to fit ``max_chars`` so a packet can never balloon the prompt."""
+        head = (f"{self.symbol}: firm view {self.verdict.direction} "
+                f"(conviction {self.verdict.conviction:.2f}).")
+        stances = "; ".join(f"{r.role}:{r.stance}" for r in self.reports)
+        body = _one_line(
+            f" analysts[{stances}]. synthesis: {self.verdict.synthesis} "
+            f"risk(conservative): {self.risk_lens.conservative}",
+            max_chars - len(head))
+        return (head + body)[:max_chars]
 
 
 class ClosedPosition(PoseidonModel):
