@@ -507,3 +507,17 @@ class AuditRecord(PoseidonModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     prev_hash: str
     hash: str
+
+
+class StrategyHealth(PoseidonModel):
+    """Advisory decay state for one strategy. Derived (not an audit fact); its own table."""
+
+    strategy: str
+    state: str
+    decline_streak: int = 0
+    recover_streak: int = 0
+    window_return: float = 0.0
+    baseline_return: float = 0.0
+    t_stat: float = 0.0
+    trades: int = 0
+    updated_at: datetime
