@@ -240,6 +240,18 @@ class WatchlistConfig(StrictModel):
         return [s.strip().upper() for s in v if s.strip()]
 
 
+class ResearchConfig(StrictModel):
+    """Offline factor research (`poseidon research factors`): point-in-time IC/IR
+    ranking of the factor library over historical bars. Read-only — this path
+    never touches the risk engine, the order path, or live capital."""
+
+    horizon: int = Field(default=5, ge=1)  # bars ahead for the primary forward return
+    rebalance_every: int = Field(default=5, ge=1)  # trading days between IC samples
+    horizons: list[int] = Field(default_factory=lambda: [1, 5, 10, 20])  # IC-decay profile
+    min_cross: int = Field(default=5, ge=1)  # minimum cross-sectional names per sample date
+    lookback_days: int = Field(default=400, ge=1)  # default history window when unset by --days
+
+
 class AppConfig(StrictModel):
     mode: TradingMode = TradingMode.RESEARCH  # safest default
     data_dir: Path = Field(default_factory=default_data_dir)
@@ -260,6 +272,7 @@ class AppConfig(StrictModel):
     watchlists: list[WatchlistConfig] = Field(default_factory=list)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
+    research: ResearchConfig = Field(default_factory=ResearchConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:

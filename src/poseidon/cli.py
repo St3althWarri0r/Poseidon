@@ -7,6 +7,7 @@
     poseidon audit verify|tail
     poseidon update check|apply
     poseidon cycle                  trigger one review cycle and exit
+    poseidon research factors       offline point-in-time IC/IR factor ranking
 """
 
 from __future__ import annotations
@@ -110,6 +111,73 @@ def cmd_cycle(args: argparse.Namespace) -> int:
 
     asyncio.run(main())
     return 0
+
+
+def _research_symbols(args: argparse.Namespace, config: AppConfig) -> list[str]:
+    """Resolve the research universe from --symbols, --symbols-file, or --watchlist
+    (checked in that order; the first one supplied wins). Empty list means the
+    caller should print a usage message and exit non-zero."""
+    if args.symbols:
+        return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if args.symbols_file:
+        try:
+            lines = Path(args.symbols_file).read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"cannot read --symbols-file {args.symbols_file}: {exc}", file=sys.stderr)
+            return []
+        return [s.strip().upper() for s in lines if s.strip()]
+    if args.watchlist:
+        return config.all_watchlist_symbols()
+    return []
+
+
+def cmd_research(args: argparse.Namespace) -> int:
+    config = _load(args)
+    configure_logging(config.data_dir / "logs", config.log_level)
+
+    symbols = _research_symbols(args, config)
+    if not symbols:
+        print(
+            "no symbols to research — pass --symbols A,B,C, --symbols-file PATH "
+            "(one symbol per line), or --watchlist (needs a configured watchlist)",
+            file=sys.stderr,
+        )
+        return 2
+
+    vault = _vault_for(config)
+    _unlock(vault)
+
+    from .app import ApplicationKernel
+    from .research.factors import ALL_FACTORS
+    from .research.loader import load_history
+    from .research.report import run_report
+
+    async def main() -> int:
+        kernel = ApplicationKernel(config, vault)
+        # Reuses the kernel's provider wiring without the side effects of a full
+        # start() (DB open, audit-chain verify, broker connect) — this command
+        # only ever reads bars. _build_router only touches config + vault, both
+        # already constructed above, so calling it standalone is safe.
+        router = kernel._build_router()  # noqa: SLF001 — CLI is a trusted caller
+        hist = await load_history(router, symbols, args.days or config.research.lookback_days)
+        if len(hist) < 2:
+            print(
+                "not enough symbols with usable history to compute cross-sectional IC",
+                file=sys.stderr,
+            )
+            return 1
+        rep = run_report(
+            ALL_FACTORS,
+            hist,
+            horizon=args.horizon or config.research.horizon,
+            rebalance_every=args.rebalance_every or config.research.rebalance_every,
+            horizons=config.research.horizons,
+            min_cross=config.research.min_cross,
+        )
+        print(rep.render())
+        return 0
+
+    return asyncio.run(main())
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -307,6 +375,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("app", help="open the dashboard as a desktop window").set_defaults(func=cmd_app)
     sub.add_parser("cycle", help="run a single review cycle and exit").set_defaults(func=cmd_cycle)
     sub.add_parser("doctor", help="self-diagnostics").set_defaults(func=cmd_doctor)
+
+    research = sub.add_parser("research", help="offline factor research")
+    research_sub = research.add_subparsers(dest="research_action", required=True)
+    fac = research_sub.add_parser("factors", help="rank factors by point-in-time IC/IR")
+    fac.add_argument("--symbols", default="", help="comma-separated symbols, e.g. AAA,BBB")
+    fac.add_argument("--symbols-file", default="", help="path to a file, one symbol per line")
+    fac.add_argument("--watchlist", action="store_true", help="use all configured watchlist symbols")
+    fac.add_argument("--days", type=int, default=0, help="history window (default: research.lookback_days)")
+    fac.add_argument("--horizon", type=int, default=0,
+                     help="forward-return horizon in bars (default: research.horizon)")
+    fac.add_argument("--rebalance-every", dest="rebalance_every", type=int, default=0,
+                     help="trading days between IC samples (default: research.rebalance_every)")
+    fac.set_defaults(func=cmd_research)
 
     vault = sub.add_parser("vault", help="manage the encrypted credential vault")
     vault_sub = vault.add_subparsers(dest="vault_action", required=True)

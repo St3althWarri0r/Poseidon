@@ -215,6 +215,96 @@ Notes:
   for, the tool returns an explicit "unavailable" error and the AI must
   record it in `data_gaps` instead of guessing.
 
+## Factor research lab
+
+`poseidon research factors` ranks a library of alpha factors (`src/poseidon/research/factors.py`
+— momentum, reversal, volatility, trend, volume, drawdown) by point-in-time
+predictive power over historical bars, loaded through the same `DataRouter`/
+provider stack as everything else in this file. It has its own top-level
+config block:
+
+```yaml
+# Offline factor research (poseidon research factors). Pure analysis — never
+# trades. Point-in-time IC/IR; give it a BROAD --symbols universe (hundreds of
+# names), not just your watchlist, or the cross-sectional IC is noisy.
+research:
+  horizon: 5            # forward-return horizon (trading days) for the headline IC
+  rebalance_every: 5    # evaluate every N days; keep >= horizon to avoid overlap inflation
+  horizons: [1, 5, 10, 20]   # decay curve
+  min_cross: 5          # minimum symbols per cross-section
+  lookback_days: 400    # bars to load per symbol
+```
+
+**What IC/IR means.** On each rebalance date, Poseidon computes the **IC**
+(Information Coefficient) — the Spearman rank correlation between every
+symbol's factor score that day and its realized forward return over the next
+`horizon` trading days. Across all sampled dates it reports `ic_mean` (does
+the ranking predict forward returns, on average?), `ic_std` (how much that
+varies date to date), the **IR** (Information Ratio) = `ic_mean / ic_std`
+(signal strength adjusted for consistency — a modest but stable IC can beat a
+larger but erratic one), a `hit_rate` (fraction of dates with positive IC),
+and a decay curve — mean IC recomputed at each horizon in `horizons`, showing
+whether the signal fades or strengthens further out.
+
+**Point-in-time, by construction.** A factor is evaluated at date `t` using
+only bars whose period has closed on or before `t` (`visible_bars` in
+`research/ic.py`); the forward-return label for that same date deliberately
+reads bars *after* `t`, but only to score the factor after the fact — it is
+never passed to the factor function. Look-ahead leakage is structurally
+impossible at the factor boundary, not just a convention to remember.
+
+**The t-stat corrects for overlap, but `rebalance_every >= horizon` is still
+the setting to use.** When `rebalance_every` is shorter than `horizon`,
+consecutive rebalance dates score overlapping forward-return windows and the
+IC series autocorrelates — counting every sampled date as independent would
+overstate significance. Poseidon already guards against this: the t-stat is
+`IR * sqrt(n_eff)`, where `n_eff` is the count of *non-overlapping* windows,
+not the raw number of sampled dates (`_effective_n` in `research/ic.py`), so
+tight rebalancing doesn't naively inflate it. Keep `rebalance_every >=
+horizon` anyway — that's the regime where `n_eff` equals the raw period count
+exactly, every IC sample comes from a genuinely independent forward-return
+window, and the t-stat isn't leaning on the downsampling approximation at all.
+
+**Give it a broad universe, not your watchlist.** `--watchlist` is
+convenient but reuses your trading watchlist (a handful of names) — exactly
+the thin universe that makes cross-sectional IC noisy, since a rank
+correlation over a few symbols swings wildly between rebalance dates.
+`min_cross` (default 5) is a hard floor: a rebalance date with fewer than
+that many symbols carrying both a valid factor score and a valid forward
+return is dropped entirely, and the report itself flags any run under 20
+total symbols as `[THIN: results are noisy/unreliable]`. Neither floor is a
+target — aim for hundreds of names (e.g. the S&P 500 via `--symbols-file`,
+one ticker per line) so each cross-section is wide enough for the ranking to
+mean something.
+
+**Pure offline research — no live-trading surface.** The command builds only
+a `DataRouter` to read historical bars (`ApplicationKernel._build_router()`);
+it never calls `ApplicationKernel.start()`, so it never opens the database,
+touches the audit chain, connects a broker, or constructs the `RiskEngine` or
+`OrderManager`. Factor evaluation itself is pure — no I/O. It prints a ranked
+report to stdout and exits; nothing it computes is persisted, injected into a
+review cycle, or reachable from `OrderManager.execute_decision`. Safe to run
+anytime, in any operating mode — including a live or autonomous config —
+with zero chance of influencing a trade.
+
+**Example:**
+
+```bash
+poseidon research factors --symbols AAPL,MSFT,GOOGL,AMZN,NVDA,... --days 400 --horizon 5
+```
+
+In practice, keep a broad universe in a file instead of typing hundreds of
+tickers inline:
+
+```bash
+poseidon research factors --symbols-file sp500.txt --days 400 --horizon 5
+```
+
+`--days`, `--horizon`, and `--rebalance-every` fall back to the `research:`
+config block (`lookback_days`, `horizon`, `rebalance_every`) when omitted or
+passed as `0`; `min_cross` and the `horizons` decay list are config-only,
+with no CLI override.
+
 ## Where keys live
 
 All keys go in the encrypted vault (`poseidon vault set NAME`), referenced
