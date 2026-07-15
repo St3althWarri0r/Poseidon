@@ -305,6 +305,89 @@ config block (`lookback_days`, `horizon`, `rebalance_every`) when omitted or
 passed as `0`; `min_cross` and the `horizons` decay list are config-only,
 with no CLI override.
 
+## Strategy-decay watchdog
+
+A scheduled sweep (`strategy_health_sweep`, added automatically on a daily
+pre-market cron once `strategy_health.enabled` is true) watches each
+strategy's **rolling realized edge** — the mean return of its last
+`window_trades` closed round-trips, attributed by strategy (fills carrying no
+strategy tag are pooled as `unattributed` and tracked the same way) — against
+that same strategy's own longer-run baseline, and raises a state when the
+edge has genuinely died rather than merely cooled off.
+
+```yaml
+strategy_health:
+  enabled: true
+  auto_retire: false      # opt-in: auto-deactivate a decayed custom strategy
+  window_trades: 20
+  min_trades: 8           # below this the window is "insufficient" (never flagged decaying)
+  baseline_min_trades: 20
+  decay_t: 2.0            # t-stat threshold for a significantly-<=0 recent edge
+  decay_streak: 2         # consecutive dying sweeps -> decaying
+  retire_streak: 4        # consecutive dying sweeps -> retire_recommended
+  recover_streak: 2       # consecutive ok sweeps to step back toward healthy
+```
+
+**States and hysteresis.** Every strategy sits in one of four states —
+`healthy` → `watch` → `decaying` → `retire_recommended` — and a single sweep
+moves it at most one rung. A `dying` sweep (the recent window's mean return is
+significantly ≤ 0: a one-sample t-stat at or below `-decay_t`) advances a
+decline streak: `decay_streak` *consecutive* dying sweeps are needed to cross
+from `healthy`/`watch` into `decaying`, and `retire_streak` consecutive dying
+sweeps before `decaying` escalates to `retire_recommended`. Recovery is the
+mirror image and just as gradual: `recover_streak` consecutive `ok` sweeps
+step the state back down exactly one rung (e.g. `decaying` → `watch`), so
+climbing all the way back from `retire_recommended` to `healthy` takes three
+separate `recover_streak`-length runs. This hysteresis is deliberate — one
+bad sweep never flags a strategy and one good sweep never clears a flag; only
+a sustained run in either direction moves the needle.
+
+**Decay, not normalization — only a genuinely-unprofitable edge escalates.**
+The assessment separates two different kinds of "worse than before." A window
+whose mean return is *statistically significantly negative* is `dying`, and
+`dying` is the only signal that ever advances the decline streak. A window
+that is still net-**profitable** but significantly below the strategy's own
+baseline is `softening` instead — read as normalization, not death — and it
+caps out at `watch`: it resets any decline streak already in progress but can
+never itself reach `decaying` or `retire_recommended`. A strategy that simply
+makes less than it used to, while still net-positive, is never a candidate
+for retirement.
+
+**Conservative on few trades.** Below `min_trades` closed round-trips in the
+recent window, or below `baseline_min_trades` in the baseline that precedes
+it, the sweep reports `insufficient` and holds the strategy's current state
+and streaks unchanged rather than drawing a conclusion from a noisy sample.
+An infrequently-traded strategy can sit at `insufficient` indefinitely — by
+design, not a gap.
+
+**Advisory and reduce-only by default.** The watchdog can only ever narrow
+what a strategy does next, never expand it: flag a state change, write an
+audit entry (`strategy.health_changed`), and send a `warning` notification on
+a downgrade into `decaying` or `retire_recommended`. It never places, sizes,
+or approves an order, and it holds no reference to `RiskEngine`,
+`OrderManager`, `submit_decision`, or any broker — the reduce-only guarantee
+is structural, not just a config default. Its one and only mutation, gated
+behind `auto_retire`, is deactivating a decayed strategy so it stops
+proposing *new* signals; with the shipped default `auto_retire: false`, the
+sweep never mutates anything and only flags/audits/notifies, no matter how
+long a strategy stays at `retire_recommended`.
+
+**`auto_retire` only ever touches a custom strategy.** When enabled, the
+sweep where a strategy's state *transitions into* `retire_recommended`
+deactivates (not deletes — it reverts to a `draft`, still editable and
+re-activatable) the matching active strategy in the algorithm workshop, and
+separately audits `strategy.auto_retired`. Built-in strategies (`momentum`,
+`mean_reversion`, etc., configured in the top-level `strategies:` list) have
+no workshop entry to deactivate, so `auto_retire` is a no-op for them by
+construction — the watchdog still flags, audits, and notifies on a decayed
+built-in strategy, but only you can turn one off
+(`strategies: [{name: ..., enabled: false}]`); it is never auto-disabled.
+
+Watch it via your configured `notifications:` channel (the `warning` alert on
+every downgrade) and the audit trail (`poseidon audit tail`), which records
+`strategy.health_changed` for every transition and `strategy.auto_retired`
+whenever auto-retire fires.
+
 ## Where keys live
 
 All keys go in the encrypted vault (`poseidon vault set NAME`), referenced
