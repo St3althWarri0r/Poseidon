@@ -1,0 +1,61 @@
+"""Strategy-decay assessment + lifecycle state machine. Pure — no I/O. Only a
+genuinely-unprofitable edge (DYING) escalates toward retirement; a lower-but-still-
+positive edge is SOFTENING (normalization, not death) and caps at WATCH."""
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass
+from enum import StrEnum
+
+from ..core.config import StrategyHealthConfig
+from .performance import RoundTrip
+
+
+class HealthState(StrEnum):
+    HEALTHY = "healthy"
+    WATCH = "watch"
+    DECAYING = "decaying"
+    RETIRE_RECOMMENDED = "retire_recommended"
+
+
+class Signal(StrEnum):
+    INSUFFICIENT = "insufficient"
+    OK = "ok"
+    SOFTENING = "softening"
+    DYING = "dying"
+
+
+@dataclass(frozen=True)
+class Assessment:
+    signal: Signal
+    window_return: float
+    baseline_return: float
+    t0: float
+    trades: int
+    win_rate: float
+
+
+def assess(trips: list[RoundTrip], cfg: StrategyHealthConfig) -> Assessment:
+    ordered = sorted(trips, key=lambda t: t.exited_at)
+    window = ordered[-cfg.window_trades:]
+    baseline = ordered[:-cfg.window_trades]
+    n = len(window)
+    wr = [t.return_pct for t in window]
+    win_mean = statistics.fmean(wr) if wr else 0.0
+    win_rate = (sum(1 for t in window if t.pnl > 0) / n) if n else 0.0
+    base_mean = statistics.fmean([t.return_pct for t in baseline]) if baseline else 0.0
+    if n < cfg.min_trades or len(baseline) < cfg.baseline_min_trades:
+        return Assessment(Signal.INSUFFICIENT, win_mean, base_mean, 0.0, n, win_rate)
+    win_std = statistics.stdev(wr) if n >= 2 else 0.0
+    if win_std == 0.0:                       # degenerate all-equal window: no t-stat
+        sig = (Signal.DYING if win_mean < 0
+               else Signal.SOFTENING if win_mean < base_mean else Signal.OK)
+        return Assessment(sig, win_mean, base_mean, 0.0, n, win_rate)
+    se = win_std / math.sqrt(n)
+    t0 = win_mean / se                       # one-sample t-test vs 0
+    if t0 <= -cfg.decay_t:
+        return Assessment(Signal.DYING, win_mean, base_mean, t0, n, win_rate)
+    if win_mean > 0 and win_mean < base_mean - cfg.decay_t * se:
+        return Assessment(Signal.SOFTENING, win_mean, base_mean, t0, n, win_rate)
+    return Assessment(Signal.OK, win_mean, base_mean, t0, n, win_rate)
