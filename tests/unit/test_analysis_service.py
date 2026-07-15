@@ -1,7 +1,8 @@
 # tests/unit/test_analysis_service.py
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 
 from poseidon.ai.analysis_service import AnalysisService
 from poseidon.core.config import AnalysisConfig
@@ -71,7 +72,49 @@ async def test_sweep_skips_fresh(tmp_path) -> None:
     await db.open()
     svc = await _svc(db, AnalysisConfig(enabled=True, debate_rounds=1, risk_rounds=1))
     await svc.run_sweep()
+    await asyncio.gather(*svc._tasks)                    # drain the background task
     await svc.run_sweep()                                # second sweep: packet is fresh
-    got = await db.recent_packets(["AAPL"], refresh_hours=24, limit=9, now=datetime.now(UTC))
-    assert len(got) == 1                                 # not recomputed
+    await asyncio.gather(*svc._tasks)
+    # Assert on the raw table, not recent_packets() (which is LIMIT-1-per-symbol
+    # and so returns one row whether the sweep recomputed or not) — this is the
+    # only way to actually distinguish "skipped" from "recomputed".
+    row = await db.fetch_one("SELECT COUNT(*) FROM analysis_packets")
+    assert row is not None and row[0] == 1               # not recomputed
+    await db.close()
+
+
+async def test_sweep_recomputes_before_full_refresh_window_elapses(tmp_path) -> None:
+    # A packet older than half the refresh window must be recomputed even
+    # though it is still "fresh" under the full refresh_hours window (that
+    # full window is the inject-staleness bound, not the recompute bound) —
+    # otherwise a packet can go stale for injection before the sweep ever
+    # refreshes it again.
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    cfg = AnalysisConfig(enabled=True, debate_rounds=1, risk_rounds=1, refresh_hours=24)
+    svc = await _svc(db, cfg)
+    await svc.analyze_symbol("AAPL")
+    stale = (datetime.now(UTC) - timedelta(hours=18)).isoformat()
+    await db.execute("UPDATE analysis_packets SET as_of = ? WHERE symbol = ?", (stale, "AAPL"))
+    await svc.run_sweep()
+    await asyncio.gather(*svc._tasks)
+    row = await db.fetch_one(
+        "SELECT COUNT(*) FROM analysis_packets WHERE symbol = ?", ("AAPL",))
+    assert row is not None and row[0] == 2               # recomputed: old row + new row
+    await db.close()
+
+
+async def test_sweep_skips_when_within_half_life(tmp_path) -> None:
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    cfg = AnalysisConfig(enabled=True, debate_rounds=1, risk_rounds=1, refresh_hours=24)
+    svc = await _svc(db, cfg)
+    await svc.analyze_symbol("AAPL")
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    await db.execute("UPDATE analysis_packets SET as_of = ? WHERE symbol = ?", (recent, "AAPL"))
+    await svc.run_sweep()
+    await asyncio.gather(*svc._tasks)
+    row = await db.fetch_one(
+        "SELECT COUNT(*) FROM analysis_packets WHERE symbol = ?", ("AAPL",))
+    assert row is not None and row[0] == 1               # still fresh -> skipped
     await db.close()

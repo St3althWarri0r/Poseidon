@@ -31,6 +31,13 @@ def test_first_json_obj_extracts_from_prose() -> None:
     assert first_json_obj("no json here") == {}
 
 
+def test_first_json_obj_ignores_braces_inside_strings() -> None:
+    # A '}' inside a string value must not be counted by the balanced-brace
+    # scan — it must not truncate extraction before the real closing brace.
+    text = '{"a": "has } brace", "b": 2}'
+    assert first_json_obj(text) == {"a": "has } brace", "b": 2}
+
+
 async def test_run_analysts_degrades_without_crashing() -> None:
     snap = Snapshot("AAPL", datetime.now(UTC), "fake", "AAPL last 190.10")
     reports = await run_analysts(_Backend(), snap, context="")

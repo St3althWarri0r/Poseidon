@@ -49,9 +49,17 @@ class AnalysisService:
         try:
             now = datetime.now(UTC)
             symbols = self._watchlist()[: self._config.max_symbols_per_sweep]
+            # Recompute at half the refresh window, not the full window. The
+            # full refresh_hours is also the inject-staleness bound (see
+            # relevant_packets/recent_packets below) and is ~ the default
+            # sweep cadence, so gating recompute on the full window can make a
+            # packet "too fresh to recompute" yet "too stale to inject" by the
+            # next sweep. Recomputing at half-life keeps injected packets
+            # within the inject window regardless of cadence drift.
+            recompute_hours = max(1, self._config.refresh_hours // 2)
             for symbol in symbols:
                 if await self._db.packet_fresh(
-                        symbol, refresh_hours=self._config.refresh_hours, now=now):
+                        symbol, refresh_hours=recompute_hours, now=now):
                     continue
                 task = asyncio.create_task(self.analyze_symbol(symbol))
                 self._tasks.add(task)

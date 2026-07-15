@@ -12,10 +12,28 @@ def first_json_obj(text: str) -> dict[str, Any]:
     start = text.find("{")
     while start != -1:
         depth = 0
+        in_string = False
+        escaped = False
         for i in range(start, len(text)):
-            if text[i] == "{":
+            ch = text[i]
+            if in_string:
+                # Inside a JSON string: braces don't count, only an
+                # unescaped '"' ends the string. A backslash toggles
+                # `escaped` so the char right after it (incl. another
+                # backslash or a quote) is consumed as literal, not as a
+                # terminator.
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
                 depth += 1
-            elif text[i] == "}":
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     try:
