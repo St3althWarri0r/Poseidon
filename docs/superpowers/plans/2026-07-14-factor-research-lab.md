@@ -416,20 +416,32 @@ def test_ic_plus_one_non_circular() -> None:
     assert evaluate_factor(neg, hist, horizon=5, rebalance_every=5, horizons=[5]).ic_mean < -0.9
 
 
-def test_non_overlapping_t_stat() -> None:
-    # per-symbol slope varies with n, so the factor is NOT constant across symbols
-    # (a constant cross-section -> spearman None -> no IC recorded).
-    series = {f"S{n}": [100 + (n + 1) * i for i in range(80)] for n in range(6)}
-    hist = _hist(series)
-    f = Factor("m", lambda b: float(b[-1].close) - float(b[-6].close), min_bars=6)
-    # rebalance_every(5) < horizon(20) => overlap => n_eff must be < n_periods
-    res = evaluate_factor(f, hist, horizon=20, rebalance_every=5, horizons=[20])
-    assert res.n_periods > 0
-    # n_eff = ceil(n_periods / ceil(20/5)) = ceil(n/4) < n  (for n >= 2)
+def test_effective_n_formula() -> None:
+    # The non-overlap count, tested directly (deterministic, not data-dependent).
+    from poseidon.research.ic import _effective_n
+    assert _effective_n(11, 20, 5) == 3     # stride ceil(20/5)=4 -> ceil(11/4)=3
+    assert _effective_n(10, 5, 5) == 10     # rebalance == horizon -> no overlap
+    assert _effective_n(12, 10, 5) == 6     # stride 2
+    assert _effective_n(0, 20, 5) == 0
+
+
+def test_t_stat_uses_non_overlapping_n_eff() -> None:
+    # IC must VARY across dates or ic_std=0 -> ir=0 -> t_stat=0 hides the bug. A per-
+    # symbol drift ranks the cross-section; a symbol-phased wiggle makes each date's IC
+    # high-but-imperfect and different, so ir != 0 and n_eff vs n_periods is testable.
     import math
-    stride = math.ceil(20 / 5)
-    expected_t = res.ir * math.sqrt(math.ceil(res.n_periods / stride))
-    assert abs(res.t_stat - expected_t) < 1e-9      # t-stat uses n_eff, not n_periods
+
+    from poseidon.research.ic import _effective_n
+    series = {f"S{n}": [100 * ((1 + 0.001 * n) ** i) * (1 + 0.02 * math.sin(0.3 * i + n))
+                        for i in range(140)] for n in range(8)}
+    hist = _hist(series)
+    mom = Factor("m", lambda b: float(b[-1].close) / float(b[-11].close) - 1.0, min_bars=11)
+    res = evaluate_factor(mom, hist, horizon=20, rebalance_every=5, horizons=[20])
+    assert res.n_periods >= 2 and abs(res.ir) > 1e-9     # data produced a genuinely varying IC
+    n_eff = _effective_n(res.n_periods, 20, 5)
+    assert n_eff < res.n_periods                         # overlap present
+    assert abs(res.t_stat - res.ir * math.sqrt(n_eff)) < 1e-9           # uses n_eff
+    assert abs(res.t_stat - res.ir * math.sqrt(res.n_periods)) > 1e-9   # NOT the raw period count
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -479,6 +491,16 @@ def _ic_series(factor: Factor, history: dict[str, list[Bar]], dates: list[date],
     return series
 
 
+def _effective_n(n_periods: int, horizon: int, rebalance_every: int) -> int:
+    """Count of NON-OVERLAPPING forward windows among n_periods rebalances. When
+    rebalance_every < horizon the windows overlap and the IC series autocorrelates, so
+    the t-stat must use independent observations, not the raw period count."""
+    if n_periods <= 0:
+        return 0
+    stride = max(1, math.ceil(horizon / max(1, rebalance_every)))
+    return math.ceil(n_periods / stride)
+
+
 def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: int,
                     rebalance_every: int, horizons: list[int],
                     min_cross: int = 5) -> ICResult:
@@ -488,8 +510,7 @@ def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: i
     ic_mean = statistics.fmean(ic) if ic else 0.0
     ic_std = statistics.stdev(ic) if n >= 2 else 0.0
     ir = ic_mean / ic_std if ic_std else 0.0
-    stride = max(1, math.ceil(horizon / max(1, rebalance_every)))   # non-overlapping windows
-    n_eff = math.ceil(n / stride) if n else 0
+    n_eff = _effective_n(n, horizon, rebalance_every)   # independent (non-overlapping) samples
     t_stat = ir * math.sqrt(n_eff) if n_eff else 0.0
     hit_rate = sum(1 for x in ic if x > 0) / n if n else 0.0
     by_h: dict[int, float] = {}
