@@ -259,3 +259,18 @@ research:
   horizons: [1, 5, 10, 20]   # decay curve
   min_cross: 5          # minimum symbols per cross-section
   lookback_days: 400    # bars to load per symbol
+
+# Strategy-decay watchdog. Watches each strategy's rolling realized edge and flags
+# decay (healthy -> watch -> decaying -> retire_recommended). ADVISORY by default —
+# it only flags/audits/notifies. It can only ever REDUCE trading, never place an
+# order. auto_retire (opt-in) deactivates a decayed CUSTOM strategy (builtin = flag-only).
+strategy_health:
+  enabled: true
+  auto_retire: false      # opt-in: auto-deactivate a decayed custom strategy
+  window_trades: 20
+  min_trades: 8           # below this the window is "insufficient" (never flagged decaying)
+  baseline_min_trades: 20
+  decay_t: 2.0            # t-stat threshold for a significantly-<=0 recent edge
+  decay_streak: 2         # consecutive dying sweeps -> decaying
+  retire_streak: 4        # consecutive dying sweeps -> retire_recommended
+  recover_streak: 2       # consecutive ok sweeps to step back toward healthy

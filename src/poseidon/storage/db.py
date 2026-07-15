@@ -26,7 +26,7 @@ from typing import Any
 
 import aiosqlite
 
-from ..core.models import AnalysisPacket, TradeLesson
+from ..core.models import AnalysisPacket, StrategyHealth, TradeLesson
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -163,6 +163,13 @@ CREATE TABLE IF NOT EXISTS analysis_packets (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_packets_symbol ON analysis_packets(symbol, as_of);
+
+CREATE TABLE IF NOT EXISTS strategy_health (
+    strategy TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -177,6 +184,11 @@ def _row_to_lesson(r: tuple[Any, ...]) -> TradeLesson:
 def _row_to_packet(row: Any) -> AnalysisPacket:
     # columns: id, symbol, as_of, model, payload, created_at
     return AnalysisPacket.model_validate_json(row[4])
+
+
+def _row_to_health(row: Any) -> StrategyHealth:
+    # columns: payload
+    return StrategyHealth.model_validate_json(row[0])
 
 
 class Database:
@@ -369,3 +381,20 @@ class Database:
                 picked[symbol] = _row_to_packet(row)
         ordered = sorted(picked.values(), key=lambda p: p.as_of, reverse=True)
         return ordered[:limit]
+
+    # -- strategy health (advisory decay state; NOT the audit chain) -----------
+
+    async def upsert_strategy_health(self, h: StrategyHealth) -> None:
+        await self.execute(
+            "INSERT OR REPLACE INTO strategy_health (strategy, state, payload, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (h.strategy, h.state, h.model_dump_json(), h.updated_at.isoformat()))
+
+    async def get_strategy_health(self, strategy: str) -> StrategyHealth | None:
+        row = await self.fetch_one(
+            "SELECT payload FROM strategy_health WHERE strategy = ?", (strategy,))
+        return _row_to_health(row) if row else None
+
+    async def list_strategy_health(self) -> list[StrategyHealth]:
+        rows = await self.fetch_all("SELECT payload FROM strategy_health ORDER BY strategy")
+        return [_row_to_health(r) for r in rows]

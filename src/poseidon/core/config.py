@@ -55,6 +55,22 @@ class ReflectionConfig(StrictModel):
     lookback_days: int = Field(default=120, ge=1)
 
 
+class StrategyHealthConfig(StrictModel):
+    """Strategy-decay watchdog (advisory). Flags a strategy whose realized edge has
+    decayed to <= 0; opt-in auto_retire deactivates a decayed CUSTOM strategy. It can
+    only reduce trading — it never touches the risk engine or the order path."""
+
+    enabled: bool = True
+    auto_retire: bool = False
+    window_trades: int = Field(default=20, ge=1)
+    min_trades: int = Field(default=8, ge=1)
+    baseline_min_trades: int = Field(default=20, ge=1)
+    decay_t: float = Field(default=2.0, gt=0)
+    decay_streak: int = Field(default=2, ge=1)
+    retire_streak: int = Field(default=4, ge=1)
+    recover_streak: int = Field(default=2, ge=1)
+
+
 class AnalysisConfig(StrictModel):
     """Advisory analyst-firm → debate packet (upstream of the PM; never gates risk).
 
@@ -273,6 +289,7 @@ class AppConfig(StrictModel):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
+    strategy_health: StrategyHealthConfig = Field(default_factory=StrategyHealthConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:
