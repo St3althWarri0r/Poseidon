@@ -249,3 +249,13 @@ updates:
   enabled: true
   check_interval_hours: 24
   auto_apply: false
+
+# Offline factor research (poseidon research factors). Pure analysis — never
+# trades. Point-in-time IC/IR; give it a BROAD --symbols universe (hundreds of
+# names), not just your watchlist, or the cross-sectional IC is noisy.
+research:
+  horizon: 5            # forward-return horizon (trading days) for the headline IC
+  rebalance_every: 5    # evaluate every N days; keep >= horizon to avoid overlap inflation
+  horizons: [1, 5, 10, 20]   # decay curve
+  min_cross: 5          # minimum symbols per cross-section
+  lookback_days: 400    # bars to load per symbol
