@@ -59,3 +59,33 @@ def assess(trips: list[RoundTrip], cfg: StrategyHealthConfig) -> Assessment:
     if win_mean > 0 and win_mean < base_mean - cfg.decay_t * se:
         return Assessment(Signal.SOFTENING, win_mean, base_mean, t0, n, win_rate)
     return Assessment(Signal.OK, win_mean, base_mean, t0, n, win_rate)
+
+
+_LADDER = [HealthState.HEALTHY, HealthState.WATCH, HealthState.DECAYING,
+           HealthState.RETIRE_RECOMMENDED]
+
+
+def _down_one(state: HealthState) -> HealthState:
+    return _LADDER[max(0, _LADDER.index(state) - 1)]
+
+
+def advance(state: HealthState, decline_streak: int, recover_streak: int,
+            signal: Signal, cfg: StrategyHealthConfig) -> tuple[HealthState, int, int]:
+    """Hysteresis transition. Only DYING escalates toward retirement."""
+    if signal is Signal.DYING:
+        d = decline_streak + 1
+        if state in (HealthState.HEALTHY, HealthState.WATCH):
+            state = HealthState.DECAYING if d >= cfg.decay_streak else HealthState.WATCH
+        elif state is HealthState.DECAYING and d >= cfg.retire_streak:
+            state = HealthState.RETIRE_RECOMMENDED
+        return state, d, 0
+    if signal is Signal.SOFTENING:
+        if state is HealthState.HEALTHY:
+            state = HealthState.WATCH
+        return state, 0, 0                    # not dying: reset decline, no recovery
+    if signal is Signal.OK:
+        r = recover_streak + 1
+        if state is not HealthState.HEALTHY and r >= cfg.recover_streak:
+            return _down_one(state), 0, 0
+        return state, 0, r
+    return state, decline_streak, recover_streak     # INSUFFICIENT holds everything
