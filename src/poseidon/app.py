@@ -26,7 +26,8 @@ from .ai.chat import ChatService
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
-from .analytics.performance import FillRecord, build_round_trips, compute_performance
+from .analytics.decay_service import StrategyHealthService
+from .analytics.performance import FillRecord, RoundTrip, build_round_trips, compute_performance
 from .api.server import DashboardServer
 from .brokers.base import Broker
 from .brokers.plugins.paper import PaperBroker
@@ -79,6 +80,10 @@ class ApplicationKernel:
         # built in start(). Packets it produces are injected into the PM's
         # cycle prompt only — never the risk engine, the order path, or chat.
         self.analysis: AnalysisService | None = None
+        # Advisory strategy-decay watchdog; the real service is built in
+        # start(). Reduce-only: its one mutation is deactivating a decayed
+        # CUSTOM strategy — it never activates one or touches the order path.
+        self.strategy_health: StrategyHealthService | None = None
 
         # populated in start()
         self.db: Database
@@ -196,6 +201,13 @@ class ApplicationKernel:
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
         self.sync = PortfolioSyncService(self.broker, self.portfolio, self.bus, self.db, self.clock)
+        self.strategy_health = StrategyHealthService(
+            db=self.db, config=cfg.strategy_health,
+            load_trips=self._load_strategy_trips,
+            audit_append=self.audit.append,
+            notify=lambda level, data: self.bus.publish(
+                Topics.NOTIFY, {"level": level, "title": "strategy health", **data}),
+            retire=self._retire_strategy)
         self.scheduler = Scheduler(self.clock, self.bus)
         self._register_jobs()
         self.health = HealthMonitor(self.bus)
@@ -615,6 +627,8 @@ class ApplicationKernel:
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
         if self.analysis is not None:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
+        if self.strategy_health is not None:
+            self.scheduler.register_job("strategy_health_sweep", self.strategy_health.sweep)
 
     def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
@@ -656,6 +670,13 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="default-analysis-sweep", job="analysis_sweep",
                                cron="30 8 * * *")  # daily pre-market (America/New_York)
+            )
+        if self.config.strategy_health.enabled and not any(
+            s.job == "strategy_health_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                ScheduleConfig(name="default-strategy-health", job="strategy_health_sweep",
+                               cron="0 6 * * *")  # daily pre-market
             )
         return schedules
 
@@ -906,20 +927,28 @@ class ApplicationKernel:
     async def performance_report(self) -> dict[str, object]:
         """Portfolio metrics from stored equity marks + realized round trips
         from the platform's own filled orders, attributed per strategy."""
-        from decimal import Decimal
-
-        from .core.enums import AssetClass, OrderSide, OrderStatus
-        from .core.models import Order
-
         marks = await self.db.fetch_all(
             "SELECT at, equity FROM equity_marks WHERE broker = ? ORDER BY at ASC",
             (self.broker.account_scope,),
         )
         equity_points = [(datetime.fromisoformat(r[0]), float(r[1])) for r in marks]
-        # Fills are account-scoped like the equity marks: paper round trips
-        # must not inflate a real account's win rate or per-strategy P&L (and
-        # vice versa). Pre-migration rows (account_scope='') are excluded,
-        # matching the equity_marks convention.
+        trips = build_round_trips(await self._load_all_fills())
+        report = compute_performance(equity_points, trips).as_dict()
+        report["open_exit_plans"] = await self.guardian.active_plans()
+        return report
+
+    async def _load_all_fills(self) -> list[FillRecord]:
+        """All filled orders as FillRecords, attributed per strategy. Fills are
+        account-scoped like the equity marks: paper round trips must not
+        inflate a real account's win rate or per-strategy P&L (and vice
+        versa). Pre-migration rows (account_scope='') are excluded, matching
+        the equity_marks convention. Shared by the performance report and the
+        strategy-health sweep."""
+        from decimal import Decimal
+
+        from .core.enums import AssetClass, OrderSide, OrderStatus
+        from .core.models import Order
+
         rows = await self.db.fetch_all(
             "SELECT payload FROM orders WHERE status = ? AND account_scope = ? "
             "ORDER BY updated_at ASC",
@@ -938,10 +967,25 @@ class ApplicationKernel:
                 strategy=order.strategy,
                 multiplier=Decimal(100) if order.asset_class is AssetClass.OPTION else Decimal(1),
             ))
-        trips = build_round_trips(fills)
-        report = compute_performance(equity_points, trips).as_dict()
-        report["open_exit_plans"] = await self.guardian.active_plans()
-        return report
+        return fills
+
+    async def _load_strategy_trips(self) -> list[RoundTrip]:
+        """All closed round-trips attributed per strategy (reuses the
+        performance loader) — feeds the strategy-health sweep."""
+        return build_round_trips(await self._load_all_fills())
+
+    async def _retire_strategy(self, strategy: str) -> bool:
+        """Reduce-only: deactivate the ACTIVE CUSTOM strategy of this name,
+        else no-op. Returns True iff it deactivated one. Never activates or
+        orders."""
+        try:
+            for algo in await self.workshop.list_all():
+                if algo.get("name") == strategy and algo.get("status") == "active":
+                    await self.workshop.deactivate(algo["id"], archive=False)
+                    return True
+        except Exception as exc:
+            log.warning("auto-retire failed", strategy=strategy, error=str(exc))
+        return False
 
     def _symbol_is_flat(self, symbol: str) -> bool:
         p = self.portfolio.position_for(symbol)
