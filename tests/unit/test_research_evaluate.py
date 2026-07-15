@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from poseidon.core.models import Bar
 from poseidon.research.factors import Factor
 from poseidon.research.ic import evaluate_factor
@@ -61,6 +63,20 @@ def test_effective_n_formula() -> None:
     assert _effective_n(10, 5, 5) == 10     # rebalance == horizon -> no overlap
     assert _effective_n(12, 10, 5) == 6     # stride 2
     assert _effective_n(0, 20, 5) == 0
+
+
+def test_evaluate_factor_rejects_non_positive_horizon_or_rebalance() -> None:
+    # A non-positive horizon/rebalance_every/horizons entry would let forward_return's
+    # `bars[i + horizon]` negative-index onto a REAL future bar — a silent look-ahead
+    # leak. The CLI now accepts a user-supplied --horizon, so this must be a hard error.
+    hist = _hist({s: [100 + i for i in range(30)] for s in ("A", "B", "C", "D", "E")})
+    probe = Factor("probe", lambda b: float(len(b)), min_bars=2)
+    with pytest.raises(ValueError):
+        evaluate_factor(probe, hist, horizon=-1, rebalance_every=5, horizons=[1])
+    with pytest.raises(ValueError):
+        evaluate_factor(probe, hist, horizon=5, rebalance_every=0, horizons=[1])
+    with pytest.raises(ValueError):
+        evaluate_factor(probe, hist, horizon=5, rebalance_every=5, horizons=[1, 0])
 
 
 def test_t_stat_uses_non_overlapping_n_eff() -> None:

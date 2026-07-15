@@ -114,6 +114,16 @@ def _effective_n(n_periods: int, horizon: int, rebalance_every: int) -> int:
 def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: int,
                     rebalance_every: int, horizons: list[int],
                     min_cross: int = 5) -> ICResult:
+    # Defense in depth: a non-positive horizon/rebalance_every/horizons entry would let
+    # forward_return's `bars[i + horizon]` negative-index onto a REAL future bar — a
+    # silent look-ahead leak, not a crash. The CLI now passes through a user-supplied
+    # --horizon, so this can no longer be assumed to always come from trusted call sites.
+    if horizon < 1 or rebalance_every < 1 or any(h < 1 for h in horizons):
+        raise ValueError(
+            f"evaluate_factor requires horizon >= 1, rebalance_every >= 1, and all "
+            f"horizons >= 1 (got horizon={horizon}, rebalance_every={rebalance_every}, "
+            f"horizons={horizons})"
+        )
     dates = rebalance_dates(history, rebalance_every)
     ic = _ic_series(factor, history, dates, horizon, min_cross)
     n = len(ic)
