@@ -74,6 +74,13 @@ APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
 mkdir -p "$ICON_DIR" "$APPS_DIR"
 install -m644 "$REPO_DIR/packaging/poseidon.svg" "$ICON_DIR/poseidon.svg"
+# Pre-rendered raster sizes so docks/taskbars stay crisp at small sizes
+# (mirrors the PKGBUILD's system-wide install).
+HICOLOR_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+for _s in 16 22 24 32 48 64 128 256 512; do
+  install -Dm644 "$REPO_DIR/packaging/icons/hicolor/${_s}x${_s}/apps/poseidon.png" \
+    "$HICOLOR_DIR/${_s}x${_s}/apps/poseidon.png"
+done
 
 # Point the entry at THIS venv's launcher and the installed icon (an absolute
 # icon path is the most reliable across desktops and cold icon caches).
