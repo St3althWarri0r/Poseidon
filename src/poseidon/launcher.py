@@ -19,10 +19,12 @@ Design:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
 
 _ENGINE_START_ATTEMPTS = 60  # up to ~30s at the default 0.5s interval
 _PROBE_INTERVAL = 0.5
+_ENGINE_STOP_GRACE = 10.0  # seconds of SIGTERM grace before SIGKILL
 
 
 # ------------------------------------------------------------------ pure core
@@ -331,6 +334,41 @@ def _engine_up(url: str) -> bool:
     return engine_running(url)
 
 
+def _wait_for_dashboard(
+    proc: subprocess.Popen[bytes],
+    url: str,
+    *,
+    attempts: int,
+    sleep: Callable[[float], None],
+    interval: float = _PROBE_INTERVAL,
+    engine_up: Callable[[str], bool] | None = None,
+) -> str:
+    """Poll until the dashboard answers, the child dies, or attempts run out.
+    Polling the child makes a wrong passphrase fail in seconds, not 30."""
+    probe = engine_up or _engine_up
+    for _ in range(attempts):
+        if proc.poll() is not None:
+            return "died"
+        if probe(url):
+            return "up"
+        sleep(interval)
+    return "timeout"
+
+
+def _kill_own_engine(proc: subprocess.Popen[bytes], *, grace: float = _ENGINE_STOP_GRACE) -> None:
+    """TERM -> grace -> KILL for OUR OWN child. No starttime check needed:
+    an unreaped child's pid cannot be recycled (we hold the zombie), and
+    ``start_new_session=True`` makes its pgid == pid."""
+    for sig, timeout in ((signal.SIGTERM, grace), (signal.SIGKILL, 5.0)):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, sig)
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _ensure_starter_config(config: AppConfig) -> None:
     """Write the starter poseidon.yaml if the user has none, so they can edit it
     later. Mirrors ``poseidon config example`` asset resolution."""
@@ -387,26 +425,47 @@ def _first_run_setup(dialog: Dialog, config: AppConfig, vault: Vault) -> str | N
     return p1
 
 
-def _start_engine(config: AppConfig, passphrase: str, dialog: Dialog, url: str) -> bool:
-    """Spawn the engine detached (survives the launcher/window closing), with the
-    passphrase in its environment, then wait for the dashboard to answer."""
+def _start_engine(
+    config: AppConfig, passphrase: str, dialog: Dialog, url: str,
+) -> subprocess.Popen[bytes] | None:
+    """Spawn the engine as a TRACKED child (own session/group), record its
+    identity in engine.pid, and wait for the dashboard. On failure the spawn
+    is cleaned up — a failed boot must never leave a half-started orphan."""
     log_path = config.data_dir / "launcher-engine.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _notify("Starting Poseidon…", "Unlocking the vault and bringing the engine up.")
     with log_path.open("a", encoding="utf-8") as log_fh:
-        subprocess.Popen(  # noqa: S603 — fixed argv (sys.executable -m poseidon), no shell
+        proc = subprocess.Popen(  # noqa: S603 — fixed argv (sys.executable -m poseidon), no shell
             [sys.executable, "-m", "poseidon", "run"],
             env=engine_env(passphrase, os.environ),
             stdin=subprocess.DEVNULL, stdout=log_fh, stderr=log_fh,
             start_new_session=True,
         )
-    if wait_until_up(lambda: _engine_up(url), attempts=_ENGINE_START_ATTEMPTS, sleep=time.sleep):
-        _notify("Poseidon is running.", "Opening the dashboard.")
-        return True
-    dialog.error(
-        "Poseidon did not come up in time.\n\nThe vault password may be wrong, or a "
-        f"key/config may be missing. See the log:\n{log_path}")
-    return False
+    pidfile = config.data_dir / _ENGINE_PIDFILE
+    starttime = proc_starttime(proc.pid)
+    if starttime is not None:
+        write_pidfile(pidfile, ProcIdent(pid=proc.pid, starttime=starttime))
+    # else: the child already died (e.g. instant crash) — the wait loop below
+    # reports it accurately; nothing to record.
+    while True:
+        outcome = _wait_for_dashboard(proc, url,
+                                      attempts=_ENGINE_START_ATTEMPTS, sleep=time.sleep)
+        if outcome == "up":
+            _notify("Poseidon is running.", "Opening the dashboard.")
+            return proc
+        if outcome == "died":
+            proc.wait()  # reap
+            pidfile.unlink(missing_ok=True)
+            dialog.error(
+                "Poseidon exited during startup — most often a wrong vault "
+                f"password, or a missing key/config. See the log:\n{log_path}")
+            return None
+        if dialog.question("Poseidon is still starting — keep waiting?"):
+            continue
+        _kill_own_engine(proc)
+        pidfile.unlink(missing_ok=True)
+        dialog.error(f"Poseidon did not come up in time. See the log:\n{log_path}")
+        return None
 
 
 def _resolve_window_token(config: AppConfig, passphrase: str | None) -> str | None:
@@ -459,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
             if not passphrase:
                 dialog.error("No password entered — Poseidon was not started.")
                 return 1
-        if not _start_engine(config, passphrase, dialog, url):
+        if _start_engine(config, passphrase, dialog, url) is None:
             return 1
 
     token = _resolve_window_token(config, passphrase)

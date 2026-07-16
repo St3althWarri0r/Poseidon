@@ -12,6 +12,8 @@ import json as _json
 from poseidon.core.config import AppConfig, DashboardConfig
 from poseidon.launcher import (
     FoundEngine,
+    _kill_own_engine,
+    _wait_for_dashboard,
     clear_running_engines,
     dashboard_url,
     engine_env,
@@ -126,7 +128,7 @@ def test_main_first_run_creates_vault_then_starts_and_opens(tmp_path, monkeypatc
     def fake_start(config, passphrase, dialog, url):  # noqa: ANN001, ANN202
         captured["passphrase"] = passphrase
         captured["url"] = url
-        return True
+        return _FakeEngineProc()
 
     launched: dict[str, object] = {}
     monkeypatch.setattr(launcher, "Dialog", FakeDialog)
@@ -440,3 +442,64 @@ def test_clear_keeps_pidfile_when_live_engine_stop_unconfirmed(tmp_path) -> None
     assert (tmp_path / "engine.pid").exists()              # record survives for retry
     log = (tmp_path / "launcher-engine.log").read_text(encoding="utf-8")
     assert "stopped=False" in log                          # attempt AND outcome logged
+
+
+# ---- _start_engine: tracked child, fast-fail on death, keep-waiting ----
+
+
+class _FakeEngineProc:
+    def __init__(self, alive: bool = True, pid: int = 777) -> None:
+        self.pid = pid
+        self._alive = alive
+        self.signals: list[int] = []
+        self.waits: list[float | None] = []
+    def poll(self):  # noqa: ANN201
+        return None if self._alive else 1
+    def wait(self, timeout=None):  # noqa: ANN001, ANN201
+        self.waits.append(timeout)
+        if self._alive:
+            import subprocess as sp
+            raise sp.TimeoutExpired("engine", timeout or 0)
+        return 0
+
+
+def test_wait_for_dashboard_up() -> None:
+    proc = _FakeEngineProc(alive=True)
+    answers = iter([False, False, True])
+    out = _wait_for_dashboard(proc, "http://x", attempts=5, sleep=lambda _s: None,
+                              engine_up=lambda _u: next(answers))
+    assert out == "up"
+
+
+def test_wait_for_dashboard_fast_fails_when_child_dies() -> None:
+    proc = _FakeEngineProc(alive=False)
+    out = _wait_for_dashboard(proc, "http://x", attempts=100, sleep=lambda _s: None,
+                              engine_up=lambda _u: False)
+    assert out == "died"                       # immediately — never 30s of polling
+
+
+def test_wait_for_dashboard_timeout_with_live_child() -> None:
+    proc = _FakeEngineProc(alive=True)
+    slept: list[float] = []
+    out = _wait_for_dashboard(proc, "http://x", attempts=4, sleep=slept.append,
+                              engine_up=lambda _u: False)
+    assert out == "timeout" and len(slept) == 4
+
+
+def test_kill_own_engine_term_then_kill(monkeypatch) -> None:
+    import poseidon.launcher as launcher
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(launcher.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    proc = _FakeEngineProc(alive=True, pid=555)
+    _kill_own_engine(proc, grace=0.1)
+    import signal as _sig
+    assert (555, _sig.SIGTERM) in sent and (555, _sig.SIGKILL) in sent
+
+
+def test_kill_own_engine_already_dead_noop(monkeypatch) -> None:
+    import poseidon.launcher as launcher
+    def raising_killpg(pgid, sig):  # noqa: ANN001, ANN202
+        raise ProcessLookupError(pgid)
+    monkeypatch.setattr(launcher.os, "killpg", raising_killpg)
+    proc = _FakeEngineProc(alive=False)
+    _kill_own_engine(proc)                     # must not raise
