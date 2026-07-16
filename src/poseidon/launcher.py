@@ -19,14 +19,18 @@ Design:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from .proclife import ProcIdent, proc_starttime
 
 if TYPE_CHECKING:
     from .core.config import AppConfig
@@ -79,6 +83,86 @@ def pick_dialog_backend(which: Callable[[str], str | None]) -> str | None:
         if which(tool):
             return tool
     return None
+
+
+# ---------------------------------------------------------- process lifecycle
+
+_ENGINE_PIDFILE = "engine.pid"
+
+
+def read_pidfile(path: Path) -> ProcIdent | None:
+    """The recorded engine identity, or None for missing/garbage — a bad pid
+    file must never be a reason to signal anything."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pid, starttime = data["pid"], data["starttime"]
+        if isinstance(pid, bool) or isinstance(starttime, bool):
+            return None
+        if not isinstance(pid, int) or not isinstance(starttime, int):
+            return None
+        return ProcIdent(pid=pid, starttime=starttime)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def write_pidfile(path: Path, ident: ProcIdent) -> None:
+    """Identity fields only — this file must never carry anything secret."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": ident.pid, "starttime": ident.starttime}),
+                    encoding="utf-8")
+
+
+def is_engine_cmdline(exe: str, argv: list[str]) -> bool:
+    """True only for the two exact engine spawn shapes. Positional matching:
+    a stray ``... poseidon run`` argument tail must NOT match — this predicate
+    authorizes a kill."""
+    if not Path(exe).name.startswith("python"):
+        return False
+    if not argv:
+        return False
+    if Path(argv[0]).name == "poseidon" and argv[1:2] == ["run"]:
+        return True
+    for i, tok in enumerate(argv[:-1]):
+        if tok == "-m" and argv[i + 1] == "poseidon" and argv[i + 2:i + 3] == ["run"]:
+            return True
+        if tok == "-mposeidon" and argv[i + 1] == "run":
+            return True
+    return False
+
+
+@dataclass(frozen=True)
+class FoundEngine(ProcIdent):
+    """A verified running engine plus its cmdline (for the forensic log)."""
+
+    cmdline: str
+
+
+def find_running_engines(proc_root: Path = Path("/proc")) -> list[FoundEngine]:
+    """Every same-UID process matching an exact engine spawn shape. Other
+    users' entries drop out naturally (their ``exe`` link is unreadable)."""
+    me = os.getpid()
+    found: list[FoundEngine] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me:
+            continue
+        try:
+            exe = str((entry / "exe").readlink())
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = raw.decode(errors="replace").split("\0")
+        while argv and argv[-1] == "":
+            argv.pop()
+        if not is_engine_cmdline(exe, argv):
+            continue
+        starttime = proc_starttime(pid, proc_root)
+        if starttime is None:
+            continue
+        found.append(FoundEngine(pid=pid, starttime=starttime, cmdline=" ".join(argv)))
+    return found
 
 
 # ------------------------------------------------------------- dialog backend

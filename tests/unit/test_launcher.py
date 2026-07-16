@@ -7,14 +7,22 @@ function tested here.
 
 from __future__ import annotations
 
+import json as _json
+
 from poseidon.core.config import AppConfig, DashboardConfig
 from poseidon.launcher import (
+    FoundEngine,
     dashboard_url,
     engine_env,
+    find_running_engines,
+    is_engine_cmdline,
     needs_setup,
     pick_dialog_backend,
+    read_pidfile,
     wait_until_up,
+    write_pidfile,
 )
+from poseidon.proclife import ProcIdent
 
 
 def _config(host: str = "127.0.0.1", port: int = 8321) -> AppConfig:
@@ -166,3 +174,67 @@ def test_main_engine_already_up_skips_setup_and_start(tmp_path, monkeypatch) -> 
 
     assert launcher.main() == 0
     assert launched["url"] == "http://127.0.0.1:8321"
+
+
+# ---- process lifecycle: pid file, engine matcher, /proc scan ----
+
+
+def test_pidfile_roundtrip_and_content(tmp_path) -> None:
+    path = tmp_path / "engine.pid"
+    write_pidfile(path, ProcIdent(pid=123, starttime=456))
+    assert read_pidfile(path) == ProcIdent(123, 456)
+    # The file must contain identity fields ONLY — never anything secret.
+    assert set(_json.loads(path.read_text())) == {"pid", "starttime"}
+
+
+def test_pidfile_garbage_and_missing_read_as_none(tmp_path) -> None:
+    path = tmp_path / "engine.pid"
+    assert read_pidfile(path) is None                       # missing
+    path.write_text("not json")
+    assert read_pidfile(path) is None                       # garbage
+    path.write_text('{"pid": "x", "starttime": 1}')
+    assert read_pidfile(path) is None                       # wrong types
+
+
+def test_engine_matcher_accepts_both_real_spawn_shapes() -> None:
+    py = "/home/u/.local/share/poseidon/venv/bin/python3.14"
+    assert is_engine_cmdline(py, [py, "-m", "poseidon", "run"]) is True
+    assert is_engine_cmdline(py, ["/venv/bin/poseidon", "run"]) is True       # console script
+    assert is_engine_cmdline(py, [py, "-mposeidon", "run"]) is True           # fused form
+
+
+def test_engine_matcher_rejects_lookalikes() -> None:
+    py = "/usr/bin/python3"
+    assert is_engine_cmdline("/usr/bin/vim", ["vim", "poseidon", "run"]) is False    # not python
+    assert is_engine_cmdline(py, [py, "x.py", "poseidon", "run"]) is False    # arg tail, not -m
+    assert is_engine_cmdline(py, [py, "-m", "poseidon", "app"]) is False      # not run
+    assert is_engine_cmdline(py, [py, "-m", "poseidonx", "run"]) is False     # wrong module
+    assert is_engine_cmdline(py, []) is False
+
+
+def _fake_proc(tmp_path, pid: int, exe: str, argv: list[str], starttime: int) -> None:
+    d = tmp_path / str(pid)
+    d.mkdir()
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    tail = f"S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0"
+    (d / "stat").write_text(f"{pid} ({argv[0][:15]}) {tail}")
+    (d / "exe").symlink_to(exe)
+
+
+def test_find_running_engines_scans_and_filters(tmp_path) -> None:
+    py = "/usr/bin/python3.14"
+    _fake_proc(tmp_path, 100, py, [py, "-m", "poseidon", "run"], 11)          # engine
+    _fake_proc(tmp_path, 101, py, ["/venv/bin/poseidon", "run"], 22)          # engine (script)
+    _fake_proc(tmp_path, 102, "/usr/bin/vim", ["vim", "poseidon", "run"], 33)  # imposter
+    _fake_proc(tmp_path, 103, py, [py, "app.py", "poseidon", "run"], 44)      # arg tail
+    (tmp_path / "not-a-pid").mkdir()
+    found = find_running_engines(proc_root=tmp_path)
+    assert sorted((e.pid, e.starttime) for e in found) == [(100, 11), (101, 22)]
+    assert all(isinstance(e, FoundEngine) and "poseidon" in e.cmdline for e in found)
+
+
+def test_find_running_engines_skips_itself(tmp_path) -> None:
+    import os as _os
+    py = "/usr/bin/python3.14"
+    _fake_proc(tmp_path, _os.getpid(), py, [py, "-m", "poseidon", "run"], 55)
+    assert find_running_engines(proc_root=tmp_path) == []
