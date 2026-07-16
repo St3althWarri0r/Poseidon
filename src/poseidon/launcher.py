@@ -491,10 +491,18 @@ def _first_run_setup(dialog: Dialog, config: AppConfig, vault: Vault) -> str | N
 
 def _start_engine(
     config: AppConfig, passphrase: str, dialog: Dialog, url: str,
+    *, on_spawn: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> subprocess.Popen[bytes] | None:
     """Spawn the engine as a TRACKED child (own session/group), record its
     identity in engine.pid, and wait for the dashboard. On failure the spawn
-    is cleaned up — a failed boot must never leave a half-started orphan."""
+    is cleaned up — a failed boot must never leave a half-started orphan.
+
+    ``on_spawn`` receives the child handle THE INSTANT it is forked — before
+    the pid-file write and before the blocking dashboard wait below. This is
+    the hand-off that makes the ~30s wait signal-safe: a SIGTERM/SIGHUP/SIGINT
+    landing mid-wait unwinds ``main()`` through its ``finally``, which can only
+    reap the engine if the handle already reached it (this function does not
+    return until the wait finishes, so its return value is too late)."""
     log_path = config.data_dir / "launcher-engine.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     _notify("Starting Poseidon…", "Unlocking the vault and bringing the engine up.")
@@ -505,6 +513,8 @@ def _start_engine(
             stdin=subprocess.DEVNULL, stdout=log_fh, stderr=log_fh,
             start_new_session=True,
         )
+    if on_spawn is not None:
+        on_spawn(proc)  # hand off at fork — must precede the blocking wait (signal safety)
     pidfile = config.data_dir / _ENGINE_PIDFILE
     starttime = proc_starttime(proc.pid)
     if starttime is not None:
@@ -642,8 +652,15 @@ def main(argv: list[str] | None = None) -> int:
     window: subprocess.Popen[bytes] | None = None
     pidfile = config.data_dir / _ENGINE_PIDFILE
     try:
-        proc = _start_engine(config, passphrase, dialog, url)
-        if proc is None:
+        def _remember_proc(p: subprocess.Popen[bytes]) -> None:
+            nonlocal proc
+            proc = p
+
+        # Bind proc via the callback, NOT the return value: _start_engine blocks
+        # in its ~30s dashboard wait before returning, so a signal mid-wait would
+        # unwind past `proc = ...` and orphan the just-spawned engine. on_spawn
+        # binds it at fork; the return value is still checked for the fail path.
+        if _start_engine(config, passphrase, dialog, url, on_spawn=_remember_proc) is None:
             return 1
         token = _resolve_window_token(config, passphrase)
         target = url
@@ -651,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
             from urllib.parse import quote
             target = f"{url}/?token={quote(token, safe='')}"
 
-        def _remember(p: subprocess.Popen[bytes]) -> None:
+        def _remember_window(p: subprocess.Popen[bytes]) -> None:
             nonlocal window
             window = p
 
@@ -660,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
             target,
             profile_dir=config.data_dir / "webview-profile",
             token_in_url=bool(token),
-            on_spawn=_remember,
+            on_spawn=_remember_window,
             fallback_block=lambda: dialog.info(
                 "Poseidon is running.\n\nClose this dialog to shut it down."),
         )

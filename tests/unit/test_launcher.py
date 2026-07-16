@@ -134,9 +134,16 @@ def test_install_signal_handlers_handler_raises_128_plus_signum(monkeypatch) -> 
 # ---- main() orchestration (real vault + config; GUI/engine/window faked) ----
 
 def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpassword",
-               window_rc=0, window_raises=None):
+               window_rc=0, window_raises=None, start_raises_after_spawn=None):
     """Standard main() wiring: real vault in tmp XDG dirs, everything else faked.
-    Returns a dict of recorders."""
+    Returns a dict of recorders.
+
+    The fake ``_start_engine`` and ``open_app_window_blocking`` both hand their
+    process handle to ``main()`` via the ``on_spawn`` callback (exactly as the
+    real ones do), so ``rec["shutdown"]`` records the ENGINE and WINDOW handles
+    that reach the teardown — proving both escaped to main()'s finally. Set
+    ``start_raises_after_spawn`` to a raised exception to simulate a signal
+    landing DURING the engine-startup wait (handle already forked)."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "d"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "c"))
     import poseidon.gui as gui
@@ -165,7 +172,18 @@ def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpasswor
         def wait(self, timeout=None):  # noqa: ANN001, ANN201
             return 0
 
+    class FakeWindow:
+        pid = 950
+        def poll(self):  # noqa: ANN201
+            return None
+        def terminate(self) -> None: ...
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+        def kill(self) -> None: ...
+
     engine = FakeEngine()
+    window_proc = FakeWindow()
+    rec["window_proc"] = window_proc
     monkeypatch.setattr(launcher, "Dialog", FakeDialog)
     monkeypatch.setattr(launcher, "pick_dialog_backend", lambda which: "zenity")
     monkeypatch.setattr(launcher, "_install_signal_handlers", lambda: None)
@@ -184,7 +202,6 @@ def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpasswor
     def fake_stop(ident, **kw):  # noqa: ANN001, ANN202
         rec["stopped"].append(ident.pid)  # type: ignore[union-attr]
         return True
-    monkeypatch.setattr(launcher, "_clear_stop_seam", fake_stop, raising=False)
     # clear_running_engines is exercised REAL, with seams injected via partial:
     real_clear = launcher.clear_running_engines
     monkeypatch.setattr(
@@ -194,9 +211,15 @@ def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpasswor
             engines=lambda: list(engines_found), stop=fake_stop,
             stop_unit=lambda: (rec["unit"].append(True), "stopped")[1],  # type: ignore[union-attr]
             engine_up=lambda _u: False, alive=lambda i: True))
-    monkeypatch.setattr(launcher, "_start_engine",
-                        lambda config, passphrase, dialog, url:
-                            (rec.__setitem__("passphrase", passphrase), engine)[1])
+
+    def fake_start(config, passphrase, dialog, url, *, on_spawn=None):  # noqa: ANN001, ANN202
+        rec["passphrase"] = passphrase
+        if on_spawn is not None:
+            on_spawn(engine)              # hand the handle off at "fork", as the real one does
+        if start_raises_after_spawn is not None:
+            raise start_raises_after_spawn
+        return engine
+    monkeypatch.setattr(launcher, "_start_engine", fake_start)
     monkeypatch.setattr(launcher, "_shutdown_engine",
                         lambda proc, window, pidfile:
                             rec["shutdown"].append((proc, window)))  # type: ignore[union-attr]
@@ -204,6 +227,8 @@ def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpasswor
     def fake_window(url, *, profile_dir, token_in_url=False, on_spawn=None,
                     fallback_block=None, handoff_threshold=2.0):  # noqa: ANN001, ANN202
         rec["window"].append(url)  # type: ignore[union-attr]
+        if on_spawn is not None:
+            on_spawn(window_proc)         # the window handle must reach _shutdown_engine too
         if window_raises is not None:
             raise window_raises
         return window_rc
@@ -221,13 +246,14 @@ def test_main_always_fresh_start_kills_running_engine(tmp_path, monkeypatch) -> 
     assert rec["stopped"] == [321]                         # prior engine killed
     assert rec["unit"]                                     # systemd stop attempted
     assert rec["window"]                                   # window opened
-    assert rec["shutdown"] == [(engine, None)]             # finally stopped OUR engine
+    # finally stopped OUR engine AND reaped the window handle it spawned:
+    assert rec["shutdown"] == [(engine, rec["window_proc"])]
 
 
 def test_main_window_close_shuts_engine_down(tmp_path, monkeypatch) -> None:
     rec, engine, launcher = _wire_main(monkeypatch, tmp_path)
     assert launcher.main() == 0
-    assert rec["shutdown"] == [(engine, None)]
+    assert rec["shutdown"] == [(engine, rec["window_proc"])]
 
 
 def test_main_signal_during_window_still_stops_engine(tmp_path, monkeypatch) -> None:
@@ -236,7 +262,22 @@ def test_main_signal_during_window_still_stops_engine(tmp_path, monkeypatch) -> 
     import pytest as _pytest
     with _pytest.raises(SystemExit):
         launcher.main()
-    assert rec["shutdown"] == [(engine, None)]             # finally ran
+    # the window handoff happened before the signal, so finally reaps both:
+    assert rec["shutdown"] == [(engine, rec["window_proc"])]
+
+
+def test_main_signal_during_startup_wait_still_reaps_engine(tmp_path, monkeypatch) -> None:
+    # The engine is Popen'd, then main() blocks ~30s waiting for the dashboard.
+    # A signal (SystemExit) landing in that wait must still reap the engine —
+    # which only works if the handle escaped to main()'s `proc` AT FORK, via
+    # on_spawn, not via _start_engine's return value (it never returns here).
+    rec, engine, launcher = _wire_main(monkeypatch, tmp_path,
+                                       start_raises_after_spawn=SystemExit(143))
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        launcher.main()
+    assert rec["shutdown"] == [(engine, None)]             # window never opened
+    assert rec["shutdown"][0][0] is engine                 # the ENGINE handle, NOT None
 
 
 def test_main_password_cancel_never_runs_kill_pass(tmp_path, monkeypatch) -> None:
@@ -284,9 +325,13 @@ def test_main_first_run_still_works_with_fresh_flow(tmp_path, monkeypatch) -> No
                                             path.open("a+", encoding="utf-8"))[1])  # noqa: SIM115
     monkeypatch.setattr(launcher, "clear_running_engines",
                         lambda config, dialog, url: True)
-    monkeypatch.setattr(launcher, "_start_engine",
-                        lambda config, passphrase, dialog, url:
-                            (captured.__setitem__("passphrase", passphrase), FakeEngine())[1])
+
+    def fake_start(config, passphrase, dialog, url, *, on_spawn=None):  # noqa: ANN001, ANN202
+        captured["passphrase"] = passphrase
+        if on_spawn is not None:
+            on_spawn(FakeEngine())
+        return FakeEngine()
+    monkeypatch.setattr(launcher, "_start_engine", fake_start)
     monkeypatch.setattr(launcher, "_shutdown_engine", lambda proc, window, pidfile: None)
     monkeypatch.setattr(gui, "open_app_window_blocking",
                         lambda url, **kw: (captured.__setitem__("url", url), 0)[1])
@@ -362,6 +407,36 @@ def test_shutdown_engine_keeps_foreign_pidfile(tmp_path, monkeypatch) -> None:
     launcher.write_pidfile(pidfile, ProcIdent(pid=999, starttime=7))
     launcher._shutdown_engine(FakeEngine(), None, pidfile)
     assert launcher.read_pidfile(pidfile) == ProcIdent(999, 7)
+
+
+def test_shutdown_engine_idempotent_across_two_calls(tmp_path, monkeypatch) -> None:
+    # main()'s finally can, in principle, run more than once' worth of teardown
+    # (a signal during teardown). Two calls must not raise, must notify exactly
+    # once, and must not double-unlink. Idempotence comes from poll() flipping
+    # live->dead after the first stop and was_live being recomputed each call.
+    import poseidon.launcher as launcher
+    from poseidon.proclife import ProcIdent
+
+    class FakeEngine:
+        pid = 904
+        def __init__(self) -> None:
+            self._dead = False
+        def poll(self):  # noqa: ANN201
+            return 0 if self._dead else None
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            self._dead = True
+            return 0
+
+    monkeypatch.setattr(launcher, "_kill_own_engine", lambda proc, **kw: proc.wait())
+    notified: list[str] = []
+    monkeypatch.setattr(launcher, "_notify", lambda *a: notified.append(a[0]))
+    pidfile = tmp_path / "engine.pid"
+    launcher.write_pidfile(pidfile, ProcIdent(pid=904, starttime=1))
+    engine = FakeEngine()
+    launcher._shutdown_engine(engine, None, pidfile)
+    launcher._shutdown_engine(engine, None, pidfile)      # second call: pure no-op
+    assert notified == ["Poseidon stopped."]              # exactly one notify
+    assert not pidfile.exists()                           # unlinked once, no double-unlink error
 
 
 # ---- process lifecycle: pid file, engine matcher, /proc scan ----
@@ -668,6 +743,33 @@ def test_wait_for_dashboard_timeout_with_live_child() -> None:
     out = _wait_for_dashboard(proc, "http://x", attempts=4, sleep=slept.append,
                               engine_up=lambda _u: False)
     assert out == "timeout" and len(slept) == 4
+
+
+def test_start_engine_hands_off_handle_before_the_wait(tmp_path, monkeypatch) -> None:
+    # _start_engine BLOCKS in its wait loop for ~30s before returning the Popen.
+    # If a signal (SystemExit) lands in that wait, the handle must ALREADY have
+    # reached the caller via on_spawn — otherwise main()'s finally can't reap
+    # the just-spawned engine and it orphans. Pin: on_spawn is called with the
+    # real Popen BEFORE the wait, and the SystemExit propagates out.
+    import pytest as _pytest
+
+    import poseidon.launcher as launcher
+
+    fake_proc = _FakeEngineProc(alive=True, pid=808)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(launcher, "proc_starttime", lambda pid: 5)
+    monkeypatch.setattr(launcher, "_notify", lambda *a: None)
+
+    def boom(_url):  # noqa: ANN001, ANN202 — the engine_up probe raises on the first poll
+        raise SystemExit(143)
+    monkeypatch.setattr(launcher, "_engine_up", boom)
+
+    spawned: list[object] = []
+    with _pytest.raises(SystemExit) as exc_info:
+        launcher._start_engine(_cfg(tmp_path), "pw", _ErrDialog(), "http://x",
+                               on_spawn=spawned.append)
+    assert exc_info.value.code == 143
+    assert spawned == [fake_proc]                          # handle escaped BEFORE the raise
 
 
 def test_kill_own_engine_term_then_kill(monkeypatch) -> None:
