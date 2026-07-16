@@ -162,7 +162,7 @@ def profile_holders(profile_dir: Path, proc_root: Path = Path("/proc")) -> list[
 
 
 def _stop_profile_holder(ident: ProcIdent) -> None:
-    stop_process(ident, grace=5.0)  # type: ignore[arg-type]
+    stop_process(ident, grace=5.0)
 
 
 def open_app_window_blocking(
@@ -202,8 +202,8 @@ def open_app_window_blocking(
     if token_in_url:
         print(
             "WARNING: no native window available — the dashboard token rides the "
-            "browser argv (visible in /proc) and persists inside the dedicated "
-            "window profile on disk. Install 'pip install poseidon[gui]' to avoid this."
+            "browser argv (visible via /proc/<pid>/cmdline to other local users) "
+            "until the window closes. Install 'pip install poseidon[gui]' to avoid this."
         )
     for name in _APP_BROWSERS:
         binary = shutil.which(name)

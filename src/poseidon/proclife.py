@@ -26,8 +26,10 @@ from typing import Protocol
 
 
 class _HasIdent(Protocol):
-    pid: int
-    starttime: int
+    @property
+    def pid(self) -> int: ...
+    @property
+    def starttime(self) -> int: ...
 
 
 @dataclass(frozen=True)

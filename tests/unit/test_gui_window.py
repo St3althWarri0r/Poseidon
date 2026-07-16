@@ -88,3 +88,74 @@ def test_fallback_block_called_when_no_browser(tmp_path, monkeypatch) -> None:
     rc = gui.open_app_window_blocking(
         "http://x", profile_dir=tmp_path / "p", fallback_block=lambda: blocked.append(True))
     assert rc == 0 and opened == ["http://x"] and blocked == [True]
+
+
+# ---- profile_holders: /proc scan for the dedicated window profile ----
+
+def _fake_proc_entry(proc_root: Path, pid: int, argv: list[str], starttime: int) -> None:
+    # Mirrors test_launcher.py's _fake_proc: field 22 of `stat` (index 19 of
+    # the tail after the last ")") is starttime — see parse_stat_starttime.
+    d = proc_root / str(pid)
+    d.mkdir()
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    tail = f"S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0"
+    (d / "stat").write_text(f"{pid} ({argv[0][:15]}) {tail}")
+
+
+def test_profile_holders_matches_exact_user_data_dir_argument(tmp_path) -> None:
+    from poseidon.proclife import ProcIdent
+    profile_dir = tmp_path / "webview-profile"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _fake_proc_entry(
+        proc_root, 500,
+        ["/usr/bin/vivaldi-stable", f"--user-data-dir={profile_dir}", "--app=http://x"],
+        starttime=12345,
+    )
+    assert gui.profile_holders(profile_dir, proc_root=proc_root) == [
+        ProcIdent(pid=500, starttime=12345)
+    ]
+
+
+def test_profile_holders_rejects_prefix_that_is_not_an_exact_argument(tmp_path) -> None:
+    # holder's --user-data-dir is profile_dir + "-extra": profile_dir is a
+    # PREFIX of it, not equal to it. A substring-based match would wrongly
+    # treat this as a holder; the real guarantee is exact-argv-token equality.
+    profile_dir = tmp_path / "p"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _fake_proc_entry(
+        proc_root, 501,
+        ["/usr/bin/vivaldi-stable", f"--user-data-dir={profile_dir}-extra"],
+        starttime=1,
+    )
+    assert gui.profile_holders(profile_dir, proc_root=proc_root) == []
+
+
+def test_profile_holders_skips_its_own_pid(tmp_path) -> None:
+    import os
+    profile_dir = tmp_path / "webview-profile"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _fake_proc_entry(
+        proc_root, os.getpid(),
+        ["/usr/bin/vivaldi-stable", f"--user-data-dir={profile_dir}"],
+        starttime=1,
+    )
+    assert gui.profile_holders(profile_dir, proc_root=proc_root) == []
+
+
+def test_profile_holders_ignores_non_numeric_proc_entries(tmp_path) -> None:
+    from poseidon.proclife import ProcIdent
+    profile_dir = tmp_path / "webview-profile"
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    (proc_root / "self").mkdir()   # real /proc always has this; must not crash or match
+    _fake_proc_entry(
+        proc_root, 777,
+        ["/usr/bin/vivaldi-stable", f"--user-data-dir={profile_dir}"],
+        starttime=42,
+    )
+    assert gui.profile_holders(profile_dir, proc_root=proc_root) == [
+        ProcIdent(pid=777, starttime=42)
+    ]
