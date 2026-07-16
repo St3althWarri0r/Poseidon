@@ -55,6 +55,37 @@ def test_proc_starttime_tolerates_non_utf8_comm(tmp_path) -> None:
     assert proc_starttime(9, proc_root=tmp_path) == 555
 
 
+def test_proc_starttime_zombie_reads_as_gone(tmp_path) -> None:
+    # A zombie's stat stays readable with its original starttime, but the
+    # process is a corpse — identity liveness must read it as gone (None), or
+    # stop_process would SIGKILL-escalate onto a dead process it can't reap.
+    for state, expect in (("R", 44), ("S", 44), ("Z", None), ("X", None), ("x", None)):
+        pid = 40 + ord(state[0])
+        stat = tmp_path / str(pid) / "stat"
+        stat.parent.mkdir()
+        stat.write_text(f"{pid} (poseidon run) {state} 1 {pid} {pid} 0 -1 0 "
+                        "0 0 0 0 0 0 0 0 20 0 1 0 44 0 0")
+        assert proc_starttime(pid, proc_root=tmp_path) == expect
+
+
+def test_proc_starttime_z_inside_comm_is_not_the_state(tmp_path) -> None:
+    # A comm of "(z)" (lowercase z inside the parens) with a real state of 'S'
+    # must NOT be misread as a zombie — state is the field AFTER the last ')'.
+    stat = tmp_path / "11" / "stat"
+    stat.parent.mkdir()
+    stat.write_text("11 (z) S 1 11 11 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 222 0 0")
+    assert proc_starttime(11, proc_root=tmp_path) == 222
+
+
+def test_same_process_false_for_zombie(tmp_path) -> None:
+    # starttime on disk still matches the ident, but the process is a zombie —
+    # same_process must report the corpse as gone.
+    stat = tmp_path / "7" / "stat"
+    stat.parent.mkdir()
+    stat.write_text("7 (x) Z 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0")
+    assert same_process(ProcIdent(7, 100), proc_root=tmp_path) is False
+
+
 def test_same_process_matches_only_same_incarnation(tmp_path) -> None:
     stat = tmp_path / "7" / "stat"
     stat.parent.mkdir()

@@ -56,18 +56,34 @@ def parse_stat_starttime(stat_text: str) -> int | None:
         return None
 
 
+def _stat_state(stat_text: str) -> str | None:
+    """The process state char — field 3, the first token after the last ``)``.
+    Using the same LAST-``)`` split as the starttime parse means a comm holding
+    parens or a stray 'Z' cannot be misread as the state."""
+    _, sep, tail = stat_text.rpartition(")")
+    fields = tail.split()
+    return fields[0] if sep and fields else None
+
+
 def proc_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
-    """The live starttime of ``pid``, or None if it does not exist / is unreadable.
+    """The live starttime of ``pid``, or None if it does not exist, is
+    unreadable, OR is a zombie/dead process.
+
+    A zombie ('Z', dead-but-unreaped) keeps a readable stat with its original
+    starttime, so a raw read would call a corpse alive — making stop_process
+    SIGKILL-escalate for the full grace on a process that is already gone.
+    States 'Z'/'X'/'x' are therefore reported as gone (None).
 
     Bytes + lossy decode: comm may hold non-UTF-8 bytes (prctl-settable), and
-    the starttime tail is ASCII, so ``errors="replace"`` cannot perturb the
-    identity check while removing the UnicodeDecodeError crash path."""
+    both the state and starttime tail are ASCII, so ``errors="replace"`` cannot
+    perturb the check while removing the UnicodeDecodeError crash path."""
     try:
-        return parse_stat_starttime(
-            (proc_root / str(pid) / "stat").read_bytes().decode(errors="replace")
-        )
+        text = (proc_root / str(pid) / "stat").read_bytes().decode(errors="replace")
     except OSError:
         return None
+    if _stat_state(text) in ("Z", "X", "x"):   # zombie/dead — effectively gone
+        return None
+    return parse_stat_starttime(text)
 
 
 def same_process(ident: _HasIdent, proc_root: Path = Path("/proc")) -> bool:
