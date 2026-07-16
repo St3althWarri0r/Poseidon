@@ -14,6 +14,7 @@ from poseidon.launcher import (
     FoundEngine,
     _kill_own_engine,
     _wait_for_dashboard,
+    acquire_launcher_lock,
     clear_running_engines,
     dashboard_url,
     engine_env,
@@ -503,3 +504,77 @@ def test_kill_own_engine_already_dead_noop(monkeypatch) -> None:
     monkeypatch.setattr(launcher.os, "killpg", raising_killpg)
     proc = _FakeEngineProc(alive=False)
     _kill_own_engine(proc)                     # must not raise
+
+
+# ---- singleton lock + takeover ----
+
+
+def test_lock_acquired_when_free_and_records_identity(tmp_path) -> None:
+    lock_path = tmp_path / "launcher.lock"
+    fh = acquire_launcher_lock(lock_path)
+    try:
+        assert fh is not None
+        recorded = read_pidfile(lock_path)
+        import os as _os
+        assert recorded is not None and recorded.pid == _os.getpid()
+        data = _json.loads(lock_path.read_text())
+        assert set(data) == {"pid", "starttime"}          # identity only, no secrets
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_takeover_signals_verified_holder_then_acquires(tmp_path) -> None:
+    lock_path = tmp_path / "launcher.lock"
+    holder = acquire_launcher_lock(lock_path)             # this test IS the holder
+    assert holder is not None
+    signalled: list[tuple[int, int]] = []
+    def term(pid, sig):  # noqa: ANN001, ANN202
+        signalled.append((pid, sig))
+        holder.close()                                    # holder "exits" -> flock releases
+    fh = acquire_launcher_lock(
+        lock_path, term=term, alive=lambda ident: True,
+        sleep=lambda _s: None, notify=lambda *_a: None)
+    try:
+        assert fh is not None
+        import signal as _sig
+        assert signalled and signalled[0][1] == _sig.SIGTERM
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_takeover_never_signals_stale_identity(tmp_path) -> None:
+    lock_path = tmp_path / "launcher.lock"
+    holder = acquire_launcher_lock(lock_path)
+    assert holder is not None
+    signalled: list[int] = []
+    released = {"n": 0}
+    def sleeper(_s: float) -> None:
+        released["n"] += 1
+        if released["n"] >= 3:
+            holder.close()                                # holder dies on its own
+    fh = acquire_launcher_lock(
+        lock_path, term=lambda pid, sig: signalled.append(pid),
+        alive=lambda ident: False,                        # identity mismatch: recycled pid
+        sleep=sleeper, notify=lambda *_a: None)
+    try:
+        assert fh is not None                             # still acquired once freed
+        assert signalled == []                            # but NOTHING was signalled
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_takeover_times_out_when_holder_never_exits(tmp_path) -> None:
+    lock_path = tmp_path / "launcher.lock"
+    holder = acquire_launcher_lock(lock_path)
+    assert holder is not None
+    try:
+        fh = acquire_launcher_lock(
+            lock_path, takeover_timeout=1.0, interval=0.5,
+            term=lambda pid, sig: None, alive=lambda ident: True,
+            sleep=lambda _s: None, notify=lambda *_a: None)
+        assert fh is None
+    finally:
+        holder.close()

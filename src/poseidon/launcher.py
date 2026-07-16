@@ -20,6 +20,7 @@ Design:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -31,7 +32,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from .proclife import ProcIdent, proc_starttime, same_process
 
@@ -92,6 +93,62 @@ def pick_dialog_backend(which: Callable[[str], str | None]) -> str | None:
 # ---------------------------------------------------------- process lifecycle
 
 _ENGINE_PIDFILE = "engine.pid"
+_LAUNCHER_LOCKFILE = "launcher.lock"
+
+
+def _try_flock(fh: IO[str]) -> bool:
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_launcher_lock(
+    lock_path: Path,
+    *,
+    takeover_timeout: float = 30.0,
+    interval: float = 0.5,
+    term: Callable[[int, int], None] = os.kill,
+    alive: Callable[[ProcIdent], bool] = same_process,
+    sleep: Callable[[float], None] = time.sleep,
+    notify: Callable[[str, str], None] | None = None,
+) -> IO[str] | None:
+    """One launcher at a time, with takeover: if another launcher holds the
+    lock, verify its recorded (pid, starttime) against /proc ON EVERY POLL and
+    SIGTERM only a verified holder (its finally-cleanup closes its window and
+    engine); an unverifiable holder is never signalled — its flock releases by
+    itself when it exits. Returns the flocked handle (keep it for life; flock
+    dies with the process, so a SIGKILLed launcher cannot wedge future
+    launches) or None if the lock never freed."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+", encoding="utf-8")
+
+    def _claim() -> IO[str]:
+        me = os.getpid()
+        starttime = proc_starttime(me) or 0
+        fh.seek(0)
+        fh.truncate()
+        fh.write(json.dumps({"pid": me, "starttime": starttime}))
+        fh.flush()
+        return fh
+
+    if _try_flock(fh):
+        return _claim()
+
+    (notify or _notify)("Restarting Poseidon…", "Handing the window over to a fresh start.")
+    waited = 0.0
+    while waited < takeover_timeout:
+        holder = read_pidfile(lock_path)
+        if holder is not None and alive(holder):
+            with contextlib.suppress(ProcessLookupError):
+                term(holder.pid, signal.SIGTERM)
+        if _try_flock(fh):
+            return _claim()
+        sleep(interval)
+        waited += interval
+    fh.close()
+    return None
 
 
 def read_pidfile(path: Path) -> ProcIdent | None:
