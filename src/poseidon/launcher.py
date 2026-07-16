@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .proclife import ProcIdent, proc_starttime
+from .proclife import ProcIdent, proc_starttime, same_process
 
 if TYPE_CHECKING:
     from .core.config import AppConfig
@@ -114,6 +114,7 @@ def write_pidfile(path: Path, ident: ProcIdent) -> None:
 
 
 _PY_EXE = re.compile(r"^python(\d+(\.\d+)*)?$")
+# NOTE: a replaced/upgraded interpreter reads as "python3.x (deleted)" and will not match — the port assertion in clear_running_engines() backstops this.
 
 
 def is_engine_cmdline(exe: str, argv: list[str]) -> bool:
@@ -167,6 +168,86 @@ def find_running_engines(proc_root: Path = Path("/proc")) -> list[FoundEngine]:
             continue
         found.append(FoundEngine(pid=pid, starttime=starttime, cmdline=" ".join(argv)))
     return found
+
+
+def stop_systemd_unit(run: Callable[..., object] = subprocess.run) -> str:
+    """Best-effort, UNCONDITIONAL ``systemctl --user stop poseidon``.
+
+    Deliberately not gated on ``is-active``: a unit in its RestartSec hold-off
+    reports ``activating`` and would resurrect an engine seconds after the
+    kill pass. Stopping an inactive/unloaded unit is a cheap rc!=0 no-op.
+    Timeout exceeds the unit's TimeoutStopSec=45."""
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return "absent"
+    try:
+        run([systemctl, "--user", "stop", "poseidon"],
+            capture_output=True, timeout=60, check=False)  # noqa: S603
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    return "stopped"
+
+
+def _forensic(config: AppConfig, line: str) -> None:
+    """One line per kill decision, for post-hoc forensics."""
+    log_path = config.data_dir / "launcher-engine.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"[launcher] {line}\n")
+    except OSError:
+        pass
+
+
+def clear_running_engines(
+    config: AppConfig,
+    dialog: Dialog,
+    url: str,
+    *,
+    engines: Callable[[], list[FoundEngine]] = find_running_engines,
+    stop: Callable[..., bool] | None = None,
+    stop_unit: Callable[[], str] = stop_systemd_unit,
+    engine_up: Callable[[str], bool] | None = None,
+    alive: Callable[..., bool] = same_process,
+) -> bool:
+    """The fresh-start pass: stop the systemd unit, kill every verified
+    engine (pid file first, then the /proc scan), then assert the dashboard
+    port went silent. True = clear to spawn; False = abort (dialog shown)."""
+    from .proclife import stop_process
+    stop = stop or stop_process
+    probe = engine_up or _engine_up
+
+    if stop_unit() == "timeout":
+        dialog.error(
+            "Poseidon's background service (systemd) did not stop in time, so a "
+            "fresh engine cannot be started safely.\n\nTry:  systemctl --user stop poseidon")
+        return False
+
+    pidfile = config.data_dir / _ENGINE_PIDFILE
+    targets: dict[int, ProcIdent] = {}
+    recorded = read_pidfile(pidfile)
+    if recorded is not None and alive(recorded):
+        targets[recorded.pid] = recorded
+    pidfile.unlink(missing_ok=True)   # recorded engine is being stopped (or is stale)
+
+    for eng in engines():
+        targets.setdefault(eng.pid, eng)
+
+    for ident in targets.values():
+        cmdline = getattr(ident, "cmdline", "(from engine.pid)")
+        _forensic(config, f"fresh-start kill pid={ident.pid} starttime={ident.starttime} "
+                          f"cmdline={cmdline}")
+        stop(ident)  # type: ignore[arg-type]  # ProcIdent satisfies the protocol at runtime
+
+    # Port assertion: backstop for false negatives in is_engine_cmdline matchers
+    # (interpreter-flag forms, (deleted)-suffix exe after upgrade)
+    if probe(url):
+        dialog.error(
+            "An engine is still running that Poseidon could not stop, so a fresh "
+            "one cannot be started.\n\nFind it with:  pgrep -af 'poseidon run'  "
+            "then close it and launch again.")
+        return False
+    return True
 
 
 # ------------------------------------------------------------- dialog backend

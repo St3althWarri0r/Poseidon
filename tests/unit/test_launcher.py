@@ -12,6 +12,7 @@ import json as _json
 from poseidon.core.config import AppConfig, DashboardConfig
 from poseidon.launcher import (
     FoundEngine,
+    clear_running_engines,
     dashboard_url,
     engine_env,
     find_running_engines,
@@ -19,6 +20,7 @@ from poseidon.launcher import (
     needs_setup,
     pick_dialog_backend,
     read_pidfile,
+    stop_systemd_unit,
     wait_until_up,
     write_pidfile,
 )
@@ -275,3 +277,115 @@ def test_find_running_engines_skips_entries_without_readable_exe(tmp_path) -> No
     py = "/usr/bin/python3.14"
     _fake_proc(tmp_path, 200, py, [py, "-m", "poseidon", "run"], 66, with_exe=False)
     assert find_running_engines(proc_root=tmp_path) == []
+
+
+# ---- fresh-start pass: systemd stop + kill + port assertion ----
+
+
+class _ErrDialog:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+
+
+def _cfg(tmp_path):
+    from poseidon.core.config import AppConfig
+    return AppConfig(data_dir=tmp_path)
+
+
+def test_stop_systemd_unit_absent_when_no_systemctl(monkeypatch) -> None:
+    import poseidon.launcher as launcher
+    monkeypatch.setattr(launcher.shutil, "which", lambda _t: None)
+    assert stop_systemd_unit() == "absent"
+
+
+def test_stop_systemd_unit_runs_unconditionally_with_timeout(monkeypatch) -> None:
+    import subprocess as sp
+
+    import poseidon.launcher as launcher
+    monkeypatch.setattr(launcher.shutil, "which", lambda _t: "/usr/bin/systemctl")
+    calls: list[tuple[list[str], float]] = []
+    def fake_run(argv, *, capture_output, timeout, check):  # noqa: ANN001, ANN202
+        calls.append((argv, timeout))
+        class R:  # noqa: E701
+            returncode = 5   # inactive unit: rc != 0 is still fine
+        return R()
+    assert stop_systemd_unit(run=fake_run) == "stopped"
+    assert calls[0][0][-2:] == ["stop", "poseidon"] and calls[0][1] >= 46
+
+    def timing_out(argv, *, capture_output, timeout, check):  # noqa: ANN001, ANN202
+        raise sp.TimeoutExpired(argv, timeout)
+    assert stop_systemd_unit(run=timing_out) == "timeout"
+
+
+def test_clear_kills_pidfile_and_scanned_engines_then_asserts_port(tmp_path) -> None:
+    from poseidon.launcher import write_pidfile
+    from poseidon.proclife import ProcIdent
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(200, 2))
+    scanned = [FoundEngine(pid=300, starttime=3, cmdline="python -m poseidon run")]
+    stopped: list[int] = []
+    ok = clear_running_engines(
+        cfg, _ErrDialog(), "http://x",
+        engines=lambda: scanned,
+        stop=lambda ident, **kw: (stopped.append(ident.pid), True)[1],
+        stop_unit=lambda: "stopped",
+        engine_up=lambda _u: False,
+        alive=lambda ident: True,
+    )
+    assert ok is True
+    assert sorted(stopped) == [200, 300]
+    assert not (tmp_path / "engine.pid").exists()          # consumed
+
+
+def test_clear_dedupes_pidfile_against_scan(tmp_path) -> None:
+    from poseidon.launcher import write_pidfile
+    from poseidon.proclife import ProcIdent
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(300, 3))
+    scanned = [FoundEngine(pid=300, starttime=3, cmdline="python -m poseidon run")]
+    stopped: list[int] = []
+    assert clear_running_engines(
+        cfg, _ErrDialog(), "http://x",
+        engines=lambda: scanned,
+        stop=lambda ident, **kw: (stopped.append(ident.pid), True)[1],
+        stop_unit=lambda: "stopped", engine_up=lambda _u: False,
+        alive=lambda ident: True) is True
+    assert stopped == [300]                                # exactly once
+
+
+def test_clear_stale_pidfile_removed_without_signal(tmp_path) -> None:
+    from poseidon.launcher import write_pidfile
+    from poseidon.proclife import ProcIdent
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(200, 2))
+    stopped: list[int] = []
+    assert clear_running_engines(
+        cfg, _ErrDialog(), "http://x",
+        engines=lambda: [],
+        stop=lambda ident, **kw: (stopped.append(ident.pid), True)[1],
+        stop_unit=lambda: "stopped", engine_up=lambda _u: False,
+        alive=lambda ident: False) is True                 # identity mismatch = stale
+    assert stopped == []
+    assert not (tmp_path / "engine.pid").exists()
+
+
+def test_clear_aborts_on_systemd_timeout(tmp_path) -> None:
+    dialog = _ErrDialog()
+    assert clear_running_engines(
+        _cfg(tmp_path), dialog, "http://x",
+        engines=lambda: [], stop=lambda i, **k: True,
+        stop_unit=lambda: "timeout", engine_up=lambda _u: False,
+        alive=lambda i: True) is False
+    assert dialog.errors                                    # explained to the user
+
+
+def test_clear_aborts_when_port_still_answers_after_pass(tmp_path) -> None:
+    dialog = _ErrDialog()
+    assert clear_running_engines(
+        _cfg(tmp_path), dialog, "http://x",
+        engines=lambda: [], stop=lambda i, **k: True,
+        stop_unit=lambda: "stopped", engine_up=lambda _u: True,
+        alive=lambda i: True) is False
+    assert dialog.errors and "still running" in dialog.errors[0]
