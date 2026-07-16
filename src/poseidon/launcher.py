@@ -595,8 +595,16 @@ def _shutdown_engine(
             pass
     if proc is None:
         return
+    # Only signal a LIVE engine. `_kill_own_engine` skips the (pid, starttime)
+    # identity check on purpose — it assumes we still hold the child's zombie so
+    # the pid can't be recycled. The failure path breaks that assumption
+    # (`_start_engine` already reaped the child before returning None), so an
+    # unguarded re-kill could `killpg` a recycled pgid. Gate on liveness to
+    # close that window; the pidfile cleanup below stays UNCONDITIONAL so a
+    # stale record still recording our pid is dropped even for a dead engine.
     was_live = proc.poll() is None
-    _kill_own_engine(proc)
+    if was_live:
+        _kill_own_engine(proc)
     recorded = read_pidfile(pidfile)
     if recorded is not None and recorded.pid == proc.pid:
         pidfile.unlink(missing_ok=True)

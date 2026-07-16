@@ -439,6 +439,45 @@ def test_shutdown_engine_idempotent_across_two_calls(tmp_path, monkeypatch) -> N
     assert not pidfile.exists()                           # unlinked once, no double-unlink error
 
 
+def test_shutdown_engine_skips_kill_for_already_dead_handle(tmp_path, monkeypatch) -> None:
+    # The fail path hands us a handle _start_engine already reaped. Re-killing it
+    # is unsafe (its pid may be recycled, and _kill_own_engine skips the identity
+    # check), so a dead handle must NOT be signalled and must NOT notify — while
+    # a live handle still is (guard against over-correction).
+    import poseidon.launcher as launcher
+    from poseidon.proclife import ProcIdent
+
+    killed: list[int] = []
+    notified: list[str] = []
+    monkeypatch.setattr(launcher, "_kill_own_engine", lambda proc, **kw: killed.append(proc.pid))
+    monkeypatch.setattr(launcher, "_notify", lambda *a: notified.append(a[0]))
+
+    class DeadEngine:
+        pid = 905
+        def poll(self):  # noqa: ANN201
+            return 0     # already reaped — an int, not None
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
+    pidfile = tmp_path / "engine.pid"
+    launcher.write_pidfile(pidfile, ProcIdent(pid=905, starttime=1))
+    launcher._shutdown_engine(DeadEngine(), None, pidfile)
+    assert killed == []                                   # dead handle never signalled
+    assert notified == []                                 # and never announced "stopped"
+    assert not pidfile.exists()                           # BUT its stale record is still dropped
+
+    class LiveEngine:
+        pid = 906
+        def poll(self):  # noqa: ANN201
+            return None  # still running
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
+    launcher._shutdown_engine(LiveEngine(), None, tmp_path / "other.pid")
+    assert killed == [906]                                # live handle IS killed
+    assert notified == ["Poseidon stopped."]              # and announced once
+
+
 # ---- process lifecycle: pid file, engine matcher, /proc scan ----
 
 
