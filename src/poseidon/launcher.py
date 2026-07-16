@@ -212,7 +212,12 @@ def clear_running_engines(
 ) -> bool:
     """The fresh-start pass: stop the systemd unit, kill every verified
     engine (pid file first, then the /proc scan), then assert the dashboard
-    port went silent. True = clear to spawn; False = abort (dialog shown)."""
+    port went silent. True = clear to spawn; False = abort (dialog shown).
+
+    ``engine.pid`` is unlinked immediately only when stale/garbage. A LIVE
+    recorded engine keeps its file until its stop is CONFIRMED, so a pass that
+    dies mid-kill (launcher OOM-killed, etc.) leaves the on-disk record of the
+    still-live engine for the next launch to retry."""
     from .proclife import stop_process
     stop = stop or stop_process
     probe = engine_up or _engine_up
@@ -226,18 +231,23 @@ def clear_running_engines(
     pidfile = config.data_dir / _ENGINE_PIDFILE
     targets: dict[int, ProcIdent] = {}
     recorded = read_pidfile(pidfile)
+    recorded_pid: int | None = None
     if recorded is not None and alive(recorded):
         targets[recorded.pid] = recorded
-    pidfile.unlink(missing_ok=True)   # recorded engine is being stopped (or is stale)
+        recorded_pid = recorded.pid   # keep the file until this stop is confirmed
+    else:
+        pidfile.unlink(missing_ok=True)   # stale or garbage — never a reason to signal
 
     for eng in engines():
         targets.setdefault(eng.pid, eng)
 
     for ident in targets.values():
         cmdline = getattr(ident, "cmdline", "(from engine.pid)")
+        stopped = stop(ident)  # type: ignore[arg-type]  # ProcIdent meets it at runtime
         _forensic(config, f"fresh-start kill pid={ident.pid} starttime={ident.starttime} "
-                          f"cmdline={cmdline}")
-        stop(ident)  # type: ignore[arg-type]  # ProcIdent satisfies the protocol at runtime
+                          f"stopped={stopped} cmdline={cmdline}")
+        if stopped and ident.pid == recorded_pid:
+            pidfile.unlink(missing_ok=True)   # confirmed stopped — consume the record
 
     # Port assertion: backstop for false negatives in is_engine_cmdline matchers
     # (interpreter-flag forms, (deleted)-suffix exe after upgrade)

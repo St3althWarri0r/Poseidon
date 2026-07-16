@@ -389,3 +389,54 @@ def test_clear_aborts_when_port_still_answers_after_pass(tmp_path) -> None:
         stop_unit=lambda: "stopped", engine_up=lambda _u: True,
         alive=lambda i: True) is False
     assert dialog.errors and "still running" in dialog.errors[0]
+
+
+# ---- pass ordering + pid-file retention through the kill loop ----
+
+
+def test_clear_order_is_unit_then_kills_then_probe(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(200, 2))
+    scanned = [FoundEngine(pid=300, starttime=3, cmdline="python -m poseidon run")]
+    order: list[str] = []
+    assert clear_running_engines(
+        cfg, _ErrDialog(), "http://x",
+        engines=lambda: scanned,
+        stop=lambda ident, **kw: (order.append(f"kill:{ident.pid}"), True)[1],
+        stop_unit=lambda: (order.append("unit"), "stopped")[1],
+        engine_up=lambda _u: (order.append("probe"), False)[1],
+        alive=lambda ident: True) is True
+    assert order == ["unit", "kill:200", "kill:300", "probe"]
+
+
+def test_clear_unit_timeout_short_circuits_the_pass(tmp_path) -> None:
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(200, 2))
+    order: list[str] = []
+    assert clear_running_engines(
+        cfg, _ErrDialog(), "http://x",
+        engines=lambda: [FoundEngine(pid=300, starttime=3, cmdline="python -m poseidon run")],
+        stop=lambda ident, **kw: (order.append(f"kill:{ident.pid}"), True)[1],
+        stop_unit=lambda: (order.append("unit"), "timeout")[1],
+        engine_up=lambda _u: (order.append("probe"), False)[1],
+        alive=lambda ident: True) is False
+    assert order == ["unit"]                               # nothing runs after the timeout
+    assert (tmp_path / "engine.pid").exists()              # record untouched
+
+
+def test_clear_keeps_pidfile_when_live_engine_stop_unconfirmed(tmp_path) -> None:
+    # A LIVE recorded engine whose stop() did NOT confirm must keep its on-disk
+    # record: the next launch retries it, and the port assertion still backstops.
+    cfg = _cfg(tmp_path)
+    write_pidfile(tmp_path / "engine.pid", ProcIdent(200, 2))
+    dialog = _ErrDialog()
+    assert clear_running_engines(
+        cfg, dialog, "http://x",
+        engines=lambda: [],
+        stop=lambda ident, **kw: False,                    # kill not confirmed
+        stop_unit=lambda: "stopped",
+        engine_up=lambda _u: True,                         # engine indeed still up
+        alive=lambda ident: True) is False
+    assert (tmp_path / "engine.pid").exists()              # record survives for retry
+    log = (tmp_path / "launcher-engine.log").read_text(encoding="utf-8")
+    assert "stopped=False" in log                          # attempt AND outcome logged
