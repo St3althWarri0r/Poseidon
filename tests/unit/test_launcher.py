@@ -512,6 +512,44 @@ def test_shutdown_engine_skips_kill_for_already_dead_handle(tmp_path, monkeypatc
     assert notified == ["Poseidon stopped."]              # and announced once
 
 
+def test_shutdown_engine_kills_engine_even_if_window_reap_interrupted(tmp_path, monkeypatch) -> None:
+    # SIGINT (Ctrl+C) during the up-to-~10s window.wait() raises KeyboardInterrupt,
+    # which the reap's `except (OSError, TimeoutExpired)` does NOT catch. The engine
+    # teardown lives in a `finally` so the live engine is STILL killed before the
+    # KeyboardInterrupt propagates on out — otherwise a live trading engine orphans,
+    # the exact failure class this feature exists to prevent.
+    import pytest as _pytest
+
+    import poseidon.launcher as launcher
+    from poseidon.proclife import ProcIdent
+
+    killed: list[int] = []
+    monkeypatch.setattr(launcher, "_kill_own_engine", lambda proc, **kw: killed.append(proc.pid))
+    monkeypatch.setattr(launcher, "_notify", lambda *a: None)
+
+    class InterruptingWindow:
+        def poll(self):  # noqa: ANN201
+            return None
+        def terminate(self) -> None: ...
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            raise KeyboardInterrupt      # Ctrl+C mid-reap
+        def kill(self) -> None: ...
+
+    class LiveEngine:
+        pid = 907
+        def poll(self):  # noqa: ANN201
+            return None                  # still running
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
+    pidfile = tmp_path / "engine.pid"
+    launcher.write_pidfile(pidfile, ProcIdent(pid=907, starttime=1))
+    with _pytest.raises(KeyboardInterrupt):
+        launcher._shutdown_engine(LiveEngine(), InterruptingWindow(), pidfile)
+    assert killed == [907]                                # engine killed despite the interrupt
+    assert not pidfile.exists()                           # and its record consumed
+
+
 # ---- process lifecycle: pid file, engine matcher, /proc scan ----
 
 

@@ -595,34 +595,43 @@ def _shutdown_engine(
 ) -> None:
     """Idempotent teardown, in dependency order: reap the window FIRST (the
     browser profile must be free before our flock releases at process death),
-    then stop our engine, then drop the pid file iff it is still ours."""
-    if window is not None and window.poll() is None:
-        try:
-            window.terminate()
+    then stop our engine, then drop the pid file iff it is still ours.
+
+    The engine teardown lives in a ``finally`` around the window reap so it
+    runs even if that reap is interrupted by ANY exception — including a
+    ``KeyboardInterrupt`` (SIGINT/Ctrl+C during the up-to-~10s window.wait())
+    or a ``SystemExit``, which the reap's ``except (OSError,
+    TimeoutExpired)`` deliberately does NOT catch. The engine must still die;
+    the interrupting exception then continues to propagate."""
+    try:
+        if window is not None and window.poll() is None:
             try:
-                window.wait(timeout=_WINDOW_REAP_GRACE)
-            except subprocess.TimeoutExpired:
-                window.kill()
-                window.wait(timeout=_WINDOW_REAP_GRACE)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    if proc is None:
-        return
-    # Only signal a LIVE engine. `_kill_own_engine` skips the (pid, starttime)
-    # identity check on purpose — it assumes we still hold the child's zombie so
-    # the pid can't be recycled. The failure path breaks that assumption
-    # (`_start_engine` already reaped the child before returning None), so an
-    # unguarded re-kill could `killpg` a recycled pgid. Gate on liveness to
-    # close that window; the pidfile cleanup below stays UNCONDITIONAL so a
-    # stale record still recording our pid is dropped even for a dead engine.
-    was_live = proc.poll() is None
-    if was_live:
-        _kill_own_engine(proc)
-    recorded = read_pidfile(pidfile)
-    if recorded is not None and recorded.pid == proc.pid:
-        pidfile.unlink(missing_ok=True)
-    if was_live:
-        _notify("Poseidon stopped.", "The engine was shut down with the window.")
+                window.terminate()
+                try:
+                    window.wait(timeout=_WINDOW_REAP_GRACE)
+                except subprocess.TimeoutExpired:
+                    window.kill()
+                    window.wait(timeout=_WINDOW_REAP_GRACE)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    finally:
+        # Only signal a LIVE engine. `_kill_own_engine` skips the (pid,
+        # starttime) identity check on purpose — it assumes we still hold the
+        # child's zombie so the pid can't be recycled. The failure path breaks
+        # that assumption (`_start_engine` already reaped the child before
+        # returning None), so an unguarded re-kill could `killpg` a recycled
+        # pgid. Gate on liveness to close that window; the pidfile cleanup
+        # stays UNCONDITIONAL so a stale record still recording our pid is
+        # dropped even for a dead engine.
+        if proc is not None:
+            was_live = proc.poll() is None
+            if was_live:
+                _kill_own_engine(proc)
+            recorded = read_pidfile(pidfile)
+            if recorded is not None and recorded.pid == proc.pid:
+                pidfile.unlink(missing_ok=True)
+            if was_live:
+                _notify("Poseidon stopped.", "The engine was shut down with the window.")
 
 
 def main(argv: list[str] | None = None) -> int:
