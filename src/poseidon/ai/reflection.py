@@ -11,6 +11,7 @@ import structlog
 
 from ..core.errors import AgentRefusedError
 from ..core.models import ClosedPosition
+from .backends import add_usage
 from .backends.base import ChatBackend
 
 log = structlog.get_logger(__name__)
@@ -40,16 +41,20 @@ def _describe(pos: ClosedPosition) -> str:
 
 
 async def reflect_on_position(backend: ChatBackend, pos: ClosedPosition, *,
-                              model: str, max_chars: int = 600) -> str | None:
+                              model: str, max_chars: int = 600,
+                              usage: list[dict[str, int]] | None = None) -> str | None:
     messages = [{"role": "user", "content": _describe(pos)}]
     try:
         resp = await backend.complete(messages, tools=[], system=REFLECTION_SYSTEM)
-    except AgentRefusedError:
+    except AgentRefusedError as exc:
+        add_usage(usage, getattr(exc, "usage", None))  # refusals still bill
         log.info("reflection refused", symbol=pos.symbol)
         return None
     except Exception as exc:  # best-effort: never propagate (covers AgentError)
+        add_usage(usage, getattr(exc, "usage", None))
         log.warning("reflection failed", symbol=pos.symbol, error=str(exc))
         return None
+    add_usage(usage, getattr(resp, "usage", None))
     text = (resp.text or "").strip()
     if not text:
         return None

@@ -170,41 +170,112 @@ async def test_wire_ai_builds_analysis_on_the_utility_tier_and_chat_has_no_packe
 # ------------------------------- constructive flow isolation (static, on source)
 # The invariant: analysis_packets may be handed ONLY to the _cycle_prompt call
 # (the decision-id trace consumes it via a comprehension, never a call argument).
-# Walk run_cycle's own AST and assert no OTHER call receives it by name — this
-# would catch a future edit that threads it into the dispatcher, the risk/order
-# path, or _parse_decision/_no_action_decision.
+# Default-deny: EVERY Load of the name inside run_cycle must match one of three
+# whitelisted shapes; anything else — an alias, a starred arg, a boolop wrapper,
+# a subscript/attribute read, a comprehension feeding any other call, a rebind —
+# fails the guard. This catches indirection (pkts = analysis_packets;
+# json.dumps([p.model_dump() for p in analysis_packets])) that a which-calls-
+# receive-the-bare-Name check would miss. Fail-closed by design: a legitimate
+# refactor of the whitelisted shapes must extend the whitelist here, on purpose.
+
+
+def _packet_reference_violations(func_source: str) -> list[str]:
+    """Non-whitelisted references to ``analysis_packets`` in a function's source.
+
+    Whitelist: (1) the ``analysis_packets=`` keyword of a ``_cycle_prompt``
+    call; (2) the bare truthiness test of an ``if``; (3) the iterable of a
+    single-generator ListComp whose element is exactly ``<target>.id`` (the
+    decision id-trace). Any Store/Del of the name is a violation too — a
+    rebind would hide the object from this guard.
+    """
+    func = ast.parse(textwrap.dedent(func_source)).body[0]
+    assert isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(func):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    def _allowed(node: ast.Name) -> bool:
+        parent = parents[node]
+        if isinstance(parent, ast.keyword) and parent.arg == "analysis_packets":
+            call = parents[parent]
+            if isinstance(call, ast.Call):
+                fn = call.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else (
+                    fn.id if isinstance(fn, ast.Name) else "")
+                return name == "_cycle_prompt"
+            return False
+        if isinstance(parent, ast.If) and parent.test is node:
+            return True
+        if isinstance(parent, ast.comprehension) and parent.iter is node:
+            comp = parents[parent]
+            if isinstance(comp, ast.ListComp) and len(comp.generators) == 1:
+                elt, target = comp.elt, parent.target
+                return (isinstance(elt, ast.Attribute) and elt.attr == "id"
+                        and isinstance(elt.value, ast.Name)
+                        and isinstance(target, ast.Name) and elt.value.id == target.id)
+            return False
+        return False
+
+    violations: list[str] = []
+    for node in ast.walk(func):
+        if not (isinstance(node, ast.Name) and node.id == "analysis_packets"):
+            continue
+        if not isinstance(node.ctx, ast.Load):
+            violations.append(f"line {node.lineno}: rebind/delete of analysis_packets")
+        elif not _allowed(node):
+            violations.append(f"line {node.lineno}: unwhitelisted use of analysis_packets")
+    return violations
 
 
 def test_run_cycles_only_consumer_of_analysis_packets_is_cycle_prompt() -> None:
     assert "analysis_packets" in inspect.signature(ClaudeAgent.run_cycle).parameters
+    violations = _packet_reference_violations(inspect.getsource(ClaudeAgent.run_cycle))
+    # Never to the dispatcher, _parse_decision/_no_action_decision, an alias,
+    # or any risk/order call — directly or through any indirection.
+    assert violations == [], (
+        f"analysis_packets escaped its whitelisted shapes in run_cycle: {violations}")
 
-    src = textwrap.dedent(inspect.getsource(ClaudeAgent.run_cycle))
-    tree = ast.parse(src)
-    func = tree.body[0]
-    assert isinstance(func, ast.AsyncFunctionDef)
 
-    calls_with_ref: list[str] = []
+def test_packet_guard_flags_indirect_leaks_by_construction() -> None:
+    # Each variant leaks the packet object past _cycle_prompt through one layer
+    # of indirection the old direct-argument check could not see. The guard
+    # must flag every one, and must stay quiet on the legitimate shapes.
+    leaks = (
+        # alias, then hand the alias to the dispatcher
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    pkts = analysis_packets\n"
+        "    await self.dispatcher.dispatch('x', {'p': pkts})\n",
+        # comprehension-wrapped prose into the dispatcher
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    import json\n"
+        "    blob = json.dumps([p.model_dump() for p in analysis_packets])\n"
+        "    await self.dispatcher.dispatch('x', {'p': blob})\n",
+        # starred args
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    self._parse_decision(*analysis_packets)\n",
+        # boolop wrapper as a call argument
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    await self.dispatcher.dispatch('x', analysis_packets or [])\n",
+        # subscript/attribute read of packet prose
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    text = analysis_packets[0].verdict.synthesis\n"
+        "    await self.dispatcher.dispatch('x', {'t': text})\n",
+        # nested call inside another call's argument
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    self._no_action_decision('c', str(len(analysis_packets)))\n",
+        # rebinding hides the object from the guard
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    analysis_packets = []\n",
+    )
+    for snippet in leaks:
+        assert _packet_reference_violations(snippet), f"guard missed a leak:\n{snippet}"
 
-    class _Visitor(ast.NodeVisitor):
-        def visit_Call(self, node: ast.Call) -> None:
-            if isinstance(node.func, ast.Attribute):
-                name = node.func.attr
-            elif isinstance(node.func, ast.Name):
-                name = node.func.id
-            else:
-                name = "<dynamic>"
-            referenced = any(
-                isinstance(a, ast.Name) and a.id == "analysis_packets" for a in node.args
-            ) or any(
-                isinstance(kw.value, ast.Name) and kw.value.id == "analysis_packets"
-                for kw in node.keywords
-            )
-            if referenced:
-                calls_with_ref.append(name)
-            self.generic_visit(node)
-
-    _Visitor().visit(func)
-    # Passed to _cycle_prompt exactly once, and to nothing else — never to the
-    # dispatcher, _parse_decision/_no_action_decision, or any risk/order call.
-    assert calls_with_ref == ["_cycle_prompt"], (
-        f"analysis_packets must be passed only to _cycle_prompt; calls seen: {calls_with_ref}")
+    legit = (
+        "async def run_cycle(self, analysis_packets=None):\n"
+        "    prompt = self._cycle_prompt(analysis_packets=analysis_packets)\n"
+        "    if analysis_packets:\n"
+        "        ids = [p.id for p in analysis_packets]\n"
+    )
+    assert _packet_reference_violations(legit) == []

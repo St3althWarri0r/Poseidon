@@ -26,10 +26,22 @@ def test_visible_bars_excludes_future() -> None:
 
 def test_forward_return_uses_future_label() -> None:
     bars = _bars([10, 11, 12, 13, 15])     # day1=10 ... day5=15
+    cal = [b.end.date() for b in bars]     # shared calendar == the symbol's own dates
     # as_of day 2 (close 11), horizon 2 -> day 4 close 13 -> 13/11 - 1
-    assert forward_return(bars, datetime(2026, 1, 2, tzinfo=UTC).date(), 2) == 13 / 11 - 1
-    # horizon past the end -> None
-    assert forward_return(bars, datetime(2026, 1, 4, tzinfo=UTC).date(), 5) is None
+    assert forward_return(bars, datetime(2026, 1, 2, tzinfo=UTC).date(), 2, cal) == 13 / 11 - 1
+    # horizon past the end of the calendar -> None
+    assert forward_return(bars, datetime(2026, 1, 4, tzinfo=UTC).date(), 5, cal) is None
+
+
+def test_forward_return_measures_horizon_on_shared_calendar() -> None:
+    # The symbol skips days 3-4 (weekend-style gap) but the shared calendar does not:
+    # horizon 3 from day 2 must land on the last close visible at CALENDAR day 5 —
+    # not 3 of the symbol's own bars ahead.
+    bars = _bars([10, 11]) + _bars([12, 13], start_day=5)   # days 1,2,5,6
+    cal = [datetime(2026, 1, d, tzinfo=UTC).date() for d in range(1, 8)]
+    assert forward_return(bars, datetime(2026, 1, 2, tzinfo=UTC).date(), 3, cal) == 12 / 11 - 1
+    # no bar inside the window -> no sample, not a fake 0.0 return
+    assert forward_return(bars, datetime(2026, 1, 2, tzinfo=UTC).date(), 1, cal) is None
 
 
 def test_spearman_monotonic_and_guards() -> None:

@@ -28,6 +28,21 @@ import aiosqlite
 
 from ..core.models import AnalysisPacket, StrategyHealth, TradeLesson
 
+# Kept separate from _SCHEMA because the account_scope migration rebuilds the
+# table (SQLite cannot add a column to a PRIMARY KEY in place) and must create
+# the exact same shape a fresh database gets.
+_STRATEGY_HEALTH_DDL = """
+CREATE TABLE IF NOT EXISTS strategy_health (
+    strategy TEXT NOT NULL,
+    account_scope TEXT NOT NULL DEFAULT '',  -- matches orders: paper verdicts never leak into live
+    state TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    last_trade_at TEXT,                      -- newest closed trade the assessment saw (evidence watermark)
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (strategy, account_scope)
+);
+"""
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -51,9 +66,9 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
--- Makes the reflection sweep's "newer than watermark" bound efficient.
-CREATE INDEX IF NOT EXISTS idx_orders_scope_status_updated
-    ON orders(account_scope, status, updated_at);
+-- idx_orders_scope_status_updated is created in Database.open(): it covers
+-- account_scope, which pre-v2.4.0 databases only gain from the additive
+-- migration that runs after this script.
 
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,6 +168,9 @@ CREATE TABLE IF NOT EXISTS trade_lessons (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trade_lessons_symbol ON trade_lessons(symbol, created_at);
+-- Backs the cross-ticker arm of recent_lessons (no symbol equality, so the
+-- (symbol, created_at) index above cannot serve it).
+CREATE INDEX IF NOT EXISTS idx_trade_lessons_created ON trade_lessons(created_at);
 
 CREATE TABLE IF NOT EXISTS analysis_packets (
     id TEXT PRIMARY KEY,
@@ -164,13 +182,7 @@ CREATE TABLE IF NOT EXISTS analysis_packets (
 );
 CREATE INDEX IF NOT EXISTS idx_analysis_packets_symbol ON analysis_packets(symbol, as_of);
 
-CREATE TABLE IF NOT EXISTS strategy_health (
-    strategy TEXT PRIMARY KEY,
-    state TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-"""
+""" + _STRATEGY_HEALTH_DDL
 
 
 def _row_to_lesson(r: tuple[Any, ...]) -> TradeLesson:
@@ -237,6 +249,34 @@ class Database:
             await self._conn.execute(
                 "ALTER TABLE orders ADD COLUMN account_scope TEXT NOT NULL DEFAULT ''"
             )
+        if not await self._column_exists("strategy_health", "account_scope"):
+            # Strategy-health verdicts are account-scoped like the fills that
+            # feed them (orders.account_scope): a paper-era retire_recommended
+            # must not survive a broker switch or seed a live account's
+            # hysteresis streaks. account_scope joins the PRIMARY KEY, which
+            # SQLite only allows via a table rebuild; legacy rows keep
+            # scope='' and drop out of scoped reads, matching the orders
+            # convention. Statement-by-statement inside the surrounding
+            # transaction so a failure cannot leave the table half-rebuilt.
+            await self._conn.execute(
+                "ALTER TABLE strategy_health RENAME TO strategy_health_legacy"
+            )
+            await self._conn.execute(_STRATEGY_HEALTH_DDL)
+            await self._conn.execute(
+                "INSERT INTO strategy_health "
+                "(strategy, account_scope, state, payload, updated_at) "
+                "SELECT strategy, '', state, payload, updated_at "
+                "FROM strategy_health_legacy"
+            )
+            await self._conn.execute("DROP TABLE strategy_health_legacy")
+        # Indexes over migrated columns must be created after the migrations:
+        # in _SCHEMA they would fail on a pre-migration database (IF NOT EXISTS
+        # only guards the index name, not missing columns). Makes the
+        # reflection sweep's "newer than watermark" bound efficient.
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_scope_status_updated "
+            "ON orders(account_scope, status, updated_at)"
+        )
         await self._conn.commit()
         # Databases (and sidecars) created by older versions must not stay
         # world readable; os.open's mode does not apply to existing files.
@@ -382,19 +422,60 @@ class Database:
         ordered = sorted(picked.values(), key=lambda p: p.as_of, reverse=True)
         return ordered[:limit]
 
+    async def prune_advisory(self, *, lesson_lookback_days: int,
+                             packet_refresh_hours: int, now: datetime) -> tuple[int, int]:
+        """Delete advisory rows no reader can return anymore; never the audit chain.
+
+        Retention derives from the reader windows with a 2x safety margin:
+        lessons older than twice the reflection lookback (recent_lessons filters
+        on ``created_at >= now - lookback_days``) and packets whose ``as_of`` is
+        older than twice the analysis refresh window (packet_fresh/recent_packets
+        filter on ``as_of >= now - refresh_hours``). Returns
+        (lessons_deleted, packets_deleted) so the caller can log the sweep.
+        """
+        lesson_cutoff = (now - timedelta(days=2 * lesson_lookback_days)).isoformat()
+        packet_cutoff = (now - timedelta(hours=2 * packet_refresh_hours)).isoformat()
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM trade_lessons WHERE created_at < ?", (lesson_cutoff,))
+            lessons_deleted = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM analysis_packets WHERE as_of < ?", (packet_cutoff,))
+            packets_deleted = cur.rowcount
+        return lessons_deleted, packets_deleted
+
     # -- strategy health (advisory decay state; NOT the audit chain) -----------
 
-    async def upsert_strategy_health(self, h: StrategyHealth) -> None:
+    async def upsert_strategy_health(self, h: StrategyHealth, *, account_scope: str = "",
+                                     last_trade_at: datetime | None = None) -> None:
+        """`last_trade_at` is the newest closed trade the assessment saw — the
+        decay watchdog's new-evidence watermark. It lives on the row (not a
+        side channel) so it commits atomically with the state it justifies."""
         await self.execute(
-            "INSERT OR REPLACE INTO strategy_health (strategy, state, payload, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (h.strategy, h.state, h.model_dump_json(), h.updated_at.isoformat()))
+            "INSERT OR REPLACE INTO strategy_health "
+            "(strategy, account_scope, state, payload, last_trade_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (h.strategy, account_scope, h.state, h.model_dump_json(),
+             last_trade_at.isoformat() if last_trade_at is not None else None,
+             h.updated_at.isoformat()))
 
-    async def get_strategy_health(self, strategy: str) -> StrategyHealth | None:
+    async def get_strategy_health(self, strategy: str, *,
+                                  account_scope: str = "") -> StrategyHealth | None:
         row = await self.fetch_one(
-            "SELECT payload FROM strategy_health WHERE strategy = ?", (strategy,))
+            "SELECT payload FROM strategy_health WHERE strategy = ? AND account_scope = ?",
+            (strategy, account_scope))
         return _row_to_health(row) if row else None
 
-    async def list_strategy_health(self) -> list[StrategyHealth]:
-        rows = await self.fetch_all("SELECT payload FROM strategy_health ORDER BY strategy")
+    async def strategy_health_last_trade_at(self, strategy: str, *,
+                                            account_scope: str = "") -> datetime | None:
+        row = await self.fetch_one(
+            "SELECT last_trade_at FROM strategy_health "
+            "WHERE strategy = ? AND account_scope = ?",
+            (strategy, account_scope))
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    async def list_strategy_health(self, *, account_scope: str = "") -> list[StrategyHealth]:
+        rows = await self.fetch_all(
+            "SELECT payload FROM strategy_health WHERE account_scope = ? ORDER BY strategy",
+            (account_scope,))
         return [_row_to_health(r) for r in rows]

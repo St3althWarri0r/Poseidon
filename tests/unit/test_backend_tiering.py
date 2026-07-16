@@ -61,6 +61,56 @@ async def test_wire_ai_binds_each_role_to_the_right_tier(tmp_path) -> None:
     assert kernel.reflection._get_backend() is kernel._backend
 
 
+async def test_review_algorithm_hands_the_reviewer_the_primary_backend(
+    tmp_path, monkeypatch
+) -> None:
+    # The other half of invariant 3: the algorithm reviewer vets code that can
+    # become a live strategy, so it must ALWAYS run on the primary backend.
+    # kernel.review_algorithm is the seam (app.py passes self._backend to
+    # ai.reviewer.review_algorithm); assert OBJECT IDENTITY of what actually
+    # crosses it — under tiering the utility backend is a distinct live object,
+    # so a "save tokens on reviews" regression to self._utility_backend fails here.
+    from types import SimpleNamespace
+
+    import poseidon.ai.reviewer as reviewer_mod
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.security.vault import Vault
+
+    captured: list[object] = []
+
+    async def _fake_review(backend, *, source, instructions="", max_tokens=8000):  # type: ignore[no-untyped-def]
+        captured.append(backend)
+        return {"convertible": False, "suggested_name": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0, "api_calls": 1}}
+
+    # app.py imports the reviewer lazily inside the method, so patching the
+    # source module intercepts the real call path, not a stale reference.
+    monkeypatch.setattr(reviewer_mod, "review_algorithm", _fake_review)
+
+    async def _noop(*args, **kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+    kernel = ApplicationKernel(AppConfig(), Vault(tmp_path / "v.bin"))
+    # review_algorithm meters usage and audits; the seam under test only needs
+    # these calls to succeed, not to persist.
+    kernel.db = SimpleNamespace(execute=_noop)  # type: ignore[assignment]
+    kernel.router = None  # type: ignore[assignment]
+    kernel.audit = SimpleNamespace(append=_noop)  # type: ignore[assignment]
+    disp, chat_disp = object(), object()
+
+    # Tiered: the reviewer must receive the primary (money) backend, never utility.
+    kernel._wire_ai(_cfg(utility_model="small"), disp, chat_disp)  # type: ignore[arg-type]
+    await kernel.review_algorithm(source="def f(): pass")
+    assert captured[-1] is kernel._backend
+    assert captured[-1] is not kernel._utility_backend
+
+    # No tiering: one shared backend; the reviewer still holds the primary object.
+    kernel._wire_ai(_cfg(), disp, chat_disp)  # type: ignore[arg-type]
+    await kernel.review_algorithm(source="def f(): pass")
+    assert captured[-1] is kernel._backend
+
+
 def test_chat_service_uses_the_backend_it_is_given() -> None:
     # Guard the plumbing the routing relies on: ChatService calls whatever backend
     # it is handed, so pointing it at the utility backend actually tiers chat.
