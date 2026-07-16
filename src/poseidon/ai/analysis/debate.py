@@ -6,6 +6,7 @@ from __future__ import annotations
 import structlog
 
 from ...core.models import AnalystReport, DebateVerdict
+from ..backends import add_usage
 from ..backends.base import ChatBackend
 from .parse import first_json_obj
 
@@ -17,35 +18,42 @@ def _digest(reports: list[AnalystReport]) -> str:
                      for r in reports)
 
 
-async def _turn(backend: ChatBackend, system: str, transcript: str) -> str:
+async def _turn(backend: ChatBackend, system: str, transcript: str,
+                usage: list[dict[str, int]] | None = None) -> str:
     try:
         resp = await backend.complete([{"role": "user", "content": transcript}],
                                       tools=[], system=system)
+        add_usage(usage, getattr(resp, "usage", None))
         return (resp.text or "").strip()[:1000]
     except Exception as exc:
+        add_usage(usage, getattr(exc, "usage", None))
         log.warning("debate turn failed", error=str(exc))
         return ""
 
 
 async def run_debate(backend: ChatBackend, reports: list[AnalystReport], *,
-                     rounds: int) -> DebateVerdict:
+                     rounds: int, usage: list[dict[str, int]] | None = None) -> DebateVerdict:
     base = _digest(reports)
     bull_sys = "You are the BULL researcher. Argue the long case; rebut the bear."
     bear_sys = "You are the BEAR researcher. Argue the short/avoid case; rebut the bull."
     bull_case = bear_case = ""
     for _ in range(rounds):
         bull_case = await _turn(backend, bull_sys,
-                                f"Analyst reports:\n{base}\n\nBear said: {bear_case}\nYour case:")
+                                f"Analyst reports:\n{base}\n\nBear said: {bear_case}\nYour case:",
+                                usage)
         bear_case = await _turn(backend, bear_sys,
-                                f"Analyst reports:\n{base}\n\nBull said: {bull_case}\nYour case:")
+                                f"Analyst reports:\n{base}\n\nBull said: {bull_case}\nYour case:",
+                                usage)
     fac_sys = ('You are the debate FACILITATOR. Weigh the cases and reply with ONLY '
                'JSON: {"direction":"long|short|avoid","conviction":0..1,"synthesis":"<=3 sentences"}.')
     try:
         resp = await backend.complete(
             [{"role": "user", "content": f"Reports:\n{base}\n\nBULL:\n{bull_case}\n\nBEAR:\n{bear_case}"}],
             tools=[], system=fac_sys)
+        add_usage(usage, getattr(resp, "usage", None))
         obj = first_json_obj(resp.text or "")
     except Exception as exc:
+        add_usage(usage, getattr(exc, "usage", None))
         log.warning("facilitator failed", error=str(exc))
         obj = {}
     direction = obj.get("direction")

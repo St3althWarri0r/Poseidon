@@ -96,16 +96,31 @@ async def test_reflect_episode_fail_open_on_backend_error(db) -> None:
     assert await _lesson_count(db) == 0
 
 
+# Sweeps below pre-seed the watermark: an empty watermark means first run,
+# which only seeds past existing fills (see test_audit_watermark.py).
+_SEED = "2026-05-01T00:00:00+00:00"
+
+
 async def test_on_account_synced_reflects_flat_symbol_and_advances_watermark(db) -> None:
     svc = _service(db, backend=FakeBackend([text_end("lesson")]), fills=_fills())
+    await db.kv_set("reflection.fill_watermark", _SEED)
     await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)  # drain the background reflection task
     assert await _lesson_count(db) == 1
-    assert await db.kv_get("reflection.fill_watermark", "") != ""
+    assert await db.kv_get("reflection.fill_watermark", "") > _SEED
+
+
+async def test_first_sweep_seeds_watermark_instead_of_reflecting(db) -> None:
+    svc = _service(db, backend=FakeBackend([text_end("lesson")]), fills=_fills())
+    await svc.on_account_synced("t", {})  # no watermark yet: upgrade/first-run path
+    await asyncio.gather(*svc._tasks)
+    assert await _lesson_count(db) == 0
+    assert await db.kv_get("reflection.fill_watermark", "") == "2026-06-04T00:00:00+00:00"
 
 
 async def test_on_account_synced_skips_when_not_flat(db) -> None:
     svc = _service(db, backend=FakeBackend([text_end("lesson")]), fills=_fills(), is_flat=False)
+    await db.kv_set("reflection.fill_watermark", _SEED)
     await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)
     assert await _lesson_count(db) == 0
@@ -113,13 +128,14 @@ async def test_on_account_synced_skips_when_not_flat(db) -> None:
 
 async def test_sweep_load_is_bounded_by_watermark(db) -> None:
     svc = _service(db, backend=FakeBackend([text_end("l1"), text_end("l2")]), fills=_fills())
+    await db.kv_set("reflection.fill_watermark", _SEED)
     await svc.on_account_synced("t", {})
     await asyncio.gather(*svc._tasks)
     await svc.on_account_synced("t", {})  # second sync
     await asyncio.gather(*svc._tasks)
     sweep_sinces = [since for (sym, since) in svc.load_calls if sym is None]  # type: ignore[attr-defined]
-    assert sweep_sinces[0] is None            # first sweep: no watermark yet
-    assert sweep_sinces[1] not in (None, "")  # second sweep: SQL-bounded by watermark
+    assert sweep_sinces[0] == _SEED           # first sweep: bounded by the seed
+    assert sweep_sinces[1] > _SEED            # second sweep: bounded by advanced watermark
     assert await _lesson_count(db) == 1       # dedup + bound -> still one lesson
 
 

@@ -159,7 +159,8 @@ def cmd_research(args: argparse.Namespace) -> int:
         # only ever reads bars. _build_router only touches config + vault, both
         # already constructed above, so calling it standalone is safe.
         router = kernel._build_router()  # noqa: SLF001 — CLI is a trusted caller
-        hist = await load_history(router, symbols, args.days or config.research.lookback_days)
+        days = args.days if args.days is not None else config.research.lookback_days
+        hist = await load_history(router, symbols, days)
         if len(hist) < 2:
             print(
                 "not enough symbols with usable history to compute cross-sectional IC",
@@ -169,8 +170,9 @@ def cmd_research(args: argparse.Namespace) -> int:
         rep = run_report(
             ALL_FACTORS,
             hist,
-            horizon=args.horizon or config.research.horizon,
-            rebalance_every=args.rebalance_every or config.research.rebalance_every,
+            horizon=args.horizon if args.horizon is not None else config.research.horizon,
+            rebalance_every=(args.rebalance_every if args.rebalance_every is not None
+                             else config.research.rebalance_every),
             horizons=config.research.horizons,
             min_cross=config.research.min_cross,
         )
@@ -365,6 +367,16 @@ def cmd_update(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- parser
 
 
+def _positive_int(text: str) -> int:
+    """argparse type for flags that must be >= 1. An explicit 0 is a usage error —
+    silently substituting the config default would run a different experiment than
+    the user asked for — and a negative value must die here, not as a traceback."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be an integer >= 1")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="poseidon", description="Poseidon — autonomous AI trading platform")
     parser.add_argument("--version", action="version", version=f"poseidon {__version__}")
@@ -382,10 +394,11 @@ def build_parser() -> argparse.ArgumentParser:
     fac.add_argument("--symbols", default="", help="comma-separated symbols, e.g. AAA,BBB")
     fac.add_argument("--symbols-file", default="", help="path to a file, one symbol per line")
     fac.add_argument("--watchlist", action="store_true", help="use all configured watchlist symbols")
-    fac.add_argument("--days", type=int, default=0, help="history window (default: research.lookback_days)")
-    fac.add_argument("--horizon", type=int, default=0,
+    fac.add_argument("--days", type=_positive_int, default=None,
+                     help="history window (default: research.lookback_days)")
+    fac.add_argument("--horizon", type=_positive_int, default=None,
                      help="forward-return horizon in bars (default: research.horizon)")
-    fac.add_argument("--rebalance-every", dest="rebalance_every", type=int, default=0,
+    fac.add_argument("--rebalance-every", dest="rebalance_every", type=_positive_int, default=None,
                      help="trading days between IC samples (default: research.rebalance_every)")
     fac.set_defaults(func=cmd_research)
 

@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 
 from ...core.models import AnalystReport
+from ..backends import add_usage
 from ..backends.base import ChatBackend
 from .parse import first_json_obj
 from .snapshot import Snapshot
@@ -48,12 +49,15 @@ def _coerce(role: str, obj: dict[str, Any]) -> AnalystReport:
         data_gaps=_strs(obj.get("data_gaps")), sources=_strs(obj.get("sources")))
 
 
-async def _one(backend: ChatBackend, role: str, system: str, user: str) -> AnalystReport:
+async def _one(backend: ChatBackend, role: str, system: str, user: str,
+               usage: list[dict[str, int]] | None = None) -> AnalystReport:
     try:
         resp = await backend.complete([{"role": "user", "content": user}],
                                       tools=[], system=system + "\n" + _JSON_RULES)
+        add_usage(usage, getattr(resp, "usage", None))
         return _coerce(role, first_json_obj(resp.text or ""))
     except Exception as exc:  # degrade, never crash the fan-out
+        add_usage(usage, getattr(exc, "usage", None))
         log.warning("analyst failed", role=role, error=str(exc))
         return AnalystReport(role=role, summary="", stance="neutral", confidence=0.0,
                              key_points=[], data_gaps=[f"{role} analyst unavailable"],
@@ -61,8 +65,9 @@ async def _one(backend: ChatBackend, role: str, system: str, user: str) -> Analy
 
 
 async def run_analysts(backend: ChatBackend, snapshot: Snapshot, *, context: str,
-                       scan: Callable[[str], str] | None = None) -> list[AnalystReport]:
+                       scan: Callable[[str], str] | None = None,
+                       usage: list[dict[str, int]] | None = None) -> list[AnalystReport]:
     safe_ctx = (scan or (lambda s: s))(context)   # sanitize untrusted external text
     user = f"{snapshot.text}\n\nContext:\n{safe_ctx}\n\nProduce your report."
-    tasks = [_one(backend, role, system, user) for role, system in _ROLES.items()]
+    tasks = [_one(backend, role, system, user, usage) for role, system in _ROLES.items()]
     return list(await asyncio.gather(*tasks))

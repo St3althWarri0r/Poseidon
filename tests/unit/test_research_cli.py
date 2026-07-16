@@ -22,12 +22,13 @@ def test_research_cli_parser_wired() -> None:
 
 
 def test_research_cli_parser_defaults() -> None:
-    # The 0/"" sentinels are load-bearing: cmd_research falls back to
-    # config.research.* with `args.x or config.research.x`.
+    # The None/"" sentinels are load-bearing: cmd_research falls back to
+    # config.research.* only when a flag was NOT supplied, so an explicit
+    # value (validated >= 1 by argparse) is always honored.
     from poseidon.cli import build_parser
     ns = build_parser().parse_args(["research", "factors"])
     assert ns.symbols == "" and ns.symbols_file == "" and ns.watchlist is False
-    assert ns.days == 0 and ns.horizon == 0 and ns.rebalance_every == 0
+    assert ns.days is None and ns.horizon is None and ns.rebalance_every is None
 
 
 def test_research_cli_parser_all_flags() -> None:

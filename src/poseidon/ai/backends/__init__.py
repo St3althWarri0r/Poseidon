@@ -14,7 +14,34 @@ from .base import ChatBackend, LLMResponse, ToolCall, ToolResult
 from .openai_backend import OpenAICompatibleBackend
 
 __all__ = ["ChatBackend", "LLMResponse", "ToolCall", "ToolResult",
-           "build_backend", "build_backends"]
+           "add_usage", "build_backend", "build_backends", "sum_usage"]
+
+
+def add_usage(acc: list[dict[str, int]] | None, usage: object) -> None:
+    """Meter one completion's ``LLMResponse.usage`` into an accumulator.
+
+    No-op when the caller is not metering (``acc is None``) or the call
+    reported no usage dict (some failures). Advisory helpers call this after
+    every ``complete`` so spend is counted even on partially-failed pipelines.
+    """
+    if acc is None or not isinstance(usage, dict):
+        return
+    acc.append({str(k): v for k, v in usage.items() if isinstance(v, int)})
+
+
+def sum_usage(calls: list[dict[str, int]]) -> dict[str, int]:
+    """Fold per-completion usage dicts into one ``ai_usage`` payload.
+
+    ``api_calls`` counts the metered completions, so any nonempty accumulator
+    produces a row the monthly budget estimate can see.
+    """
+    total = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_write_tokens": 0}
+    for u in calls:
+        for key in total:
+            total[key] += u.get(key, 0)
+    total["api_calls"] = len(calls)
+    return total
 
 
 def build_backend(cfg: AIConfig, resolve_secret: Callable[[str], str]) -> ChatBackend:

@@ -23,12 +23,20 @@ async def _svc(db, cfg, retired, audits, notes):
     async def _audit(actor, action, data): audits.append((actor, action))
     async def _notify(level, data): notes.append(level)
     async def _retire(name):
+        # Mirrors the real retire contract: idempotent, True only on the call
+        # that actually deactivates.
+        if name in retired:
+            return False
         retired.append(name)
         return True
-    # 25 profitable then 25 losing trades: with the default window_trades=20 the window
-    # is cleanly negative (baseline >= 20) -> a clean DYING assessment.
-    dying = [_trip(0.02, d) for d in range(25)] + [_trip(-0.015, 25 + d) for d in range(25)]
-    async def _load(): return dying
+    # 25 profitable then a growing tail of losing trades: with the default
+    # window_trades=20 the window is cleanly negative (baseline >= 20) -> a
+    # clean DYING assessment, and each sweep sees one NEW losing trade (a
+    # frozen window deliberately never advances the streak).
+    trips = [_trip(0.02, d) for d in range(25)] + [_trip(-0.015, 25 + d) for d in range(25)]
+    async def _load():
+        trips.append(_trip(-0.015, 25 + len(trips)))
+        return list(trips)
     return StrategyHealthService(db=db, config=cfg, load_trips=_load, audit_append=_audit,
                                  notify=_notify, retire=_retire)
 

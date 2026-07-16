@@ -238,6 +238,10 @@ class ApplicationKernel:
         and analysis roles use the utility backend. With no ``ai.utility_model``
         the utility backend IS the primary object, so every role shares one
         backend exactly as before — this is the default that ships.
+
+        Cost control: the advisory roles receive the same contract chat and
+        review cycles enforce inline — their spend is metered into ``ai_usage``
+        (role-tagged) and their sweeps skip once ``_over_ai_budget`` trips.
         """
         self._backend, self._utility_backend = build_backends(ai_cfg, self.vault.get)
         self.agent = ClaudeAgent(ai_cfg, self._backend, dispatcher)
@@ -246,7 +250,9 @@ class ApplicationKernel:
             db=self.db, router=self.router, config=ai_cfg.reflection, model=ai_cfg.model,
             get_backend=lambda: self._utility_backend,
             load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
-            audit_append=self.audit.append)
+            audit_append=self.audit.append,
+            record_usage=lambda usage: self._record_ai_usage(usage, "reflection"),
+            over_budget=self._over_ai_budget)
         self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
         # Advisory analyst firm -> debate packet (never gates risk / touches
         # orders). Packets are injected into the PM's cycle prompt only — see
@@ -255,9 +261,13 @@ class ApplicationKernel:
             db=self.db, router=self.router, config=ai_cfg.analysis, model=ai_cfg.model,
             get_backend=lambda: self._utility_backend,
             watchlist=lambda: self.config.all_watchlist_symbols(),
-            audit_append=self.audit.append, scan=None)  # v1: no untrusted text flows yet
-            # (context=""); wire ai/tools.py's injection scanner here when the per-role
+            audit_append=self.audit.append,
+            # v1: scan=None — no untrusted text flows yet (context=""); wire
+            # ai/tools.py's injection scanner here when the per-role
             # news/fundamentals retrieval fast-follow lands.
+            scan=None,
+            record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
+            over_budget=self._over_ai_budget)
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
@@ -625,6 +635,7 @@ class ApplicationKernel:
         self.scheduler.register_job("portfolio_sync", self.sync.sync_once)
         self.scheduler.register_job("update_check", self._update_check_job)
         self.scheduler.register_job("audit_verify", self._audit_verify_job)
+        self.scheduler.register_job("advisory_prune", self._advisory_prune_job)
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
@@ -646,6 +657,11 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="nightly-audit-verify", job="audit_verify",
                                cron="15 2 * * *")
+            )
+        if not any(s.job == "advisory_prune" and s.enabled for s in schedules):
+            schedules.append(
+                ScheduleConfig(name="nightly-advisory-prune", job="advisory_prune",
+                               cron="30 2 * * *")  # after nightly-audit-verify (02:15)
             )
         if self.config.guardian.enabled and not any(
             s.job == "position_guardian" and s.enabled for s in schedules
@@ -984,7 +1000,15 @@ class ApplicationKernel:
         try:
             for algo in await self.workshop.list_all():
                 if f"algo:{algo.get('name')}" == strategy and algo.get("status") == "active":
-                    await self.workshop.deactivate(algo["id"], archive=False, actor="system")
+                    # Deactivation pops the sleeve cap from the LIVE RiskEngine
+                    # dict; mid-cycle that would loosen PositionSizeRule for an
+                    # in-flight attributed order. Serialize against the cycle so
+                    # the pop lands only between cycles (the sweep never runs
+                    # inside a cycle, so this cannot deadlock; a concurrent
+                    # cycle tick skipping while we briefly hold the lock is
+                    # acceptable).
+                    async with self._cycle_lock:
+                        await self.workshop.deactivate(algo["id"], archive=False, actor="system")
                     return True
         except Exception as exc:
             log.warning("auto-retire failed", strategy=strategy, error=str(exc))
@@ -1101,6 +1125,21 @@ class ApplicationKernel:
                 "body": f"Record {bad_seq} does not verify. Trading halted.",
             })
 
+    async def _advisory_prune_job(self) -> None:
+        """Nightly retention sweep for the advisory trade_lessons/analysis_packets
+        tables (see Database.prune_advisory) — read-side caches for the
+        reflection/analysis loops, not the tamper-evident audit chain, and
+        unbounded without this. No self-guard: like _audit_verify_job and the
+        other unconditional jobs above, a failure here is caught, logged, and
+        reported by Scheduler._execute — it must never crash the scheduler or
+        block another job's tick."""
+        lessons, packets = await self.db.prune_advisory(
+            lesson_lookback_days=self.config.ai.reflection.lookback_days,
+            packet_refresh_hours=self.config.ai.analysis.refresh_hours,
+            now=datetime.now(UTC),
+        )
+        log.info("advisory_prune", lessons=lessons, packets=packets)
+
     # ---------------------------------------------------------------- control
 
     async def set_mode(self, mode: TradingMode) -> None:
@@ -1177,6 +1216,13 @@ class ApplicationKernel:
         await self._shutdown.wait()
         await self.stop()
 
+    async def _stop_advisory_services(self) -> None:
+        """Drain the advisory background tasks (short grace, then cancel)
+        before the backends, router, and DB they write to are closed."""
+        for svc in (self.reflection, self.analysis):
+            if svc is not None:
+                await svc.stop()
+
     async def stop(self) -> None:
         log.info("shutting down")
         with contextlib.suppress(Exception):
@@ -1184,6 +1230,12 @@ class ApplicationKernel:
         for closer in (
             self.dashboard.stop, self.updates.stop, self.health.stop,
             self.scheduler.stop, self.sync.stop,
+            # With the scheduler and sync publisher stopped, drain in-flight
+            # reflection/analysis work. The services' _stopped latch also
+            # neutralizes any sync handler still in flight when bus.close()
+            # drains it below — it must not spawn tasks against the closed
+            # backend or advance the fill watermark past unreflected closes.
+            self._stop_advisory_services,
             # After the scheduler stops (no new sweeps), let any in-flight
             # guardian exit dispatch finish rather than abandoning it.
             self.guardian.drain,
