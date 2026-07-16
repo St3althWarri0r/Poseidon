@@ -246,7 +246,7 @@ def clear_running_engines(
 
     for ident in targets.values():
         cmdline = getattr(ident, "cmdline", "(from engine.pid)")
-        stopped = stop(ident)  # type: ignore[arg-type]  # ProcIdent meets it at runtime
+        stopped = stop(ident)
         _forensic(config, f"fresh-start kill pid={ident.pid} starttime={ident.starttime} "
                           f"stopped={stopped} cmdline={cmdline}")
         if stopped and ident.pid == recorded_pid:
