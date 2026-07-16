@@ -46,6 +46,15 @@ def test_proc_starttime_reads_proc_tree(tmp_path) -> None:
     assert proc_starttime(43, proc_root=tmp_path) is None        # no such pid
 
 
+def test_proc_starttime_tolerates_non_utf8_comm(tmp_path) -> None:
+    # comm is prctl-settable to arbitrary bytes; the identity read must not
+    # crash on invalid UTF-8 (the starttime tail is ASCII regardless).
+    stat = tmp_path / "9" / "stat"
+    stat.parent.mkdir()
+    stat.write_bytes(b"9 (\xffevil\xff) S 1 9 9 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 555 0 0")
+    assert proc_starttime(9, proc_root=tmp_path) == 555
+
+
 def test_same_process_matches_only_same_incarnation(tmp_path) -> None:
     stat = tmp_path / "7" / "stat"
     stat.parent.mkdir()
@@ -60,10 +69,16 @@ def test_same_process_matches_only_same_incarnation(tmp_path) -> None:
 class _Seams:
     """Scriptable process world: starttime lookups + recorded signals."""
 
-    def __init__(self, timeline: list[int | None], pgid: int | None = None) -> None:
+    def __init__(
+        self,
+        timeline: list[int | None],
+        pgid: int | None = None,
+        raise_on_signal: bool = False,
+    ) -> None:
         self.timeline = list(timeline)   # successive starttime_of() answers
         self.signals: list[tuple[str, int, int]] = []
         self._pgid = pgid
+        self._raise_on_signal = raise_on_signal   # signal call itself raises
         self.slept: list[float] = []
 
     def starttime_of(self, pid: int) -> int | None:
@@ -76,9 +91,13 @@ class _Seams:
 
     def kill(self, pid: int, sig: int) -> None:
         self.signals.append(("kill", pid, sig))
+        if self._raise_on_signal:
+            raise ProcessLookupError(pid)
 
     def killpg(self, pgid: int, sig: int) -> None:
         self.signals.append(("killpg", pgid, sig))
+        if self._raise_on_signal:
+            raise ProcessLookupError(pgid)
 
     def sleep(self, s: float) -> None:
         self.slept.append(s)
@@ -127,6 +146,16 @@ def test_stop_group_leader_gets_killpg_nonleader_gets_kill() -> None:
 
 
 def test_stop_getpgid_process_lookup_error_means_dead() -> None:
-    w = _Seams(timeline=[100, None], pgid=None)               # getpgid raises
+    # Alive at the initial check AND at send()'s re-verify, so execution
+    # genuinely reaches getpgid — which raises (pgid=None) => treated dead.
+    w = _Seams(timeline=[100, 100, None], pgid=None)          # getpgid raises
     assert w.run(ProcIdent(50, 100)) is True
     assert w.signals == []
+
+
+def test_stop_signal_raising_process_lookup_error_is_tolerated() -> None:
+    # Process dies inside the verify->signal window: the killpg call itself
+    # raises. stop_process must neither crash nor escalate to SIGKILL.
+    w = _Seams(timeline=[100, 100, 100, None], pgid=50, raise_on_signal=True)
+    assert w.run(ProcIdent(50, 100)) is True
+    assert w.signals == [("killpg", 50, signal.SIGTERM)]      # one attempt, no KILL

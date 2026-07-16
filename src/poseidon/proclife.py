@@ -55,9 +55,15 @@ def parse_stat_starttime(stat_text: str) -> int | None:
 
 
 def proc_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
-    """The live starttime of ``pid``, or None if it does not exist / is unreadable."""
+    """The live starttime of ``pid``, or None if it does not exist / is unreadable.
+
+    Bytes + lossy decode: comm may hold non-UTF-8 bytes (prctl-settable), and
+    the starttime tail is ASCII, so ``errors="replace"`` cannot perturb the
+    identity check while removing the UnicodeDecodeError crash path."""
     try:
-        return parse_stat_starttime((proc_root / str(pid) / "stat").read_text())
+        return parse_stat_starttime(
+            (proc_root / str(pid) / "stat").read_bytes().decode(errors="replace")
+        )
     except OSError:
         return None
 
