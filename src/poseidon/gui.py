@@ -17,11 +17,16 @@ user service, then explains what to do rather than opening a dead window.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import httpx
+
+from .proclife import ProcIdent, proc_starttime, stop_process
 
 _APP_BROWSERS = (
     "chromium", "chromium-browser", "google-chrome-stable", "google-chrome",
@@ -128,3 +133,103 @@ def launch(url: str, token: str | None = None) -> int:
 
         url = f"{url}/?token={quote(token, safe='')}"
     return open_window(url, token_in_url=bool(token))
+
+
+_WINDOW_FLAGS = ("--no-first-run", "--no-default-browser-check")
+_HANDOFF_THRESHOLD = 2.0
+
+
+def profile_holders(profile_dir: Path, proc_root: Path = Path("/proc")) -> list[ProcIdent]:
+    """Processes holding our dedicated window profile. The dir is exclusively
+    the launcher's, so any holder is a dead launcher's orphaned window — safe
+    to stop by construction (chromium's ProcessSingleton would otherwise hand
+    our new window to it and exit instantly, breaking wait() as a close signal)."""
+    needle = f"--user-data-dir={profile_dir}"
+    me = os.getpid()
+    holders: list[ProcIdent] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if needle in argv:
+            starttime = proc_starttime(int(entry.name), proc_root)
+            if starttime is not None:
+                holders.append(ProcIdent(pid=int(entry.name), starttime=starttime))
+    return holders
+
+
+def _stop_profile_holder(ident: ProcIdent) -> None:
+    stop_process(ident, grace=5.0)  # type: ignore[arg-type]
+
+
+def open_app_window_blocking(
+    url: str,
+    *,
+    profile_dir: Path,
+    token_in_url: bool = False,
+    on_spawn: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    fallback_block: Callable[[], None] | None = None,
+    handoff_threshold: float = _HANDOFF_THRESHOLD,
+) -> int:
+    """The LAUNCHER's window: blocks until the window closes.
+
+    pywebview blocks natively. The chromium-family path spawns with a
+    dedicated ``--user-data-dir`` so the process's lifetime is the window's
+    lifetime — ``wait()`` is the close signal. An exit within
+    ``handoff_threshold`` seconds means chromium handed the window to a
+    process already holding the profile (an orphan from a SIGKILLed
+    launcher): sweep the holder and respawn once. ``fallback_block`` runs
+    when no trackable window exists (bare ``webbrowser.open``).
+
+    Tradeoff (extends F019): with a token in ``url``, the dedicated profile
+    persists it in history/session files under the (0700) profile dir —
+    loopback default carries no token."""
+    try:
+        import webview  # optional dependency: poseidon[gui]
+    except ImportError:
+        webview = None
+    if webview is not None:
+        try:
+            webview.create_window("Poseidon", url,
+                                  width=_WINDOW_SIZE[0], height=_WINDOW_SIZE[1])
+            webview.start()
+            return 0
+        except Exception as exc:  # missing GTK/Qt backend, no display, …
+            print(f"native window unavailable ({exc}); falling back to a browser window")
+    if token_in_url:
+        print(
+            "WARNING: no native window available — the dashboard token rides the "
+            "browser argv (visible in /proc) and persists inside the dedicated "
+            "window profile on disk. Install 'pip install poseidon[gui]' to avoid this."
+        )
+    for name in _APP_BROWSERS:
+        binary = shutil.which(name)
+        if not binary:
+            continue
+        profile_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for _attempt in (1, 2):
+            for holder in profile_holders(profile_dir):
+                _stop_profile_holder(holder)
+            proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+                [binary, f"--app={url}", f"--user-data-dir={profile_dir}",
+                 *_WINDOW_FLAGS,
+                 f"--window-size={_WINDOW_SIZE[0]},{_WINDOW_SIZE[1]}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if on_spawn is not None:
+                on_spawn(proc)
+            started = time.monotonic()
+            proc.wait()
+            if time.monotonic() - started >= handoff_threshold:
+                return 0            # a real window session ended (user hit X)
+            # instant exit: ProcessSingleton hand-off — sweep and retry once
+        return 0
+    import webbrowser
+
+    webbrowser.open(url)
+    if fallback_block is not None:
+        fallback_block()
+    return 0
