@@ -114,7 +114,7 @@ def _try_flock(fh: IO[str]) -> bool:
 def acquire_launcher_lock(
     lock_path: Path,
     *,
-    takeover_timeout: float = 30.0,
+    takeover_timeout: float = 45.0,
     interval: float = 0.5,
     term: Callable[[int, int], None] = os.kill,
     alive: Callable[[ProcIdent], bool] = same_process,
@@ -123,11 +123,16 @@ def acquire_launcher_lock(
 ) -> IO[str] | None:
     """One launcher at a time, with takeover: if another launcher holds the
     lock, verify its recorded (pid, starttime) against /proc ON EVERY POLL and
-    SIGTERM only a verified holder (its finally-cleanup closes its window and
-    engine); an unverifiable holder is never signalled — its flock releases by
-    itself when it exits. Returns the flocked handle (keep it for life; flock
-    dies with the process, so a SIGKILLed launcher cannot wedge future
-    launches) or None if the lock never freed."""
+    SIGTERM a verified holder — but only the FIRST time we see that identity,
+    not on every poll: the victim's own teardown (window reap up to ~10s +
+    engine TERM/KILL grace) takes real time, and re-signalling a process
+    already tearing down is noise at best. An unverifiable holder is never
+    signalled — its flock releases by itself when it exits. ``takeover_timeout``
+    defaults wide enough (45s) to outlast that worst-case teardown so a
+    slow-but-correct victim is not abandoned with a spurious "did not hand
+    over" error. Returns the flocked handle (keep it for life; flock dies with
+    the process, so a SIGKILLed launcher cannot wedge future launches) or None
+    if the lock never freed."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = lock_path.open("a+", encoding="utf-8")
 
@@ -145,11 +150,13 @@ def acquire_launcher_lock(
 
     (notify or _notify)("Restarting Poseidon…", "Handing the window over to a fresh start.")
     waited = 0.0
+    signalled: ProcIdent | None = None
     while waited < takeover_timeout:
         holder = read_pidfile(lock_path)
-        if holder is not None and alive(holder):
+        if holder is not None and alive(holder) and holder != signalled:
             with contextlib.suppress(ProcessLookupError):
                 term(holder.pid, signal.SIGTERM)
+            signalled = holder
         if _try_flock(fh):
             return _claim()
         sleep(interval)
@@ -569,6 +576,12 @@ def _install_signal_handlers() -> None:
     is the longest window in the launcher's life and must be covered."""
 
     def _bail(signum: int, _frame: object) -> None:
+        # Latch: further SIGTERM/SIGHUP are ignored so the one SystemExit's
+        # finally-teardown (window reap + engine kill) runs to completion — a
+        # takeover re-signals every poll, and a second raise here would abort
+        # teardown before the engine is killed.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -648,8 +661,12 @@ def main(argv: list[str] | None = None) -> int:
     if passphrase is None:
         passphrase = dialog.password("Enter your Poseidon vault password to start:")
         if not passphrase:
-            # Cancelling a launch must never stop a running engine: the kill
-            # pass below is reached only with a passphrase in hand.
+            # Cancelling here only skips THIS launcher's kill pass and the new
+            # engine spawn below — by itself it stops nothing. If this launch
+            # took over a prior launcher (acquire_launcher_lock, above), that
+            # prior launcher's engine was already torn down by the takeover
+            # BEFORE we ever reached this prompt — the intended "every launch
+            # is a fresh start" semantics, not a side effect of cancelling now.
             dialog.error("No password entered — Poseidon was not started.")
             return 1
 
@@ -691,7 +708,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     finally:
         _shutdown_engine(proc, window, pidfile)
-        del lock  # released by process exit; explicit for the reader
+        # Deleting the last reference closes the file handle HERE, releasing
+        # the flock at this exact point (end of the finally, after teardown) —
+        # not merely "by process exit". That ordering is what keeps a new
+        # launcher's takeover kill-pass correctly serialized behind this one's
+        # teardown finishing first.
+        del lock
 
 
 if __name__ == "__main__":

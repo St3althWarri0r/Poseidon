@@ -184,6 +184,15 @@ def open_app_window_blocking(
     launcher): sweep the holder and respawn once. ``fallback_block`` runs
     when no trackable window exists (bare ``webbrowser.open``).
 
+    Signal-safety note: the pywebview path blocks inside a native GTK/Qt
+    event loop, where a Python signal handler installed by the launcher may
+    not run until that loop yields control back to the interpreter — so
+    takeover/signal-driven teardown (a new launch's SIGTERM, a logout's
+    SIGHUP) is best-effort on that path. The chromium-family
+    ``--user-data-dir`` path below — the one actually used on this
+    deployment — is plain ``Popen`` + ``wait()`` in the launcher's own loop,
+    so it is fully signal-driven.
+
     Tradeoff (extends F019): with a token in ``url``, the dedicated profile
     persists it in history/session files under the (0700) profile dir —
     loopback default carries no token."""

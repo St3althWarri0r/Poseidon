@@ -125,10 +125,44 @@ def test_install_signal_handlers_handler_raises_128_plus_signum(monkeypatch) -> 
     monkeypatch.setattr(launcher.signal, "signal",
                         lambda sig, handler: installed.__setitem__(sig, handler))
     launcher._install_signal_handlers()
+    # Snapshot BEFORE invoking either handler: the latch makes the handler
+    # itself call (the monkeypatched) signal.signal on both signals, which
+    # would otherwise overwrite `installed[SIGHUP]` with SIG_IGN while we are
+    # still iterating and reading it live — invoking a non-callable sentinel
+    # on the second loop turn instead of the handler.
+    handlers = dict(installed)
     for sig in (launcher.signal.SIGTERM, launcher.signal.SIGHUP):
         with _pytest.raises(SystemExit) as exc_info:
-            installed[sig](sig, None)  # type: ignore[operator]
+            handlers[sig](sig, None)  # type: ignore[operator]
         assert exc_info.value.code == 128 + sig
+
+
+def test_install_signal_handlers_latches_to_sig_ign_after_firing() -> None:
+    # A takeover re-signals the victim on EVERY 0.5s poll, and the victim's
+    # `finally` (window reap + engine kill) is not instant. Without a latch, a
+    # second SIGTERM landing mid-teardown raises SystemExit AGAIN, unwinding
+    # `_shutdown_engine` before it reaches the engine kill — leaving the
+    # engine running headless. Pin: the REAL installed handler disarms both
+    # signals to SIG_IGN the instant it first fires, so a takeover's repeated
+    # signalling can only ever produce ONE SystemExit.
+    import signal as _sig
+
+    import pytest as _pytest
+
+    import poseidon.launcher as launcher
+
+    try:
+        launcher._install_signal_handlers()
+        term_handler = _sig.getsignal(_sig.SIGTERM)
+        with _pytest.raises(SystemExit):
+            term_handler(_sig.SIGTERM, None)  # type: ignore[operator]
+        assert _sig.getsignal(_sig.SIGTERM) is _sig.SIG_IGN
+        assert _sig.getsignal(_sig.SIGHUP) is _sig.SIG_IGN
+    finally:
+        # Restore real process-wide disposition so this test cannot leak
+        # SIG_IGN into any test that runs after it in the same process.
+        _sig.signal(_sig.SIGTERM, _sig.SIG_DFL)
+        _sig.signal(_sig.SIGHUP, _sig.SIG_DFL)
 
 
 # ---- main() orchestration (real vault + config; GUI/engine/window faked) ----
@@ -863,6 +897,37 @@ def test_takeover_signals_verified_holder_then_acquires(tmp_path) -> None:
         assert fh is not None
         import signal as _sig
         assert signalled and signalled[0][1] == _sig.SIGTERM
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_takeover_signals_holder_once_per_identity_not_every_poll(tmp_path) -> None:
+    # A verified-alive holder that is slow to tear down (its own window/engine
+    # reap takes real time) stays the recorded identity across many polls.
+    # Spamming SIGTERM at it every 0.5s is pure noise at best; pin that the
+    # SAME identity is signalled exactly ONCE no matter how many polls it
+    # takes for the flock to actually free.
+    lock_path = tmp_path / "launcher.lock"
+    holder = acquire_launcher_lock(lock_path)
+    assert holder is not None
+    signalled: list[tuple[int, int]] = []
+    polls = {"n": 0}
+
+    def term(pid, sig):  # noqa: ANN001, ANN202
+        signalled.append((pid, sig))
+
+    def sleeper(_s: float) -> None:
+        polls["n"] += 1
+        if polls["n"] >= 4:                # holder only "exits" after several polls
+            holder.close()
+
+    fh = acquire_launcher_lock(
+        lock_path, term=term, alive=lambda ident: True,
+        sleep=sleeper, notify=lambda *_a: None)
+    try:
+        assert fh is not None
+        assert len(signalled) == 1         # ONE term call total, not once-per-poll
     finally:
         if fh is not None:
             fh.close()

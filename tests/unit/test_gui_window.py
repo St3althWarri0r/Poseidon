@@ -2,6 +2,7 @@
 lifetime IS the window lifetime, with ProcessSingleton hand-off defenses."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import poseidon.gui as gui
@@ -19,13 +20,19 @@ class _FakeProc:
 
 
 def _no_webview(monkeypatch) -> None:
-    import builtins
-    real_import = builtins.__import__
-    def fake_import(name, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if name == "webview":
-            raise ImportError(name)
-        return real_import(name, *a, **kw)
-    monkeypatch.setattr(builtins, "__import__", fake_import)
+    """Simulate the optional ``webview`` dependency being absent.
+
+    Scoped to ``sys.modules`` only — patching ``builtins.__import__`` broadly
+    (the prior approach) intercepted EVERY import in the process for the life
+    of the monkeypatch, which caused a one-time, non-reproducing collection
+    ImportError for other imports racing underneath it. Setting the module
+    entry to None is the narrow, standard-library-documented way to force
+    ``import webview`` to raise (``ModuleNotFoundError``, an ``ImportError``
+    subclass) without touching any other import: ``open_app_window_blocking``
+    already treats that as "the optional dependency isn't installed" via its
+    own ``except ImportError: webview = None``.
+    """
+    monkeypatch.setitem(sys.modules, "webview", None)
 
 
 def test_blocking_window_spawns_dedicated_profile_and_waits(tmp_path, monkeypatch) -> None:
