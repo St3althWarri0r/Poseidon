@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -112,22 +113,25 @@ def write_pidfile(path: Path, ident: ProcIdent) -> None:
                     encoding="utf-8")
 
 
+_PY_EXE = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
 def is_engine_cmdline(exe: str, argv: list[str]) -> bool:
-    """True only for the two exact engine spawn shapes. Positional matching:
-    a stray ``... poseidon run`` argument tail must NOT match — this predicate
-    authorizes a kill."""
-    if not Path(exe).name.startswith("python"):
+    """True only for the two exact engine spawn shapes — this predicate
+    authorizes a kill, so matching is strictly positional: a stray
+    ``... -m poseidon run`` argument tail must NOT match, and an
+    interpreter-flag form (``python -O -m poseidon run``) is deliberately
+    rejected too (the fresh-start port assertion backstops any engine the
+    scan misses)."""
+    if not _PY_EXE.match(Path(exe).name):
         return False
     if not argv:
         return False
     if Path(argv[0]).name == "poseidon" and argv[1:2] == ["run"]:
         return True
-    for i, tok in enumerate(argv[:-1]):
-        if tok == "-m" and argv[i + 1] == "poseidon" and argv[i + 2:i + 3] == ["run"]:
-            return True
-        if tok == "-mposeidon" and argv[i + 1] == "run":
-            return True
-    return False
+    if argv[1:4] == ["-m", "poseidon", "run"]:
+        return True
+    return argv[1:3] == ["-mposeidon", "run"]
 
 
 @dataclass(frozen=True)

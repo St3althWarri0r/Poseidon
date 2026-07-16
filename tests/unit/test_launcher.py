@@ -194,6 +194,8 @@ def test_pidfile_garbage_and_missing_read_as_none(tmp_path) -> None:
     assert read_pidfile(path) is None                       # garbage
     path.write_text('{"pid": "x", "starttime": 1}')
     assert read_pidfile(path) is None                       # wrong types
+    path.write_text('{"pid": true, "starttime": 1}')
+    assert read_pidfile(path) is None                       # bool is not a pid
 
 
 def test_engine_matcher_accepts_both_real_spawn_shapes() -> None:
@@ -212,13 +214,40 @@ def test_engine_matcher_rejects_lookalikes() -> None:
     assert is_engine_cmdline(py, []) is False
 
 
-def _fake_proc(tmp_path, pid: int, exe: str, argv: list[str], starttime: int) -> None:
+def test_engine_matcher_never_pattern_scans_argv() -> None:
+    # A script that merely RECEIVES "-m poseidon run" as its own arguments must
+    # NOT match — this predicate authorizes a kill, so matching is strictly
+    # positional, never a scan over argv.
+    py = "/usr/bin/python3"
+    assert is_engine_cmdline(py, [py, "x.py", "-m", "poseidon", "run"]) is False
+
+
+def test_engine_matcher_requires_real_interpreter_basename() -> None:
+    argv = ["/usr/bin/python3", "-m", "poseidon", "run"]
+    assert is_engine_cmdline("/usr/bin/python-wrapper", argv) is False
+    assert is_engine_cmdline("/usr/bin/python3-config", argv) is False
+    assert is_engine_cmdline("/usr/bin/python", argv) is True
+    assert is_engine_cmdline("/usr/bin/python3", argv) is True
+    assert is_engine_cmdline("/usr/bin/python3.14", argv) is True
+
+
+def test_engine_matcher_rejects_interpreter_flag_form_by_design() -> None:
+    # Documented false negative: positional strictness rejects interpreter
+    # flags before -m (``python -O -m poseidon run``). Deliberate — the
+    # fresh-start port assertion backstops any engine the scan misses.
+    py = "/usr/bin/python3"
+    assert is_engine_cmdline(py, [py, "-O", "-m", "poseidon", "run"]) is False
+
+
+def _fake_proc(tmp_path, pid: int, exe: str, argv: list[str], starttime: int,
+               *, with_exe: bool = True) -> None:
     d = tmp_path / str(pid)
     d.mkdir()
     (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
     tail = f"S 1 {pid} {pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {starttime} 0 0"
     (d / "stat").write_text(f"{pid} ({argv[0][:15]}) {tail}")
-    (d / "exe").symlink_to(exe)
+    if with_exe:
+        (d / "exe").symlink_to(exe)
 
 
 def test_find_running_engines_scans_and_filters(tmp_path) -> None:
@@ -237,4 +266,12 @@ def test_find_running_engines_skips_itself(tmp_path) -> None:
     import os as _os
     py = "/usr/bin/python3.14"
     _fake_proc(tmp_path, _os.getpid(), py, [py, "-m", "poseidon", "run"], 55)
+    assert find_running_engines(proc_root=tmp_path) == []
+
+
+def test_find_running_engines_skips_entries_without_readable_exe(tmp_path) -> None:
+    # A matching cmdline whose ``exe`` link cannot be read (absent here; another
+    # user's process in production) is skipped via the OSError path.
+    py = "/usr/bin/python3.14"
+    _fake_proc(tmp_path, 200, py, [py, "-m", "poseidon", "run"], 66, with_exe=False)
     assert find_running_engines(proc_root=tmp_path) == []
