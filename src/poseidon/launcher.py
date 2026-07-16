@@ -1,19 +1,26 @@
 """GUI double-click launcher for Poseidon (`poseidon-launch`).
 
-The desktop entry point. On a double-click it brings the whole platform up with
-no terminal: it guides first-time setup (vault + Anthropic key) through GUI
-dialogs, prompts for the vault passphrase, starts the engine in the background,
-and opens the dashboard window.
+The desktop entry point. On a double-click it brings the whole platform up
+with no terminal, and OWNS the engine's lifetime: closing the window (or the
+launcher receiving SIGTERM/SIGHUP/SIGINT) terminates the engine — TERM, a
+grace period, then KILL of its process group — and every launch begins by
+stopping any engine already running (pid file, /proc scan, systemd unit).
+There is deliberately no reuse: every open is a fresh start.
 
 Design:
   * The passphrase reaches the engine through its ENVIRONMENT
-    (``POSEIDON_VAULT_PASSPHRASE``, read by ``Vault.unlock_from_environment``) —
-    never a file, never argv, so it cannot leak via ``ps``. It is dropped from
-    this process once the engine is spawned.
-  * The launcher never changes the trading mode. The engine starts in whatever
-    the config says (default: research + paper broker); enabling autonomous or
-    live trading stays a deliberate in-dashboard action.
-  * Decision logic is pure module functions (unit-tested); the dialog and
+    (``POSEIDON_VAULT_PASSPHRASE``) — never a file, never argv. The pid and
+    lock files carry (pid, starttime) identity JSON only.
+  * Signals are sent only to processes verified by (pid, starttime) identity
+    — a recycled PID can never be killed by mistake (see ``proclife``).
+  * The launcher never changes the trading mode. The engine starts in
+    whatever the config says; enabling autonomous or live trading stays a
+    deliberate in-dashboard action.
+  * ``poseidon app`` (the CLI window) keeps its service-view semantics: it
+    never stops the engine. Only the launcher owns lifecycle. If the systemd
+    user service is re-enabled, the next launch will stop it — the two
+    ownership models do not mix.
+  * Decision logic is pure module functions (unit-tested); dialogs and
     subprocess calls sit behind thin seams.
 """
 
@@ -542,10 +549,56 @@ def _resolve_window_token(config: AppConfig, passphrase: str | None) -> str | No
     return token
 
 
+_WINDOW_REAP_GRACE = 5.0
+
+
+def _install_signal_handlers() -> None:
+    """SIGTERM/SIGHUP become SystemExit so main()'s finally still stops the
+    engine (KDE logout, terminal kill, a takeover's signal). SIGINT already
+    raises KeyboardInterrupt. Installed FIRST in main(): the ~30s startup wait
+    is the longest window in the launcher's life and must be covered."""
+
+    def _bail(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _bail)
+
+
+def _shutdown_engine(
+    proc: subprocess.Popen[bytes] | None,
+    window: subprocess.Popen[bytes] | None,
+    pidfile: Path,
+) -> None:
+    """Idempotent teardown, in dependency order: reap the window FIRST (the
+    browser profile must be free before our flock releases at process death),
+    then stop our engine, then drop the pid file iff it is still ours."""
+    if window is not None and window.poll() is None:
+        try:
+            window.terminate()
+            try:
+                window.wait(timeout=_WINDOW_REAP_GRACE)
+            except subprocess.TimeoutExpired:
+                window.kill()
+                window.wait(timeout=_WINDOW_REAP_GRACE)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if proc is None:
+        return
+    was_live = proc.poll() is None
+    _kill_own_engine(proc)
+    recorded = read_pidfile(pidfile)
+    if recorded is not None and recorded.pid == proc.pid:
+        pidfile.unlink(missing_ok=True)
+    if was_live:
+        _notify("Poseidon stopped.", "The engine was shut down with the window.")
+
+
 def main(argv: list[str] | None = None) -> int:
     from .core.config import load_config
-    from .gui import launch
     from .security.vault import Vault
+
+    _install_signal_handlers()
 
     backend = pick_dialog_backend(shutil.which)
     if backend is None:
@@ -560,6 +613,12 @@ def main(argv: list[str] | None = None) -> int:
         dialog.error(f"Poseidon configuration could not be loaded:\n\n{exc}")
         return 1
 
+    lock = acquire_launcher_lock(config.data_dir / _LAUNCHER_LOCKFILE)
+    if lock is None:
+        dialog.error("Another Poseidon window is open and did not hand over in time.\n"
+                     "Close it, then launch again.")
+        return 1
+
     vault = Vault(config.data_dir / "vault.bin")
     url = dashboard_url(config)
     passphrase: str | None = None
@@ -568,18 +627,46 @@ def main(argv: list[str] | None = None) -> int:
         passphrase = _first_run_setup(dialog, config, vault)
         if passphrase is None:
             return 1  # user cancelled setup
-
-    if not _engine_up(url):
-        if passphrase is None:
-            passphrase = dialog.password("Enter your Poseidon vault password to start:")
-            if not passphrase:
-                dialog.error("No password entered — Poseidon was not started.")
-                return 1
-        if _start_engine(config, passphrase, dialog, url) is None:
+    if passphrase is None:
+        passphrase = dialog.password("Enter your Poseidon vault password to start:")
+        if not passphrase:
+            # Cancelling a launch must never stop a running engine: the kill
+            # pass below is reached only with a passphrase in hand.
+            dialog.error("No password entered — Poseidon was not started.")
             return 1
 
-    token = _resolve_window_token(config, passphrase)
-    return launch(url, token)
+    if not clear_running_engines(config, dialog, url):
+        return 1
+
+    proc: subprocess.Popen[bytes] | None = None
+    window: subprocess.Popen[bytes] | None = None
+    pidfile = config.data_dir / _ENGINE_PIDFILE
+    try:
+        proc = _start_engine(config, passphrase, dialog, url)
+        if proc is None:
+            return 1
+        token = _resolve_window_token(config, passphrase)
+        target = url
+        if token:
+            from urllib.parse import quote
+            target = f"{url}/?token={quote(token, safe='')}"
+
+        def _remember(p: subprocess.Popen[bytes]) -> None:
+            nonlocal window
+            window = p
+
+        from .gui import open_app_window_blocking
+        return open_app_window_blocking(
+            target,
+            profile_dir=config.data_dir / "webview-profile",
+            token_in_url=bool(token),
+            on_spawn=_remember,
+            fallback_block=lambda: dialog.info(
+                "Poseidon is running.\n\nClose this dialog to shut it down."),
+        )
+    finally:
+        _shutdown_engine(proc, window, pidfile)
+        del lock  # released by process exit; explicit for the reader
 
 
 if __name__ == "__main__":

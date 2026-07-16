@@ -103,12 +103,154 @@ def test_pick_dialog_backend_none_when_no_gui() -> None:
     assert pick_dialog_backend(lambda _t: None) is None
 
 
+# ---- signal handling: SIGTERM/SIGHUP become SystemExit so finally still runs ----
+
+
+def test_install_signal_handlers_registers_term_and_hup(monkeypatch) -> None:
+    import poseidon.launcher as launcher
+
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(launcher.signal, "signal",
+                        lambda sig, handler: installed.__setitem__(sig, handler))
+    launcher._install_signal_handlers()
+    assert set(installed) == {launcher.signal.SIGTERM, launcher.signal.SIGHUP}
+
+
+def test_install_signal_handlers_handler_raises_128_plus_signum(monkeypatch) -> None:
+    import pytest as _pytest
+
+    import poseidon.launcher as launcher
+
+    installed: dict[int, object] = {}
+    monkeypatch.setattr(launcher.signal, "signal",
+                        lambda sig, handler: installed.__setitem__(sig, handler))
+    launcher._install_signal_handlers()
+    for sig in (launcher.signal.SIGTERM, launcher.signal.SIGHUP):
+        with _pytest.raises(SystemExit) as exc_info:
+            installed[sig](sig, None)  # type: ignore[operator]
+        assert exc_info.value.code == 128 + sig
+
+
 # ---- main() orchestration (real vault + config; GUI/engine/window faked) ----
 
-def test_main_first_run_creates_vault_then_starts_and_opens(tmp_path, monkeypatch) -> None:
+def _wire_main(monkeypatch, tmp_path, *, engines_found=(), password="longpassword",
+               window_rc=0, window_raises=None):
+    """Standard main() wiring: real vault in tmp XDG dirs, everything else faked.
+    Returns a dict of recorders."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "d"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "c"))
-    import poseidon.gui
+    import poseidon.gui as gui
+    import poseidon.launcher as launcher
+    from poseidon.security.vault import Vault
+
+    Vault(tmp_path / "d" / "poseidon" / "vault.bin").create("longpassword")
+
+    rec: dict[str, object] = {"stopped": [], "unit": [], "shutdown": [], "window": []}
+
+    class FakeDialog:
+        def __init__(self, backend: str) -> None: ...
+        def info(self, message: str) -> None: ...
+        def error(self, message: str) -> None:
+            rec.setdefault("errors", []).append(message)  # type: ignore[union-attr]
+        def question(self, message: str) -> bool:
+            return False
+        def password(self, prompt: str) -> str | None:
+            rec["password_prompted"] = True
+            return password
+
+    class FakeEngine:
+        pid = 900
+        def poll(self):  # noqa: ANN201
+            return None
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
+    engine = FakeEngine()
+    monkeypatch.setattr(launcher, "Dialog", FakeDialog)
+    monkeypatch.setattr(launcher, "pick_dialog_backend", lambda which: "zenity")
+    monkeypatch.setattr(launcher, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "acquire_launcher_lock",
+                        # SIM115: this fakes a lock HANDOFF (an open handle the
+                        # caller holds for the launcher's life), not a read/write
+                        # that should be scoped to a `with` block. mkdir mirrors
+                        # the real seam, which is called before the data dir is
+                        # guaranteed to exist (e.g. a genuinely fresh install).
+                        lambda path, **kw: (path.parent.mkdir(parents=True, exist_ok=True),
+                                            path.open("a+", encoding="utf-8"))[1])  # noqa: SIM115
+    monkeypatch.setattr(launcher, "stop_systemd_unit",
+                        lambda **kw: (rec["unit"].append(True), "stopped")[1])  # type: ignore[union-attr]
+    monkeypatch.setattr(launcher, "find_running_engines", lambda **kw: list(engines_found))
+
+    def fake_stop(ident, **kw):  # noqa: ANN001, ANN202
+        rec["stopped"].append(ident.pid)  # type: ignore[union-attr]
+        return True
+    monkeypatch.setattr(launcher, "_clear_stop_seam", fake_stop, raising=False)
+    # clear_running_engines is exercised REAL, with seams injected via partial:
+    real_clear = launcher.clear_running_engines
+    monkeypatch.setattr(
+        launcher, "clear_running_engines",
+        lambda config, dialog, url: real_clear(
+            config, dialog, url,
+            engines=lambda: list(engines_found), stop=fake_stop,
+            stop_unit=lambda: (rec["unit"].append(True), "stopped")[1],  # type: ignore[union-attr]
+            engine_up=lambda _u: False, alive=lambda i: True))
+    monkeypatch.setattr(launcher, "_start_engine",
+                        lambda config, passphrase, dialog, url:
+                            (rec.__setitem__("passphrase", passphrase), engine)[1])
+    monkeypatch.setattr(launcher, "_shutdown_engine",
+                        lambda proc, window, pidfile:
+                            rec["shutdown"].append((proc, window)))  # type: ignore[union-attr]
+
+    def fake_window(url, *, profile_dir, token_in_url=False, on_spawn=None,
+                    fallback_block=None, handoff_threshold=2.0):  # noqa: ANN001, ANN202
+        rec["window"].append(url)  # type: ignore[union-attr]
+        if window_raises is not None:
+            raise window_raises
+        return window_rc
+    monkeypatch.setattr(gui, "open_app_window_blocking", fake_window)
+    return rec, engine, launcher
+
+
+def test_main_always_fresh_start_kills_running_engine(tmp_path, monkeypatch) -> None:
+    from poseidon.launcher import FoundEngine
+    rec, engine, launcher = _wire_main(
+        monkeypatch, tmp_path,
+        engines_found=[FoundEngine(pid=321, starttime=1, cmdline="python -m poseidon run")])
+    assert launcher.main() == 0
+    assert rec.get("password_prompted") is True            # always prompted now
+    assert rec["stopped"] == [321]                         # prior engine killed
+    assert rec["unit"]                                     # systemd stop attempted
+    assert rec["window"]                                   # window opened
+    assert rec["shutdown"] == [(engine, None)]             # finally stopped OUR engine
+
+
+def test_main_window_close_shuts_engine_down(tmp_path, monkeypatch) -> None:
+    rec, engine, launcher = _wire_main(monkeypatch, tmp_path)
+    assert launcher.main() == 0
+    assert rec["shutdown"] == [(engine, None)]
+
+
+def test_main_signal_during_window_still_stops_engine(tmp_path, monkeypatch) -> None:
+    rec, engine, launcher = _wire_main(monkeypatch, tmp_path,
+                                       window_raises=SystemExit(143))
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        launcher.main()
+    assert rec["shutdown"] == [(engine, None)]             # finally ran
+
+
+def test_main_password_cancel_never_runs_kill_pass(tmp_path, monkeypatch) -> None:
+    rec, engine, launcher = _wire_main(monkeypatch, tmp_path, password=None)
+    assert launcher.main() == 1
+    assert rec["stopped"] == [] and rec["unit"] == []      # nothing was touched
+    assert rec["shutdown"] == []                           # no engine ever existed
+
+
+def test_main_first_run_still_works_with_fresh_flow(tmp_path, monkeypatch) -> None:
+    # Same shape as the pre-existing first-run test, adapted: no vault yet.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "d"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "c"))
+    import poseidon.gui as gui
     import poseidon.launcher as launcher
     from poseidon.security.vault import Vault
 
@@ -119,66 +261,107 @@ def test_main_first_run_creates_vault_then_starts_and_opens(tmp_path, monkeypatc
         def info(self, message: str) -> None: ...
         def error(self, message: str) -> None:
             raise AssertionError(f"unexpected error dialog: {message}")
+        def question(self, message: str) -> bool:
+            return False
         def password(self, prompt: str) -> str:
             return next(answers)
         def entry(self, prompt: str) -> str:
             return next(answers)
 
+    class FakeEngine:
+        pid = 901
+        def poll(self):  # noqa: ANN201
+            return None
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
     captured: dict[str, object] = {}
-
-    def fake_start(config, passphrase, dialog, url):  # noqa: ANN001, ANN202
-        captured["passphrase"] = passphrase
-        captured["url"] = url
-        return _FakeEngineProc()
-
-    launched: dict[str, object] = {}
     monkeypatch.setattr(launcher, "Dialog", FakeDialog)
     monkeypatch.setattr(launcher, "pick_dialog_backend", lambda which: "zenity")
-    monkeypatch.setattr(launcher, "_engine_up", lambda url: False)  # down -> must start it
-    monkeypatch.setattr(launcher, "_start_engine", fake_start)
-    monkeypatch.setattr(poseidon.gui, "launch",
-                        lambda url, token=None: (launched.update(url=url, token=token), 0)[1])
+    monkeypatch.setattr(launcher, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(launcher, "acquire_launcher_lock",
+                        lambda path, **kw: (path.parent.mkdir(parents=True, exist_ok=True),
+                                            path.open("a+", encoding="utf-8"))[1])  # noqa: SIM115
+    monkeypatch.setattr(launcher, "clear_running_engines",
+                        lambda config, dialog, url: True)
+    monkeypatch.setattr(launcher, "_start_engine",
+                        lambda config, passphrase, dialog, url:
+                            (captured.__setitem__("passphrase", passphrase), FakeEngine())[1])
+    monkeypatch.setattr(launcher, "_shutdown_engine", lambda proc, window, pidfile: None)
+    monkeypatch.setattr(gui, "open_app_window_blocking",
+                        lambda url, **kw: (captured.__setitem__("url", url), 0)[1])
 
     assert launcher.main() == 0
-    # The vault was really created in the tmp data dir, with the pasted key.
     vault = Vault(tmp_path / "d" / "poseidon" / "vault.bin")
     assert vault.exists
     vault.unlock("longpassword")
     assert vault.get("anthropic_api_key") == "sk-ant-key"
-    # The engine start got that same passphrase; the window opened on loopback.
     assert captured["passphrase"] == "longpassword"
     assert captured["url"] == "http://127.0.0.1:8321"
-    assert launched["url"] == "http://127.0.0.1:8321"
-    assert launched["token"] is None  # loopback default has no bearer token
 
 
-def test_main_engine_already_up_skips_setup_and_start(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "d"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "c"))
-    import poseidon.gui
+# ---- _shutdown_engine: idempotent teardown, in dependency order ----
+
+
+def test_shutdown_engine_reaps_window_then_engine_then_pidfile(tmp_path, monkeypatch) -> None:
     import poseidon.launcher as launcher
-    from poseidon.security.vault import Vault
+    from poseidon.proclife import ProcIdent
+    order: list[str] = []
 
-    Vault(tmp_path / "d" / "poseidon" / "vault.bin").create("longpassword")  # not first run
+    class FakeWindow:
+        def poll(self):  # noqa: ANN201
+            return None
+        def terminate(self) -> None:
+            order.append("window-term")
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            order.append("window-wait")
+            return 0
+        def kill(self) -> None:
+            order.append("window-kill")
 
-    class FakeDialog:
-        def __init__(self, backend: str) -> None: ...
-        def error(self, message: str) -> None:
-            raise AssertionError(f"unexpected error dialog: {message}")
+    class FakeEngine:
+        pid = 902
+        def poll(self):  # noqa: ANN201
+            return None
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
 
-    def no_start(*a, **k):  # noqa: ANN002, ANN003, ANN202
-        raise AssertionError("engine must not be started when it is already up")
+    monkeypatch.setattr(launcher, "_kill_own_engine",
+                        lambda proc, **kw: order.append("engine-stop"))
+    notified: list[str] = []
+    monkeypatch.setattr(launcher, "_notify", lambda *a: notified.append(a[0]))
+    pidfile = tmp_path / "engine.pid"
+    launcher.write_pidfile(pidfile, ProcIdent(pid=902, starttime=1))
+    launcher._shutdown_engine(FakeEngine(), FakeWindow(), pidfile)
+    assert order[0] == "window-term" and "engine-stop" in order
+    assert order.index("window-term") < order.index("engine-stop")
+    assert not pidfile.exists()
+    assert notified                                       # "Poseidon stopped."
 
-    launched: dict[str, object] = {}
-    monkeypatch.setattr(launcher, "Dialog", FakeDialog)
-    monkeypatch.setattr(launcher, "pick_dialog_backend", lambda which: "zenity")
-    monkeypatch.setattr(launcher, "_engine_up", lambda url: True)  # already running
-    monkeypatch.setattr(launcher, "_start_engine", no_start)
-    monkeypatch.setattr(poseidon.gui, "launch",
-                        lambda url, token=None: (launched.update(url=url), 0)[1])
 
-    assert launcher.main() == 0
-    assert launched["url"] == "http://127.0.0.1:8321"
+def test_shutdown_engine_none_is_noop(tmp_path) -> None:
+    import poseidon.launcher as launcher
+    launcher._shutdown_engine(None, None, tmp_path / "engine.pid")   # must not raise
+
+
+def test_shutdown_engine_keeps_foreign_pidfile(tmp_path, monkeypatch) -> None:
+    # pidfile now records a DIFFERENT engine (a takeover already restarted) —
+    # our cleanup must not delete someone else's record.
+    import poseidon.launcher as launcher
+    from poseidon.proclife import ProcIdent
+
+    class FakeEngine:
+        pid = 903
+        def poll(self):  # noqa: ANN201
+            return 0     # already dead
+        def wait(self, timeout=None):  # noqa: ANN001, ANN201
+            return 0
+
+    monkeypatch.setattr(launcher, "_kill_own_engine", lambda proc, **kw: None)
+    pidfile = tmp_path / "engine.pid"
+    launcher.write_pidfile(pidfile, ProcIdent(pid=999, starttime=7))
+    launcher._shutdown_engine(FakeEngine(), None, pidfile)
+    assert launcher.read_pidfile(pidfile) == ProcIdent(999, 7)
 
 
 # ---- process lifecycle: pid file, engine matcher, /proc scan ----
