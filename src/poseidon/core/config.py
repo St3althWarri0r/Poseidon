@@ -90,6 +90,20 @@ class AnalysisConfig(StrictModel):
     max_symbols_per_sweep: int = Field(default=8, ge=1)
 
 
+class SnapshotConfig(StrictModel):
+    """Deterministic snapshot enrichment + identity grounding (advisory text only).
+
+    ON by default — deliberate exception to ship-OFF: zero LLM cost, enriches
+    existing prompt surfaces (no new AI surface), every failure degrades to
+    explicit N/A/unresolved, and it only REMOVES hallucination room. The one new
+    tool is deterministic, read-only, on the same router as get_quote/get_bars.
+    """
+
+    bars_limit: int = Field(default=250, ge=50, le=500)  # daily bars (SMA200 needs 200)
+    closes_n: int = Field(default=20, ge=5, le=120)  # last-N closes listed verbatim
+    identity: bool = True  # resolve + inject instrument identity
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -113,6 +127,8 @@ class AIConfig(StrictModel):
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     # Advisory analyst-firm → debate packet (advisory; see AnalysisConfig).
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
+    # Deterministic snapshot enrichment + identity grounding (see SnapshotConfig).
+    snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses

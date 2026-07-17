@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from poseidon.ai.analysis_service import AnalysisService
 from poseidon.core.config import AnalysisConfig
+from poseidon.core.models import Quote
 from poseidon.storage.db import Database
 
 
@@ -25,15 +27,10 @@ class _Backend:
                      '"key_points":[],"data_gaps":[],"sources":[]}')
 
 
-class _Quote:
-    price = 190.1
-    as_of = datetime.now(UTC)
-    source = "fake"
-
-
 class _Router:
     async def quote(self, s, allow_delayed=True):
-        return _Quote()
+        return Quote(symbol="AAPL", last=Decimal("190.10"),
+                     as_of=datetime.now(UTC), source="fake")
 
     async def bars(self, s, timeframe="1d", limit=30):
         return []
