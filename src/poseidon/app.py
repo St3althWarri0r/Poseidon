@@ -186,6 +186,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -197,6 +198,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -267,7 +269,8 @@ class ApplicationKernel:
             # news/fundamentals retrieval fast-follow lands.
             scan=None,
             record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
-            over_budget=self._over_ai_budget)
+            over_budget=self._over_ai_budget,
+            snapshot_config=ai_cfg.snapshot)
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
