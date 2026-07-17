@@ -29,7 +29,15 @@ from ..core.errors import (
     ProviderError,
     StaleDataError,
 )
-from ..core.models import Bar, EarningsEvent, EconomicEvent, NewsArticle, OptionChain, Quote
+from ..core.models import (
+    Bar,
+    EarningsEvent,
+    EconomicEvent,
+    InstrumentProfile,
+    NewsArticle,
+    OptionChain,
+    Quote,
+)
 from .base import DataCapability, MarketDataProvider
 
 log = structlog.get_logger(__name__)
@@ -94,6 +102,9 @@ _SECTOR_TTL = 7 * 86400.0  # classifications change on index-rebalance timescale
 _SECTOR_NEGATIVE_TTL = 3600.0  # unknowns retry hourly (may be transient outage)
 _SECTOR_UNKNOWN = ""  # cached negative result (e.g. ETFs have no sector)
 
+_PROFILE_TTL = 7 * 86400.0  # instrument identity changes on corporate-action timescales
+_PROFILE_NEGATIVE_TTL = 3600.0  # unresolved retries hourly (may be transient outage)
+
 
 class DataRouter:
     def __init__(self, providers: list[tuple[MarketDataProvider, int]],
@@ -103,6 +114,7 @@ class DataRouter:
         )
         self._freshness = freshness
         self._sector_cache: dict[str, tuple[str, float]] = {}
+        self._profile_cache: dict[str, tuple[InstrumentProfile | None, float]] = {}
 
     @property
     def freshness(self) -> FreshnessPolicy:
@@ -223,6 +235,28 @@ class DataRouter:
             return None
         self._sector_cache[symbol] = (sector, time.monotonic())
         return sector
+
+    async def profile(self, symbol: str) -> InstrumentProfile | None:
+        """Resolved instrument identity, or None when no provider can resolve
+        the symbol. Like sector() this is slow-moving reference data, so
+        results are cached for a week and unresolved symbols retried hourly.
+        None means *unresolved*, never a guess — callers decide their own
+        policy (ticker-only identity downstream).
+        """
+        symbol = symbol.upper()
+        cached = self._profile_cache.get(symbol)
+        if cached is not None:
+            ttl = _PROFILE_TTL if cached[0] is not None else _PROFILE_NEGATIVE_TTL
+            if time.monotonic() - cached[1] < ttl:
+                return cached[0]
+        try:
+            prof = await self._route(DataCapability.PROFILE, lambda p: p.profile(symbol))
+        except (AllProvidersFailedError, DataUnavailableError) as exc:
+            log.info("profile unavailable", symbol=symbol, error=str(exc))
+            self._profile_cache[symbol] = (None, time.monotonic())
+            return None
+        self._profile_cache[symbol] = (prof, time.monotonic())
+        return prof
 
     # -- routing core -------------------------------------------------------------
 
