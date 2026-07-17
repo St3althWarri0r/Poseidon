@@ -14,12 +14,13 @@ from typing import Any
 
 import structlog
 
-from ..core.config import RiskConfig
+from ..core.config import RiskConfig, SnapshotConfig
 from ..core.errors import ConfigError, DataError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
 from ..risk.engine import RiskEngine
 from ..strategy.workshop import AlgorithmWorkshop
+from .analysis.snapshot import build_snapshot
 
 log = structlog.get_logger(__name__)
 
@@ -58,7 +59,8 @@ class ToolDispatcher:
     def __init__(self, router: DataRouter, portfolio: PortfolioState, risk: RiskEngine,
                  *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY",
                  risk_config: RiskConfig | None = None,
-                 workshop: AlgorithmWorkshop | None = None) -> None:
+                 workshop: AlgorithmWorkshop | None = None,
+                 snapshot_config: SnapshotConfig | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
@@ -66,6 +68,7 @@ class ToolDispatcher:
         self._benchmark = benchmark_symbol
         self._risk_config = risk_config or RiskConfig()
         self._workshop = workshop
+        self._snapshot_config = snapshot_config or SnapshotConfig()
         self.sources_used: set[str] = set()
 
     async def dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
@@ -164,6 +167,14 @@ class ToolDispatcher:
         for e in events[:1]:
             self.sources_used.add(e.source)
         return {"events": [e.model_dump(mode="json") for e in events]}
+
+    async def _tool_get_market_snapshot(self, symbol: str) -> dict[str, Any]:
+        snap = await build_snapshot(self._router, symbol, config=self._snapshot_config,
+                                    allow_delayed=self._allow_delayed)
+        if snap is None or snap.payload is None:
+            raise DataError(f"no live snapshot available for {symbol}")
+        self.sources_used.update(snap.sources)  # provenance → Decision.data_sources
+        return snap.payload
 
     # -- portfolio / risk tools -----------------------------------------------------
 
