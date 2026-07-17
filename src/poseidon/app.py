@@ -764,6 +764,8 @@ class ApplicationKernel:
                 packets = (await self.analysis.relevant_packets(
                     self.config.all_watchlist_symbols())
                     if self.analysis is not None else [])
+                identities = await self._instrument_identities(
+                    self.config.all_watchlist_symbols())
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -773,6 +775,7 @@ class ApplicationKernel:
                     market_regime=await self._regime_line(),
                     trade_lessons=lessons,
                     analysis_packets=packets,
+                    instrument_identities=identities,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -831,6 +834,24 @@ class ApplicationKernel:
 
     async def _risk_metrics_job(self) -> None:
         await self.refresh_risk_metrics()
+
+    async def _instrument_identities(self, symbols: list[str]) -> dict[str, str]:
+        """Resolved identity lines for the cycle prompt (design §3.5). Fails
+        open per symbol — an unresolved/erroring profile is simply omitted, so
+        this can never block or fail a review cycle. The router's weekly cache
+        makes it ≤1 HTTP call per symbol on the first cycle, free after."""
+        if not self.config.ai.snapshot.identity:
+            return {}
+        identities: dict[str, str] = {}
+        for sym in symbols:
+            try:
+                prof = await self.router.profile(sym)
+            except Exception:
+                continue
+            if prof is None:
+                continue
+            identities[sym] = f"{prof.name} ({prof.exchange}, {prof.asset_type})"
+        return identities
 
     async def _regime_line(self) -> str | None:
         """Regime summary for the cycle prompt. Uses the cached metrics when
