@@ -19,8 +19,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
+from poseidon.api.server import build_app
 from poseidon.app import ApplicationKernel
 from poseidon.core.config import AppConfig
 from poseidon.core.enums import (
@@ -786,3 +788,28 @@ async def test_audit_facts_chain(kernel_ctx) -> None:
     assert ok, f"audit chain broke at seq {bad_seq}"
     # A single loud critical summary notification was raised.
     assert any(n.get("level") == "critical" for n in kernel_ctx["notifies"])
+
+
+# -- test_api_halt_runs_cleanup ----------------------------------------------------
+
+async def test_api_halt_runs_cleanup(kernel_ctx, monkeypatch) -> None:
+    """POST /api/halt routes through ``kernel.halt`` (spec §8 task 8), so the
+    operator's dashboard HALT latches the breaker AND runs the cancel-all cleanup
+    — a resting order left live during a halt could fill mid-halt."""
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN", raising=False)
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN_FILE", raising=False)
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    order = await _seed_open(manager, symbol="AAPL", broker="fake")
+    app = build_app(kernel)
+
+    async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost") as c:
+        r = await c.post("/api/halt", json={"reason": "dashboard HALT"})
+
+    assert r.status_code == 200, r.text
+    # The latch stands…
+    assert risk.circuit.is_open is True
+    assert await kernel_ctx["db"].kv_get("circuit.manual_halt") == "dashboard HALT"
+    # …and cleanup ran: the resting order was canceled exactly once through the API.
+    assert broker.cancel_calls == [order.id]

@@ -23,13 +23,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
+from poseidon.api.server import build_app
 from poseidon.app import ApplicationKernel
 from poseidon.core.config import AppConfig
 from poseidon.core.enums import TradingMode
 from poseidon.core.events import EventBus, Topics
 from poseidon.execution.manager import OrderManager
+from poseidon.scheduler.scheduler import Scheduler
 from poseidon.security.audit import AuditLog
 from poseidon.security.vault import Vault
 from poseidon.storage.db import Database
@@ -269,3 +272,124 @@ async def test_set_mode_non_autonomous_clears_grant(kctx) -> None:
     # Cleared to "" (the circuit.manual_halt convention) — falsy, so the checker
     # treats it as absent.
     assert not await db.kv_get(_KEY)
+
+
+# ============================================================================
+# TDD task 8 — wiring: scheduler job + cycle-start + /api/mode (spec §5.4).
+# ============================================================================
+
+# -- test_job_registered_and_fires_without_ai --------------------------------------
+
+async def test_job_registered_and_fires_without_ai(kctx) -> None:
+    """The ``autonomy_expiry`` job is registered unconditionally and scheduled to
+    fire every 60 s with ``only_market_hours=False`` (spec §5.4 site 2) — it must
+    run overnight, with no AI, so a grant expiring while the market is closed still
+    reverts."""
+    kernel, manager, db, bus = (kctx["kernel"], kctx["manager"],
+                                kctx["db"], kctx["bus"])
+
+    # (1) _register_jobs wires the job. Stub the heavyweight deps it references so
+    # the pure registration call runs; capture the registered names.
+    registered: list[str] = []
+    recorder = MagicMock()
+    recorder.register_job = lambda name, job: registered.append(name)
+    kernel.scheduler = recorder
+    kernel.sync = MagicMock()
+    kernel.guardian = MagicMock()
+    kernel._register_jobs()
+    assert "autonomy_expiry" in registered
+
+    # (2) _effective_schedules registers it unconditionally, every 60 s, NOT
+    # market-hours gated (fires overnight).
+    scheds = kernel._effective_schedules()
+    auto = [s for s in scheds if s.job == "autonomy_expiry"]
+    assert len(auto) == 1, scheds
+    assert auto[0].only_market_hours is False
+    assert auto[0].every_seconds == 60
+    assert auto[0].enabled is True
+
+    # (3) firing the job through a real scheduler reverts an expired grant even
+    # though there is NO AI wired (agent is None — the checker never touches it).
+    assert kernel.agent is None
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    await db.kv_set(_KEY, past)
+    scheduler = Scheduler(kernel.clock, bus)
+    scheduler.register_job("autonomy_expiry", kernel._autonomy_expiry_job)
+    await scheduler.trigger_now("autonomy_expiry")
+    assert manager.mode is TradingMode.APPROVAL
+    assert any(n.get("level") == "critical" for n in kctx["notifies"])
+
+
+# -- test_cycle_start_checks_expiry ------------------------------------------------
+
+async def test_cycle_start_checks_expiry(kctx) -> None:
+    """The expiry checker is the FIRST statement inside ``run_review_cycle``'s
+    ``_cycle_lock`` (spec §5.4 site 3), so the cycle prompt sees the reverted
+    mode. Proven by expiring the grant, then short-circuiting the rest of the
+    cycle (over-budget) — the revert must still have landed."""
+    kernel, manager, db = kctx["kernel"], kctx["manager"], kctx["db"]
+    kernel.agent = MagicMock()  # non-None so run_review_cycle enters the lock body
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    await db.kv_set(_KEY, past)
+
+    # Short-circuit everything after the checker (which runs first): budget-hit
+    # returns before any strategy scan or agent call.
+    async def over_budget() -> bool:
+        return True
+
+    kernel._over_ai_budget = over_budget  # type: ignore[method-assign]
+
+    await kernel.run_review_cycle()
+
+    # The checker ran at the top of the cycle and reverted before the (skipped)
+    # AI work — the mode is APPROVAL, not AUTONOMOUS.
+    assert manager.mode is TradingMode.APPROVAL
+
+
+# -- test_api_mode_accepts_expires_in_hours ----------------------------------------
+
+async def test_api_mode_accepts_expires_in_hours(kctx, monkeypatch) -> None:
+    """POST /api/mode accepts an ``expires_in_hours`` bound alongside
+    ``mode=autonomous`` and threads it into ``set_mode`` → the durable consent
+    latch is stamped now+hours (spec §5.2 operator grant)."""
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN", raising=False)
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN_FILE", raising=False)
+    kernel, db = kctx["kernel"], kctx["db"]
+    app = build_app(kernel)
+
+    before = datetime.now(UTC)
+    async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost") as c:
+        r = await c.post("/api/mode",
+                         json={"mode": "autonomous", "expires_in_hours": 5})
+    after = datetime.now(UTC)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "autonomous"
+    stamped = await db.kv_get(_KEY)
+    assert stamped, "granting AUTONOMOUS with expires_in_hours must stamp a bound"
+    stamped_at = datetime.fromisoformat(stamped)
+    assert before + timedelta(hours=5) <= stamped_at <= after + timedelta(hours=5)
+    assert kernel.order_manager.mode is TradingMode.AUTONOMOUS
+
+
+# -- test_api_mode_accepts_explicit_expires_at (the complementary parse branch) ----
+
+async def test_api_mode_accepts_explicit_expires_at(kctx, monkeypatch) -> None:
+    """POST /api/mode also accepts an explicit ISO ``expires_at`` bound, which
+    wins over any configured ttl (spec §5.2)."""
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN", raising=False)
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN_FILE", raising=False)
+    kernel, db = kctx["kernel"], kctx["db"]
+    kernel.config.risk.autonomous_ttl_hours = 2  # a default ttl exists…
+    explicit = datetime.now(UTC) + timedelta(days=3)  # …but the operator names one
+    app = build_app(kernel)
+
+    async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost") as c:
+        r = await c.post("/api/mode",
+                         json={"mode": "autonomous",
+                               "expires_at": explicit.isoformat()})
+
+    assert r.status_code == 200, r.text
+    assert datetime.fromisoformat(await db.kv_get(_KEY)) == explicit

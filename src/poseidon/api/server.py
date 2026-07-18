@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -318,7 +319,36 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             mode = TradingMode(str(body.get("mode", "")))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="mode must be research|approval|autonomous") from exc
-        await kernel.set_mode(mode)
+        # Optional consent bound (control-hardening spec §5.2), accepted ONLY with
+        # mode=autonomous: an explicit ISO ``expires_at`` wins over ``expires_in_
+        # hours`` (now+hours). Threaded into set_mode, which stamps the durable
+        # ``mode.autonomous_expires_at`` latch. A non-autonomous mode carries no
+        # bound (leaving AUTONOMOUS consumes any grant).
+        expires_at: datetime | None = None
+        has_bound = body.get("expires_at") is not None or body.get("expires_in_hours") is not None
+        if has_bound:
+            if mode is not TradingMode.AUTONOMOUS:
+                raise HTTPException(
+                    status_code=422,
+                    detail="expires_at/expires_in_hours are only valid with mode=autonomous")
+            raw_at = body.get("expires_at")
+            if raw_at is not None:
+                try:
+                    expires_at = datetime.fromisoformat(str(raw_at))
+                except (ValueError, TypeError) as exc:
+                    raise HTTPException(
+                        status_code=422, detail="expires_at must be an ISO-8601 timestamp") from exc
+            else:
+                try:
+                    hours = float(body["expires_in_hours"])
+                except (ValueError, TypeError) as exc:
+                    raise HTTPException(
+                        status_code=422, detail="expires_in_hours must be a number") from exc
+                if hours <= 0:
+                    raise HTTPException(
+                        status_code=422, detail="expires_in_hours must be > 0")
+                expires_at = datetime.now(UTC) + timedelta(hours=hours)
+        await kernel.set_mode(mode, expires_at=expires_at)
         return JSONResponse({"ok": True, "mode": mode.value})
 
     @app.post("/api/halt")

@@ -651,6 +651,8 @@ class ApplicationKernel:
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
+        # Consent-bound expiry: fires overnight, no AI needed (spec §5.4 site 2).
+        self.scheduler.register_job("autonomy_expiry", self._autonomy_expiry_job)
         if self.analysis is not None:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
         if self.strategy_health is not None:
@@ -694,6 +696,13 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="risk-metrics", job="risk_metrics",
                                every_seconds=900, only_market_hours=True)
+            )
+        if not any(s.job == "autonomy_expiry" and s.enabled for s in schedules):
+            # Unconditional + NOT market-hours gated: an autonomy grant that
+            # lapses overnight must still revert (spec §5.4 site 2).
+            schedules.append(
+                ScheduleConfig(name="autonomy-expiry", job="autonomy_expiry",
+                               every_seconds=60, only_market_hours=False)
             )
         if self.config.ai.analysis.enabled and not any(
             s.job == "analysis_sweep" and s.enabled for s in schedules
@@ -755,6 +764,10 @@ class ApplicationKernel:
             log.info("review cycle already running; skipping")
             return
         async with self._cycle_lock:
+            # First statement under the lock (spec §5.4 site 3): a lapsed autonomy
+            # grant reverts AUTONOMOUS -> APPROVAL BEFORE the agent runs, so the
+            # cycle prompt (and every order it produces) sees the reverted mode.
+            await self._check_autonomy_expiry()
             if await self._over_ai_budget():
                 log.warning("monthly AI budget reached; skipping review cycle")
                 await self.bus.publish(Topics.NOTIFY, {
@@ -1238,6 +1251,12 @@ class ApplicationKernel:
         })
         log.warning("autonomous mode expired; reverted to approval", expires_at=raw)
         return True
+
+    async def _autonomy_expiry_job(self) -> None:
+        """Scheduler entry point for the consent-bound expiry check (spec §5.4
+        site 2). A thin ``-> None`` wrapper so the scheduler's ``Job`` type is
+        satisfied; the bool return of the checker is irrelevant to a tick."""
+        await self._check_autonomy_expiry()
 
     async def _init_autonomy_expiry(self) -> None:
         """Startup consent-bound handling (control-hardening spec §5.2 startup +
