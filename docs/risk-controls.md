@@ -93,6 +93,28 @@ else: session checks, notional bounds, slippage protection, duplicate
 prevention, and the circuit breaker. `sell_to_open` (opening short option
 risk) is deliberately **not** exempt.
 
+### Asset-class exemptions (crypto)
+
+Crypto orders (`BASE/USD`, e.g. `BTC/USD`) pass the **full** risk engine with
+exactly **two** exemptions, both category corrections rather than relaxations:
+
+- **`market_session`** — spot crypto trades 24/7, so the regular-session gate
+  does not apply. (`MarketOpenRule` already skips crypto.)
+- **`min_volume`** — `min_avg_volume` is a *share*-count floor (default
+  100,000). Crypto `Bar.volume` is denominated in *coins*: BTC trades tens of
+  thousands of coins/day (~$30B notional) yet would fail a 100k-*share* floor.
+  Applying a share count to a coin count is a category error, so the volume
+  floor is skipped for crypto — liquidity stays gated by `max_spread` and
+  `slippage_protection`, which use spread % and are asset-class-neutral.
+
+**Everything else applies to crypto unchanged:** notional/position/exposure/
+leverage caps, buying power, `volatility_halt` (crypto is volatile — kept),
+cooldown, orders-per-day, the daily/weekly/drawdown loss halts, VaR, the
+economic blackout, the circuit breaker, and `fresh_portfolio_state`. In
+particular a whole-BTC buy above `max_order_notional` is *correctly* rejected
+(size fractionally). Crypto is **not** exempt from the reduce-only guard — the
+platform still never opens a short crypto position.
+
 ### Dedicated sleeves
 
 An algorithm can be given a **capital sleeve** (a fraction of equity, set

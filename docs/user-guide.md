@@ -168,7 +168,20 @@ trade ticket places your own orders — equities, market/limit/stop, day or
 GTC, extended hours — with a live freshness-graded quote beside the form.
 Manual orders take the exact pipeline AI orders take: **every risk rule**,
 duplicate prevention, broker preflight, lifecycle polling, TCA slippage
-capture, and the audit log (actor: `human`). Two deliberate differences:
+capture, and the audit log (actor: `human`).
+
+**Crypto.** Enter a spot crypto pair with a slash — `BASE/USD`, e.g.
+`BTC/USD` or `ETH/USD` — and the ticket handles the rest: the symbol is
+auto-tagged as crypto (no asset-class picker needed), quoted 24/7, and
+fractional sizes (e.g. `0.05 BTC`) are allowed. Crypto orders clear the full
+risk engine with only two exemptions — the market-hours gate (crypto trades
+around the clock) and the equity share-count volume floor; see
+docs/risk-controls.md. Crypto is **paper-only** today and needs a crypto-capable
+data provider configured (enable `alpaca` — see docs/api-configuration.md);
+only `BASE/USD` pairs are supported (a stablecoin pair like `BTC/USDT` is
+rejected with a clear message).
+
+Two deliberate differences:
 there is no approval queue (you are the approver), and research mode still
 refuses — research means no orders from anyone. Your fills sync into the
 portfolio like any others, so Claude sees and manages around them on the

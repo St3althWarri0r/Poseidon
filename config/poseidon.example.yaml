@@ -99,6 +99,9 @@ data:
     # reusing the same `alpaca_keys` broker credential. The simplest way to get
     # quotes fresh enough to clear real_time_max_age_seconds for live trading
     # (the free finnhub/twelvedata/alphavantage tiers are too delayed for it).
+    # Also the crypto source: enabling it advertises the `crypto` capability, so
+    # spot BASE/USD pairs (e.g. BTC/USD) can be quoted 24/7 — needed for crypto
+    # paper trading (see docs/api-configuration.md). No extra entitlement.
     # Credential is JSON: {"key_id": "...", "secret_key": "..."}
     # - name: alpaca
     #   credential: alpaca_keys
@@ -116,6 +119,9 @@ data:
 
 brokers:
   # Built-in paper broker — fills priced from live quotes; ideal first setup.
+  # Supports equities (fractional) and spot crypto (BASE/USD, e.g. BTC/USD).
+  # Crypto needs a crypto-capable data provider (enable `alpaca` data above)
+  # and is paper-only for now; live crypto is a documented follow-on.
   - name: paper
     enabled: true
     primary: true
