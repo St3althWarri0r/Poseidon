@@ -282,6 +282,14 @@ class ResearchConfig(StrictModel):
     horizons: list[int] = Field(default_factory=lambda: [1, 5, 10, 20])  # IC-decay profile
     min_cross: int = Field(default=5, ge=1)  # minimum cross-sectional names per sample date
     lookback_days: int = Field(default=400, ge=1)  # default history window when unset by --days
+    # Random-control null + honest-verdict knobs (design §4.7). Seeds/threshold/groups are
+    # config-only (no CLI flag); train_frac is also settable per-run via --train-frac.
+    null_seeds: int = Field(default=5, ge=1)  # within-date score permutations per date
+    null_base_seed: int = 42  # explicit seed base — never wall-clock; runs stay byte-identical
+    train_frac: float = Field(default=0.0, ge=0, lt=1)  # 0 disables the chronological OOS split
+    alpha_t_threshold: float = Field(default=2.0, gt=0)  # HLZ: prefer 3.5 for whole-library scans
+    verdict_min_n_eff: int = Field(default=10, ge=2)  # below this -> verdict "insufficient_data"
+    n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
 class AppConfig(StrictModel):

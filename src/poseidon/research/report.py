@@ -8,7 +8,9 @@ from dataclasses import dataclass
 
 from ..core.models import Bar
 from .factors import Factor
-from .ic import ICResult, evaluate_factor
+from .ic import ICResult, NullSpec, evaluate_factor
+
+_DEFAULT_NULL = NullSpec()
 
 _THIN_UNIVERSE = 20     # cross-sectional IC below this many names is very noisy
 
@@ -41,9 +43,11 @@ class FactorReport:
 
 
 def run_report(factors: list[Factor], history: dict[str, list[Bar]], *, horizon: int,
-               rebalance_every: int, horizons: list[int], min_cross: int = 5) -> FactorReport:
+               rebalance_every: int, horizons: list[int], min_cross: int = 5,
+               null: NullSpec = _DEFAULT_NULL) -> FactorReport:
     results = [evaluate_factor(f, history, horizon=horizon, rebalance_every=rebalance_every,
-                               horizons=horizons, min_cross=min_cross) for f in factors]
+                               horizons=horizons, min_cross=min_cross, null=null)
+               for f in factors]
     results.sort(key=lambda r: abs(r.t_stat), reverse=True)
     size = len(history)
     breadths = [r.breadth for r in results if r.n_periods > 0]
