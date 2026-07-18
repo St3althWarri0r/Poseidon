@@ -6,6 +6,7 @@ See docs/superpowers/specs/2026-07-17-broker-toggle-design.md.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -15,7 +16,7 @@ import pytest
 from poseidon.app import ApplicationKernel
 from poseidon.brokers.base import Broker
 from poseidon.core.config import AppConfig, BrokerConfig
-from poseidon.core.enums import BrokerCapability
+from poseidon.core.enums import BrokerCapability, TradingMode
 from poseidon.core.models import AccountSnapshot, Order, Position
 from poseidon.security.vault import Vault
 
@@ -193,3 +194,144 @@ async def test_connection_test_reuses_saved_env_credential(
     result = await kernel.broker_connection_test("alpaca", paper=paper, credentials=None)
     assert result["account_id"] == expect_account_id
     assert result["paper"] is paper
+
+
+# --------------------------------------------- server-side live-switch guard
+#
+# The single choke point is ``ApplicationKernel.switch_broker``. Arming
+# AUTONOMOUS real-money trading must never happen by a mis-click: activating a
+# LIVE broker while the mode is AUTONOMOUS is demoted to APPROVAL server-side
+# (audited ``mode.changed``), so the operator has to deliberately re-arm. The
+# clamp is DEMOTION-ONLY — it never raises autonomy (RESEARCH/APPROVAL stay
+# put) — and switching to a PAPER account never touches the mode. Because it
+# lives in switch_broker (not the endpoint), no HTTP path can bypass it.
+
+
+@pytest.fixture
+async def wired(tmp_path, monkeypatch):
+    """Factory building a minimally-but-really-wired kernel whose
+    ``switch_broker`` runs end to end over the fake Alpaca broker, so the guard
+    is exercised in its true home. ``make(mode)`` returns a kernel started in
+    that TradingMode with both env keys seeded and ``create_broker`` faked;
+    ``audits`` captures every ``(actor, action, payload)`` the switch records.
+    """
+    from poseidon.core.clock import FreshnessPolicy, MarketClock
+    from poseidon.core.config import RiskConfig
+    from poseidon.data.router import DataRouter
+    from poseidon.execution.approvals import ApprovalQueue
+    from poseidon.execution.manager import OrderManager
+    from poseidon.portfolio.sync import PortfolioSyncService
+    from poseidon.risk.engine import RiskEngine
+    from poseidon.security.audit import AuditLog
+    from poseidon.storage.db import Database
+
+    from ..conftest import FakeProvider
+
+    monkeypatch.setattr("poseidon.app.create_broker", _fake_create_broker)
+    audits: list[tuple[str, str, dict]] = []
+    built: list[tuple[ApplicationKernel, object]] = []
+
+    async def make(mode: TradingMode) -> ApplicationKernel:
+        cfg = AppConfig(data_dir=tmp_path)
+        cfg.config_path = tmp_path / "poseidon.yaml"
+        kernel = ApplicationKernel(cfg, Vault(tmp_path / "v.bin"))
+        _seed_alpaca_keys(kernel)
+        db = Database(tmp_path / "toggle.db")
+        await db.open()
+        audit = AuditLog(db)
+        real_append = audit.append
+
+        async def spy(actor, action, payload=None):
+            audits.append((actor, action, payload or {}))
+            return await real_append(actor, action, payload)
+
+        audit.append = spy  # type: ignore[method-assign]
+        router = DataRouter([(FakeProvider(name="feed"), 10)], FreshnessPolicy())
+        risk = RiskEngine(RiskConfig(news_blackout_minutes_before_econ=0),
+                          kernel.portfolio, router, kernel.clock, kernel.bus)
+        approvals = ApprovalQueue(kernel.bus)
+        # Start on the alpaca PAPER account so a live switch is the interesting
+        # transition; a non-PaperBroker start keeps switch_broker off its
+        # simulator-only branches.
+        start_broker = _RecordingBroker(
+            credentials={"key_id": "PKPAPER"}, paper=True, options={})
+        await start_broker.connect()
+        kernel.db = db
+        kernel.audit = audit
+        kernel.router = router
+        kernel.risk = risk
+        kernel.approvals = approvals
+        kernel.broker = start_broker
+        kernel.order_manager = OrderManager(
+            start_broker, risk, approvals, db, audit, kernel.bus, mode=mode)
+        kernel.sync = PortfolioSyncService(
+            start_broker, kernel.portfolio, kernel.bus, db, MarketClock())
+        built.append((kernel, db))
+        return kernel
+
+    yield make, audits
+
+    for _kernel_obj, db in built:
+        await db.close()
+    for _kernel_obj, _db in built:
+        with contextlib.suppress(Exception):
+            await _kernel_obj.bus.close()
+
+
+def _mode_changes(audits: list[tuple[str, str, dict]]) -> list[dict]:
+    return [payload for _actor, action, payload in audits if action == "mode.changed"]
+
+
+async def test_live_switch_from_autonomous_demotes_to_approval(wired) -> None:
+    """AUTONOMOUS + activate LIVE ⇒ mode drops to APPROVAL with a ``mode.changed``
+    audit (autonomous→approval). A mis-click can never leave real money armed."""
+    make, audits = wired
+    kernel = await make(TradingMode.AUTONOMOUS)
+    result = await kernel.switch_broker("alpaca", paper=False, credentials=None)
+    assert result["paper"] is False
+    assert kernel.order_manager.mode is TradingMode.APPROVAL
+    changes = _mode_changes(audits)
+    assert changes == [{"from": "autonomous", "to": "approval"}]
+
+
+async def test_paper_switch_from_autonomous_leaves_mode(wired) -> None:
+    """Activating a PAPER account never clamps the mode — AUTONOMOUS stays, no
+    ``mode.changed`` is written."""
+    make, audits = wired
+    kernel = await make(TradingMode.AUTONOMOUS)
+    result = await kernel.switch_broker("alpaca", paper=True, credentials=None)
+    assert result["paper"] is True
+    assert kernel.order_manager.mode is TradingMode.AUTONOMOUS
+    assert _mode_changes(audits) == []
+
+
+@pytest.mark.parametrize("mode", [TradingMode.RESEARCH, TradingMode.APPROVAL])
+async def test_live_switch_never_raises_autonomy(wired, mode) -> None:
+    """Demotion-only: a LIVE activation must never RAISE the mode. RESEARCH and
+    APPROVAL are left exactly as they were, with no ``mode.changed``."""
+    make, audits = wired
+    kernel = await make(mode)
+    await kernel.switch_broker("alpaca", paper=False, credentials=None)
+    assert kernel.order_manager.mode is mode
+    assert _mode_changes(audits) == []
+
+
+async def test_live_guard_fires_through_connect_endpoint(wired) -> None:
+    """The guard is unbypassable via HTTP: a credential-less
+    ``POST /api/brokers/connect {name:"alpaca", paper:false}`` on an AUTONOMOUS
+    kernel demotes the mode to APPROVAL through the real ASGI app."""
+    import httpx
+
+    from poseidon.api.server import build_app
+
+    make, _audits = wired
+    kernel = await make(TradingMode.AUTONOMOUS)
+    app = build_app(kernel)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://127.0.0.1") as client:
+        resp = await client.post("/api/brokers/connect",
+                                 json={"name": "alpaca", "paper": False})
+    assert resp.status_code == 200
+    assert resp.json()["broker"]["paper"] is False
+    assert kernel.order_manager.mode is TradingMode.APPROVAL

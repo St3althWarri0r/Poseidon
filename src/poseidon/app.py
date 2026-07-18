@@ -522,6 +522,15 @@ class ApplicationKernel:
         except Exception as exc:
             log.warning("first sync after broker switch failed; sync loop will retry",
                         error=str(exc))
+        if not new_broker.is_paper and self.order_manager.mode is TradingMode.AUTONOMOUS:
+            # A real-money account just went active while armed for autonomous
+            # trading. Demote to APPROVAL server-side so a mis-click (or any
+            # HTTP caller) can never auto-execute real money — the operator must
+            # deliberately re-arm Autonomous. Demotion-only: RESEARCH/APPROVAL
+            # are never raised, and a paper switch never clamps the mode.
+            # set_mode() writes the mode.changed audit record; runs before the
+            # notify build below so the notification's mode string is accurate.
+            await self.set_mode(TradingMode.APPROVAL)
         display = new_broker.display_name or new_broker.name
         await self.bus.publish(Topics.NOTIFY, {
             "level": "info" if new_broker.is_paper else "warning",

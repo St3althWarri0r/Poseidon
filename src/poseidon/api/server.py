@@ -633,8 +633,11 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     @app.post("/api/brokers/connect")
     async def broker_connect(body: dict[str, Any]) -> JSONResponse:
         """Store credentials in the vault, persist the choice, and hot-swap
-        the active broker. The trading mode is untouched — connecting a live
-        account in research mode still cannot place an order."""
+        the active broker. Activating a LIVE account while the mode is
+        AUTONOMOUS demotes it to APPROVAL server-side (in switch_broker, the
+        single choke point) so a mis-click can never arm autonomous real-money
+        trading; RESEARCH/APPROVAL and paper switches leave the mode untouched.
+        Either way, no connect can itself place an order."""
         name, paper, credentials, options = _broker_request(body)
         try:
             result = await kernel.switch_broker(
