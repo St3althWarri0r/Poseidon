@@ -20,6 +20,7 @@ Safety invariants pinned here (spec §5.3, §7.7):
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -140,6 +141,51 @@ async def test_already_approval_is_noop_no_duplicate_notify(kctx) -> None:
     assert await kernel._check_autonomy_expiry() is False
     assert manager.mode is TradingMode.APPROVAL
     assert len(kctx["notifies"]) == 1
+    assert _actions(audit_calls).count("mode.autonomy_expired") == 1
+
+
+# -- test_concurrent_expiry_checks_revert_once -------------------------------------
+
+async def test_concurrent_expiry_checks_revert_once(kctx) -> None:
+    """The scheduler job and the cycle-start hook can fire the checker CONCURRENTLY.
+    Both pass the top AUTONOMOUS guard and both await ``db.kv_get`` before either
+    reverts; without the post-kv_get re-assert both revert and publish a DUPLICATE
+    critical NOTIFY. The fix makes the revert + notification land EXACTLY once (mode
+    still ends APPROVAL) — the loser observes APPROVAL after its await and bails."""
+    kernel, manager, db = kctx["kernel"], kctx["manager"], kctx["db"]
+    audit_calls = _spy_audit(kctx["audit"])
+    past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    await db.kv_set(_KEY, past)
+
+    # Force a real interleave AT the kv_get await: hold BOTH callers inside kv_get
+    # — both already past the top guard while mode is still AUTONOMOUS — until both
+    # have arrived, then release. This deterministically opens the race window the
+    # fix must close, independent of the DB's own scheduling.
+    real_kv_get = db.kv_get
+    both_inside = asyncio.Semaphore(0)
+    arrivals = 0
+
+    async def gated_kv_get(key):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals >= 2:  # the second caller unblocks both
+            both_inside.release()
+            both_inside.release()
+        await both_inside.acquire()
+        return await real_kv_get(key)
+
+    db.kv_get = gated_kv_get  # type: ignore[method-assign]
+
+    results = await asyncio.gather(
+        kernel._check_autonomy_expiry(),
+        kernel._check_autonomy_expiry(),
+    )
+
+    # Exactly one revert, one audit fact, one critical NOTIFY — never two.
+    assert manager.mode is TradingMode.APPROVAL
+    assert results.count(True) == 1 and results.count(False) == 1
+    criticals = [n for n in kctx["notifies"] if n.get("level") == "critical"]
+    assert len(criticals) == 1, criticals
     assert _actions(audit_calls).count("mode.autonomy_expired") == 1
 
 
@@ -371,6 +417,28 @@ async def test_api_mode_accepts_expires_in_hours(kctx, monkeypatch) -> None:
     stamped_at = datetime.fromisoformat(stamped)
     assert before + timedelta(hours=5) <= stamped_at <= after + timedelta(hours=5)
     assert kernel.order_manager.mode is TradingMode.AUTONOMOUS
+
+
+# -- test_api_mode_rejects_non_finite_expires_in_hours -----------------------------
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "nan"])
+async def test_api_mode_rejects_non_finite_expires_in_hours(kctx, monkeypatch, bad) -> None:
+    """A non-finite ``expires_in_hours`` — ``inf``/``nan``, which ``float()`` accepts
+    from a JSON string — must be a clean 422, never a 500: without the isfinite
+    guard ``timedelta(hours=inf)`` raises deep in the handler (spec §5.2 input
+    validation). The rejected grant must never touch the durable latch."""
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN", raising=False)
+    monkeypatch.delenv("POSEIDON_DASHBOARD_TOKEN_FILE", raising=False)
+    kernel, db = kctx["kernel"], kctx["db"]
+    app = build_app(kernel)
+
+    async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost") as c:
+        r = await c.post("/api/mode",
+                         json={"mode": "autonomous", "expires_in_hours": bad})
+
+    assert r.status_code == 422, r.text
+    assert not await db.kv_get(_KEY), "a rejected grant must not stamp the latch"
 
 
 # -- test_api_mode_accepts_explicit_expires_at (the complementary parse branch) ----

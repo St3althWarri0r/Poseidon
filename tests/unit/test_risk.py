@@ -13,7 +13,14 @@ from poseidon.core.config import RiskConfig
 from poseidon.core.enums import AssetClass, OrderSide, OrderType
 from poseidon.core.errors import CircuitBreakerOpen, RiskViolation
 from poseidon.core.events import EventBus
-from poseidon.core.models import AccountSnapshot, Bar, EconomicEvent, Order, Position
+from poseidon.core.models import (
+    AccountSnapshot,
+    Bar,
+    EconomicEvent,
+    OptionLeg,
+    Order,
+    Position,
+)
 from poseidon.data.router import DataRouter
 from poseidon.portfolio.state import PortfolioState
 from poseidon.risk.circuit import CircuitBreaker, TradeCooldowns
@@ -429,6 +436,35 @@ class TestHaltFlattenWindow:
         with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
             quote = await risk.validate_order(self._sell(), halt_token=token)
         assert quote is not None
+
+    async def test_open_breaker_rejects_normal_order(self) -> None:
+        # The single load-bearing invariant, pinned directly (elsewhere only
+        # transitively covered): a tripped breaker rejects EVERY order that
+        # presents no halt token — even a risk-reducing exit, the exact shape the
+        # carve-out admits WITH a live token. Passing nothing (halt_token defaults
+        # None) short-circuits the window entirely, so the breaker gate stands.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._sell())
+
+    async def test_valid_token_never_admits_multi_leg(self) -> None:
+        # A live token on a risk-reducing exit that carries legs is STILL rejected:
+        # halt_exit_permitted's ``and not order.legs`` clause bars any multi-leg
+        # order from the carve-out. Identical to the admitted reduce-only exit above
+        # but for the legs, so this isolates that clause — a stolen token can never
+        # smuggle a multi-leg (e.g. spread-opening) order past a tripped breaker.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window()
+        multi_leg = Order(
+            symbol="HELD", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+            quantity=Decimal("10"), limit_price=Decimal("100"),
+            legs=[OptionLeg(contract_symbol="HELD_C1",
+                            side=OrderSide.SELL_TO_CLOSE, quantity=1)],
+        )
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(multi_leg, halt_token=token)
 
 
 class TestCircuitBreaker:

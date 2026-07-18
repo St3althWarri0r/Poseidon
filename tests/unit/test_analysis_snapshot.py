@@ -64,6 +64,19 @@ class _RouterNoProfile:
         return []
 
 
+class _RecordingProfileRouter(_RouterNoProfile):
+    """Counts profile() calls so a test can assert the lookup was SKIPPED, not
+    merely swallowed — build_snapshot fail-opens on a profile exception, so a fake
+    that raises would let a removed ``if cfg.identity:`` guard pass unnoticed."""
+
+    def __init__(self) -> None:
+        self.profile_calls = 0
+
+    async def profile(self, symbol: str) -> InstrumentProfile | None:
+        self.profile_calls += 1
+        return _profile()
+
+
 async def test_snapshot_pins_price() -> None:
     snap = await build_snapshot(_Router(), "AAPL")
     assert isinstance(snap, Snapshot)
@@ -202,3 +215,47 @@ async def test_payload_structure_sources_and_note() -> None:
     assert p["sources"] == ["fake", "barsrc", "finnhub"]
     assert set(p["indicators"]) == {"sma50", "sma200", "ema10", "macd", "rsi14",
                                     "bollinger", "atr14"}
+
+
+async def test_identity_false_skips_profile_lookup_entirely() -> None:
+    # SnapshotConfig(identity=False) must SKIP the profile lookup (the `if
+    # cfg.identity:` guard), not just discard its result. A call-recording fake
+    # proves 0 calls; because build_snapshot fail-opens on a profile exception, a
+    # raising fake would NOT catch a removed guard — a counter does.
+    router = _RecordingProfileRouter()
+    snap = await build_snapshot(router, "AAPL", config=SnapshotConfig(identity=False))
+    assert snap is not None
+    assert router.profile_calls == 0
+    assert "identity: unresolved — ticker AAPL only" in snap.text
+    assert snap.payload is not None
+    assert snap.payload["identity"]["resolved"] is False
+
+    # Positive control: with identity ON (default) the SAME recorder IS consulted,
+    # so the assertion above is not vacuously true from a never-wired lookup.
+    router_on = _RecordingProfileRouter()
+    snap_on = await build_snapshot(router_on, "AAPL")
+    assert snap_on is not None
+    assert router_on.profile_calls == 1
+    assert "identity: Apple Inc" in snap_on.text
+
+
+async def test_high_precision_money_renders_verbatim() -> None:
+    # Guards the display path against a lossy f"{x:.2f}"/float() regression: a last
+    # of 190.105 and a close of 101.1234 both round or truncate under any 2-dp or
+    # binary-float path, so str(Decimal) is the only rendering that keeps them exact.
+    bar = Bar(symbol="AAPL", open=Decimal("100.50"), high=Decimal("102.00"),
+              low=Decimal("99.00"), close=Decimal("101.1234"), volume=1234,
+              start=datetime(2026, 1, 1, tzinfo=UTC),
+              end=datetime(2026, 1, 2, tzinfo=UTC), source="barsrc")
+    snap = await build_snapshot(
+        _Router(quote=_quote("190.105"), bars=[bar]), "AAPL")
+    assert snap is not None
+    # Verbatim in the cited text …
+    assert "190.105" in snap.text
+    assert "101.1234" in snap.text
+    # … and in the structured payload — never a rounded string or a float.
+    assert snap.payload is not None
+    assert snap.payload["quote"]["last"] == "190.105"
+    assert snap.payload["latest_bar"]["close"] == "101.1234"
+    assert snap.payload["closes"]["values"] == ["101.1234"]
+    assert snap.payload["range_30d"] == {"low": "101.1234", "high": "101.1234"}

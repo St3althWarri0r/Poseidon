@@ -1241,6 +1241,15 @@ class ApplicationKernel:
                 return False
         except (ValueError, TypeError):
             pass  # unparseable -> expired (fail-safe), fall through to revert
+        # Re-assert AUTONOMOUS after the kv_get await: the scheduler job and the
+        # cycle-start hook can BOTH pass the top guard, both await kv_get, and both
+        # reach here — without this a second caller reverts again and publishes a
+        # DUPLICATE critical NOTIFY. This check and the synchronous set_mode below
+        # run with no await between them, so only the first caller mutates; any
+        # concurrent caller now observes APPROVAL and bails. The revert stays
+        # idempotent; mode still always ends APPROVAL.
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
         # Direct set_mode: leave the kv latch in place (see docstring).
         self.order_manager.set_mode(TradingMode.APPROVAL)
         await self.audit.append("system", "mode.autonomy_expired", {"expires_at": raw})

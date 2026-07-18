@@ -97,6 +97,13 @@ _FLATTEN_LIVE_STATUSES = frozenset({
     OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
 })
 
+# The live-at-broker statuses ``cancel_all_open`` sweeps, derived from the single
+# source of truth ``OrderStatus.is_open_at_broker`` so the cancel query and the
+# enum predicate can never drift (control-hardening spec §3.2).
+_OPEN_AT_BROKER_STATUSES: tuple[str, ...] = tuple(
+    s.value for s in OrderStatus if s.is_open_at_broker
+)
+
 
 @dataclass(frozen=True)
 class FlattenSummary:
@@ -800,10 +807,10 @@ class OrderManager:
                                      {"phase": "cancel_all_open",
                                       "error": "broker switch in progress — cleanup aborted"})
             return summary
+        placeholders = ", ".join("?" * len(_OPEN_AT_BROKER_STATUSES))
         rows = await self._db.fetch_all(
-            "SELECT payload FROM orders WHERE status IN (?, ?, ?)",
-            (OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
-             OrderStatus.PARTIALLY_FILLED.value),
+            f"SELECT payload FROM orders WHERE status IN ({placeholders})",
+            _OPEN_AT_BROKER_STATUSES,
         )
         for (payload,) in rows:
             order = Order.model_validate(json.loads(payload))

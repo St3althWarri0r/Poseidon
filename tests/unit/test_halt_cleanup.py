@@ -37,7 +37,11 @@ from poseidon.core.enums import (
 from poseidon.core.errors import BrokerError, CircuitBreakerOpen, RiskViolation
 from poseidon.core.events import EventBus, Topics
 from poseidon.core.models import Order, Position
-from poseidon.execution.manager import HaltCleanupSummary, OrderManager
+from poseidon.execution.manager import (
+    _OPEN_AT_BROKER_STATUSES,
+    HaltCleanupSummary,
+    OrderManager,
+)
 from poseidon.risk.rules import reduce_only_breach
 from poseidon.security.audit import AuditLog
 from poseidon.security.vault import Vault
@@ -131,6 +135,21 @@ async def test_cancels_each_open_order_once(harness) -> None:
     for order in (a, b, c):
         row = await harness["db"].fetch_one("SELECT status FROM orders WHERE id = ?", (order.id,))
         assert row[0] == OrderStatus.CANCELED.value
+
+
+# -- test_open_at_broker_statuses_derive_from_enum ---------------------------------
+
+def test_open_at_broker_statuses_derive_from_enum() -> None:
+    # cancel_all_open's live-status IN-list is derived from the single source of
+    # truth OrderStatus.is_open_at_broker, not a hardcoded literal, so the query and
+    # the enum predicate can never drift (spec §3.2). It stays exactly the three
+    # broker-live states, and nothing terminal can leak into a cancel sweep.
+    assert set(_OPEN_AT_BROKER_STATUSES) == {
+        OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
+        OrderStatus.PARTIALLY_FILLED.value,
+    }
+    assert all(OrderStatus(s).is_open_at_broker for s in _OPEN_AT_BROKER_STATUSES)
+    assert not any(OrderStatus(s).is_terminal for s in _OPEN_AT_BROKER_STATUSES)
 
 
 # -- test_cancel_failure_recorded_not_retried --------------------------------------

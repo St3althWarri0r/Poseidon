@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -344,9 +345,13 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 except (ValueError, TypeError) as exc:
                     raise HTTPException(
                         status_code=422, detail="expires_in_hours must be a number") from exc
-                if hours <= 0:
+                # Reject non-finite floats (``float("inf")``/``float("nan")`` — both
+                # accepted by float() from a string) BEFORE the timedelta below, which
+                # would otherwise raise OverflowError/ValueError and surface as a 500.
+                if not math.isfinite(hours) or hours <= 0:
                     raise HTTPException(
-                        status_code=422, detail="expires_in_hours must be > 0")
+                        status_code=422,
+                        detail="expires_in_hours must be a finite number > 0")
                 expires_at = datetime.now(UTC) + timedelta(hours=hours)
         await kernel.set_mode(mode, expires_at=expires_at)
         return JSONResponse({"ok": True, "mode": mode.value})

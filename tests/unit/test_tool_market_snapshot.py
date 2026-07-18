@@ -113,3 +113,17 @@ async def test_schema_in_data_tools_and_all_tools_with_source_of_truth_footer() 
     assert schema["input_schema"]["required"] == ["symbol"]
     assert schema["input_schema"]["properties"] == {"symbol": {"type": "string"}}
     assert schema["input_schema"]["additionalProperties"] is False
+
+
+async def test_dispatcher_threads_non_default_snapshot_config() -> None:
+    # A non-default SnapshotConfig must reach build_snapshot through the dispatcher:
+    # closes_n=5 (vs the default 20) surfaces as closes.n == 5. A mutant that
+    # ignored self._snapshot_config would emit the default 20 and fail here.
+    router = _Router(quote=_quote("190.10"), bars=_bars(250), profile=_profile())
+    disp = _dispatcher(router, snapshot_config=SnapshotConfig(closes_n=5))
+    payload = await disp._tool_get_market_snapshot("AAPL")
+    assert payload["closes"]["n"] == 5
+    assert len(payload["closes"]["values"]) == 5
+    # Exactly the last five closes, oldest first, rendered verbatim (str(Decimal)).
+    expected = [str(b.close) for b in _bars(250)[-5:]]
+    assert payload["closes"]["values"] == expected

@@ -31,7 +31,10 @@ _SNAPSHOT_MODULE = "poseidon.ai.analysis.snapshot"
 _IDENTITY_SYMBOL = "poseidon.core.models.InstrumentProfile"
 
 # Live packages whose import graph must stay clear of the snapshot surface.
-_GUARDED_PACKAGES = ("poseidon.risk", "poseidon.execution")
+# ``poseidon.portfolio`` is named alongside risk/execution in spec §5.1 and is
+# clean today — guarding it now keeps a future accounting change from splicing the
+# advisory identity/indicator surface into the live-state path.
+_GUARDED_PACKAGES = ("poseidon.risk", "poseidon.execution", "poseidon.portfolio")
 
 
 # ------------------------------------------------- config threads to the sites
