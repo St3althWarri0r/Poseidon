@@ -85,6 +85,13 @@ class ChatService:
     def busy(self) -> bool:
         return self._lock.locked()
 
+    def rebind_backend(self, backend: ChatBackend) -> None:
+        """Point the frozen backend ref at a new object on a live model/backend
+        swap. The kernel calls this under its ``_cycle_lock``; it deliberately
+        avoids re-running ``_wire_ai`` (which reconstructs agent/chat and
+        double-subscribes reflection)."""
+        self._backend = backend
+
     # -- public API -------------------------------------------------------------
 
     async def send(self, message: str, *, context: str) -> dict[str, Any]:
