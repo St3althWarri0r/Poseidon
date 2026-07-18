@@ -15,10 +15,11 @@ class MomentumStrategy(Strategy):
     name = "momentum"
     description = "Long candidates with strong 20/60-day returns above the 50-day average."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         min_return = float(self.options.get("min_20d_return", 0.05))
-        bars_by_symbol = await gather_bars(router, self.symbols, limit=90)
+        bars_by_symbol = await gather_bars(router, self._widen(extra_symbols), limit=90)
         for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             r20 = pct_return(closes, 20)
@@ -49,11 +50,12 @@ class BreakoutStrategy(Strategy):
     name = "breakouts"
     description = "New 55-day highs on above-average volume."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         lookback = int(self.options.get("lookback_days", 55))
         vol_multiple = float(self.options.get("min_volume_multiple", 1.5))
-        bars_by_symbol = await gather_bars(router, self.symbols, limit=lookback + 10)
+        bars_by_symbol = await gather_bars(router, self._widen(extra_symbols), limit=lookback + 10)
         for symbol, bars in bars_by_symbol.items():
             if len(bars) < lookback + 1:
                 continue
@@ -81,9 +83,10 @@ class SwingStrategy(Strategy):
     name = "swing"
     description = "Pullbacks to the 20-day average inside an uptrend (swing entries)."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
-        bars_by_symbol = await gather_bars(router, self.symbols, limit=80)
+        bars_by_symbol = await gather_bars(router, self._widen(extra_symbols), limit=80)
         for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             ma20, ma50 = sma(closes, 20), sma(closes, 50)

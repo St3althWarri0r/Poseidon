@@ -23,10 +23,11 @@ class MeanReversionStrategy(Strategy):
     name = "mean_reversion"
     description = "Oversold names (z-score < -2 vs 20-day mean) inside a longer uptrend."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         entry_z = float(self.options.get("entry_zscore", -2.0))
-        bars_by_symbol = await gather_bars(router, self.symbols, limit=120)
+        bars_by_symbol = await gather_bars(router, self._widen(extra_symbols), limit=120)
         for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]
             z = _zscore(closes)
@@ -57,7 +58,10 @@ class PairsStrategy(Strategy):
     name = "pairs"
     description = "Spread divergence between configured pairs (options.pairs: [[A,B],...])."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
+        # extra_symbols is ignored: pairs trade a spread between two *configured*
+        # legs — an unpaired screened name has nothing to trade against.
         signals: list[Signal] = []
         pairs: list[list[str]] = self.options.get("pairs", [])
         threshold = float(self.options.get("entry_zscore", 2.0))

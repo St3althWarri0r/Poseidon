@@ -293,8 +293,10 @@ class CustomAlgorithm(Strategy):
             raise ValueError("algorithm defines no callable `scan`")
         self._scan_fn = scan_fn
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
-        ctx = AlgoContext(router=router, portfolio=portfolio, symbols=list(self.symbols),
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
+        ctx = AlgoContext(router=router, portfolio=portfolio,
+                          symbols=self._widen(extra_symbols),
                           params=dict(self.options), algo_name=self._algo_name)
         try:
             raw = await asyncio.wait_for(self._scan_fn(ctx), timeout=60)

@@ -47,7 +47,8 @@ class StrategyEngine:
         self._strategies = [s for s in self._strategies if s.name != name]
         return len(self._strategies) != before
 
-    async def scan_all(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan_all(self, router: DataRouter, portfolio: PortfolioState, *,
+                       extra_symbols: list[str] | None = None) -> list[Signal]:
         """Run every enabled strategy concurrently. A strategy that FAILS, or
         that hangs on an await, never blocks the others — each is bounded by
         asyncio.wait_for. Caveat: wait_for can only cancel at an await point, so
@@ -59,7 +60,8 @@ class StrategyEngine:
 
         async def run(strategy: Strategy) -> list[Signal]:
             try:
-                return await asyncio.wait_for(strategy.scan(router, portfolio), _SCAN_TIMEOUT)
+                return await asyncio.wait_for(
+                    strategy.scan(router, portfolio, extra_symbols=extra_symbols), _SCAN_TIMEOUT)
             except TimeoutError:
                 log.warning("strategy scan timed out", strategy=strategy.name)
                 return []

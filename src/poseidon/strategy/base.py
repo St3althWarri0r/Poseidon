@@ -53,9 +53,34 @@ class Strategy(abc.ABC):
         self.options = options or {}
 
     @abc.abstractmethod
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         """Inspect live data and return zero or more signals. Data failures
-        for one symbol must not abort the scan for the rest."""
+        for one symbol must not abort the scan for the rest.
+
+        ``extra_symbols`` are screener-supplied candidates the strategy should
+        additionally consider this cycle (default ``None`` ⇒ unchanged, only
+        the configured universe). It is advisory *selection* only — it widens
+        WHAT gets screened; every emitted signal still flows through the AI and
+        the RiskEngine unchanged. Equity screeners fold it into their universe
+        via :meth:`_widen`; options strategies accept it but ignore it (selling
+        options on unheld screened names is out of scope)."""
+
+    def _widen(self, extra_symbols: list[str] | None,
+               *, base: list[str] | None = None) -> list[str]:
+        """The strategy's configured universe (or ``base`` when it resolves its
+        own default) plus any screener-supplied ``extra_symbols`` — uppercased,
+        order-stable, de-duplicated (configured names first). ``extra_symbols``
+        is ``None`` ⇒ returns the base universe unchanged."""
+        source = self.symbols if base is None else base
+        out: list[str] = []
+        seen: set[str] = set()
+        for sym in (*source, *(s.upper() for s in (extra_symbols or []))):
+            upper = sym.upper()
+            if upper not in seen:
+                seen.add(upper)
+                out.append(upper)
+        return out
 
 
 async def gather_bars(router: DataRouter, symbols: list[str], *,
