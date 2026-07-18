@@ -699,6 +699,7 @@ function connectWebsocket() {
   ws.onmessage = (msg) => {
     let evt;
     try { evt = JSON.parse(msg.data); } catch { return; }
+    window.__debugTap && window.__debugTap(evt);
     const row = document.createElement("div");
     row.className = "evt";
     const summary = typeof evt.payload === "object" && evt.payload
