@@ -32,6 +32,9 @@ class _Dispatcher:
         self.sources_used: set[str] = set()
         self.dispatched: list[str] = []
 
+    def reset_cycle_budget(self) -> None:
+        pass
+
     async def dispatch(self, name: str, args: dict) -> tuple[str, bool]:
         self.dispatched.append(name)
         return ('{"ok": true}', False)
