@@ -26,6 +26,15 @@ from ..conftest import make_quote
 NOW = datetime.now(UTC)
 
 
+class _DisabledScreener:
+    """Stand-in for the market screener in the minimal run_review_cycle harnesses:
+    a disabled screener yields no candidates, so the cycle runs on the watchlist
+    alone (exactly the pre-screener behaviour these error-path tests assert)."""
+
+    async def select_candidates(self) -> list[str]:
+        return []
+
+
 # ---------------------------------------------------------------- RCE sandbox (finding 1)
 
 RCE_PAYLOADS = [
@@ -497,7 +506,8 @@ async def test_refused_cycle_still_meters_ai_usage(tmp_path) -> None:
     class _NoStrategies:
         enabled_names: list[str] = []
 
-        async def scan_all(self, router: object, portfolio: object) -> list[object]:
+        async def scan_all(self, router: object, portfolio: object, *,
+                           extra_symbols: list[str] | None = None) -> list[object]:
             return []
 
     kernel.agent = _RefusingAgent()  # type: ignore[assignment]
@@ -505,6 +515,7 @@ async def test_refused_cycle_still_meters_ai_usage(tmp_path) -> None:
     kernel.risk = SimpleNamespace(set_cycle_attribution=lambda *_: None)  # type: ignore[assignment]
     kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
     kernel.router = None  # type: ignore[assignment]
+    kernel.screener = _DisabledScreener()  # type: ignore[assignment]
 
     async def _not_over() -> bool:
         return False
@@ -555,7 +566,8 @@ async def _build_cycle_kernel(tmp_path, agent, *, ai=None):
     class _NoStrategies:
         enabled_names: list[str] = []
 
-        async def scan_all(self, router: object, portfolio: object) -> list[object]:
+        async def scan_all(self, router: object, portfolio: object, *,
+                           extra_symbols: list[str] | None = None) -> list[object]:
             return []
 
     async def _not_over() -> bool:
@@ -569,6 +581,7 @@ async def _build_cycle_kernel(tmp_path, agent, *, ai=None):
     kernel.risk = SimpleNamespace(set_cycle_attribution=lambda *_: None)  # type: ignore[assignment]
     kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
     kernel.router = None  # type: ignore[assignment]
+    kernel.screener = _DisabledScreener()  # type: ignore[assignment]
     kernel._over_ai_budget = _not_over  # type: ignore[method-assign]
     kernel._regime_line = _no_regime  # type: ignore[method-assign]
     return kernel, db

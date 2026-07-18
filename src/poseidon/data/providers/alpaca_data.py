@@ -63,6 +63,25 @@ class AlpacaDataProvider(MarketDataProvider):
     async def _get(self, path: str, **params: Any) -> Any:
         return await self._get_json(f"{_DATA_BASE}{path}", params=params, headers=self._headers)
 
+    def _bar_from_row(self, symbol: str, row: dict[str, Any], timeframe: str,
+                      *, crypto: bool = False) -> Bar | None:
+        """Parse one Alpaca bar row into a :class:`Bar`, or ``None`` if the row
+        is malformed. Single source of truth for the single-symbol, crypto, and
+        batched bar paths. Crypto volume is fractional coins, so it is floored
+        via ``int(float(...))``; equity volume is already an integer share count."""
+        try:
+            start = datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
+            volume = int(float(row.get("v", 0))) if crypto else int(row.get("v", 0))
+            return Bar(
+                symbol=symbol,
+                open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
+                low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
+                volume=volume,
+                start=start, end=bar_end(start, timeframe), source=self.name,
+            )
+        except (KeyError, ValueError):
+            return None
+
     async def quote(self, symbol: str) -> Quote:
         if is_crypto_symbol(symbol):
             return await self._crypto_quote(symbol)
@@ -121,23 +140,80 @@ class AlpacaDataProvider(MarketDataProvider):
         )
         bars: list[Bar] = []
         for row in payload.get("bars", []) or []:
-            try:
-                start = datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
-                bars.append(
-                    Bar(
-                        symbol=symbol.upper(),
-                        open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
-                        low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
-                        volume=int(row.get("v", 0)),
-                        start=start, end=bar_end(start, timeframe), source=self.name,
-                    )
-                )
-            except (KeyError, ValueError):
-                continue
+            bar = self._bar_from_row(symbol.upper(), row, timeframe)
+            if bar is not None:
+                bars.append(bar)
         bars.reverse()  # requested newest-first; consumers expect chronological
         if not bars:
             raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
         return bars
+
+    async def bars_multi(self, symbols: list[str], *, timeframe: str,
+                         limit: int) -> dict[str, list[Bar]]:
+        # Batched equity daily bars: GET /v2/stocks/bars?symbols=A,B,..&... — one
+        # (paginated) round-trip for the whole screener universe instead of N.
+        # Chunk to `max_batch_symbols` symbols/request and follow next_page_token
+        # until exhausted, merging each `bars[SYM]` list. A chunk that errors
+        # drops only its own symbols (best-effort); the crypto multi-bars path
+        # differs (own endpoint), so crypto symbols are excluded here.
+        tf = _TIMEFRAMES.get(timeframe)
+        if tf is None:
+            raise ProviderError(self.name, f"unsupported timeframe {timeframe}", retryable=False)
+        # Lookback scaled to the requested bar count (plus slack for weekends/
+        # holidays) so a batch never over-fetches years of history per symbol.
+        if timeframe == "1w":
+            lookback = limit * 7 + 30
+        elif timeframe == "1d":
+            lookback = limit * 2 + 15
+        else:
+            lookback = 30
+        start_date = (datetime.now(UTC) - timedelta(days=lookback)).date().isoformat()
+        chunk_size = max(1, int(self._options.get("max_batch_symbols", 200)))
+        equities = [s.upper() for s in symbols if not is_crypto_symbol(s)]
+
+        rows_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for i in range(0, len(equities), chunk_size):
+            chunk = equities[i:i + chunk_size]
+            try:
+                await self._fetch_bars_chunk(chunk, tf, start_date, limit, rows_by_symbol)
+            except ProviderError:
+                continue  # best-effort: a failed chunk drops only its own symbols
+
+        result: dict[str, list[Bar]] = {}
+        for sym, rows in rows_by_symbol.items():
+            parsed = [b for b in (self._bar_from_row(sym, r, timeframe) for r in rows)
+                      if b is not None]
+            parsed.reverse()  # requested newest-first; consumers expect chronological
+            if parsed:
+                result[sym] = parsed[-limit:]  # cap to the requested window per symbol
+        return result
+
+    async def _fetch_bars_chunk(self, chunk: list[str], tf: str, start_date: str,
+                                limit: int, rows_by_symbol: dict[str, list[dict[str, Any]]]) -> None:
+        """Fetch one symbol chunk, following ``next_page_token`` to exhaustion and
+        accumulating each page's per-symbol rows (newest-first) into
+        ``rows_by_symbol``."""
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                # Multi-symbol /v2/stocks/bars applies `limit` to the TOTAL bars
+                # across ALL symbols in a page (hence next_page_token), NOT
+                # per-symbol — so send the endpoint MAX, not the caller's small
+                # per-symbol bars_limit, or a ~200-symbol chunk paginates ~100x
+                # (spec §8 budget: 4-8 req/screen). The `start` window bounds the
+                # data and the final parsed[-limit:] trims per symbol.
+                "symbols": ",".join(chunk), "timeframe": tf, "limit": 10000,
+                "adjustment": "split", "feed": self._options.get("feed", "iex"),
+                "start": start_date, "sort": "desc",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            payload = await self._get("/v2/stocks/bars", **params)
+            for sym, rows in (payload.get("bars") or {}).items():
+                rows_by_symbol.setdefault(sym, []).extend(rows or [])
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
 
     async def _crypto_bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
         # Crypto bars (v1beta3) are multi-symbol and keyed by symbol; no split
@@ -157,21 +233,11 @@ class AlpacaDataProvider(MarketDataProvider):
         rows = (payload.get("bars") or {}).get(sym) or []
         bars: list[Bar] = []
         for row in rows:
-            try:
-                start = datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
-                bars.append(
-                    Bar(
-                        symbol=sym,
-                        open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
-                        low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
-                        # crypto volume is fractional coins; Bar.volume is an int
-                        # coin count (VolumeRule is exempt for crypto, §E).
-                        volume=int(float(row.get("v", 0))),
-                        start=start, end=bar_end(start, timeframe), source=self.name,
-                    )
-                )
-            except (KeyError, ValueError):
-                continue
+            # crypto volume is fractional coins; Bar.volume is an int coin count
+            # (VolumeRule is exempt for crypto, §E).
+            bar = self._bar_from_row(sym, row, timeframe, crypto=True)
+            if bar is not None:
+                bars.append(bar)
         bars.reverse()  # requested newest-first; consumers expect chronological
         if not bars:
             raise ProviderError(self.name, f"no bars for {sym} ({timeframe})")

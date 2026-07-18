@@ -12,10 +12,11 @@ class VolatilityRegimeStrategy(Strategy):
     description = ("Track 10d vs 60d realized volatility; flag expansion (de-risk/hedge) "
                    "and contraction (premium-selling friendly) regimes.")
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         expansion_ratio = float(self.options.get("expansion_ratio", 1.5))
-        symbols = self.symbols or ["SPY"]
+        symbols = self._widen(extra_symbols, base=self.symbols or ["SPY"])
         bars_by_symbol = await gather_bars(router, symbols, limit=90)
         for symbol, bars in bars_by_symbol.items():
             closes = [float(b.close) for b in bars]

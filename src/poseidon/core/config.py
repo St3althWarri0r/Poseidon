@@ -316,6 +316,21 @@ class ResearchConfig(StrictModel):
     n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
+class ScreenerConfig(StrictModel):
+    """Market screener: widen the trading universe by pre-screening a broad index each cycle and
+    handing the AI the top-N ranked candidates to deep-analyze. Advisory selection only — it picks
+    WHAT to evaluate; every candidate still passes the full AI → RiskEngine → broker chain. OFF by
+    default: zero behavior change until deliberately enabled."""
+
+    enabled: bool = False
+    universe: Literal["sp500"] = "sp500"
+    top_n: int = Field(default=15, ge=1, le=100)
+    min_dollar_volume: Decimal = Field(default=Decimal("20000000"))  # $20M median 20d ADV floor
+    refresh_minutes: int = Field(default=15, ge=1)  # cache TTL for the ranked list
+    bars_limit: int = Field(default=90, ge=64, le=250)  # daily bars/symbol for ranking
+    max_batch_symbols: int = Field(default=200, ge=1, le=500)  # symbols per Alpaca batch request
+
+
 class AppConfig(StrictModel):
     mode: TradingMode = TradingMode.RESEARCH  # safest default
     data_dir: Path = Field(default_factory=default_data_dir)
@@ -338,6 +353,7 @@ class AppConfig(StrictModel):
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     strategy_health: StrategyHealthConfig = Field(default_factory=StrategyHealthConfig)
+    screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:

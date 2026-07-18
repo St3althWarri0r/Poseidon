@@ -13,8 +13,9 @@ class EtfRotationStrategy(Strategy):
     name = "etf_rotation"
     description = "Rank a sector-ETF universe by blended 1/3/6-month momentum; surface leaders and laggard holdings."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
-        universe = [s.upper() for s in (self.symbols or _DEFAULT_UNIVERSE)]
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
+        universe = self._widen(extra_symbols, base=self.symbols or _DEFAULT_UNIVERSE)
         top_n = int(self.options.get("top_n", 3))
         scores: list[tuple[str, float, dict[str, float | None]]] = []
         bars_by_symbol = await gather_bars(router, universe, limit=140)

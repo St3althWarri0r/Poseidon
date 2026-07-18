@@ -3,6 +3,11 @@
 These scan live chains for concrete candidate contracts (delta bands,
 minimum premium yield, open-interest floors) and hand them to the AI as
 evidence; multi-leg structures (spreads, condors) list every leg.
+
+Every ``scan`` accepts the ``extra_symbols`` kwarg (Liskov with the base
+Strategy) but deliberately IGNORES it: selling/writing options on unheld,
+screener-surfaced names is out of scope — these strategies keep their narrow
+held-position / configured-watchlist semantics.
 """
 
 from __future__ import annotations
@@ -54,7 +59,8 @@ class CoveredCallStrategy(_OptionsStrategyBase):
     name = "covered_calls"
     description = "Sell OTM calls (delta 0.15-0.35) against long stock held in 100+ share lots."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         min_oi = int(self.options.get("min_open_interest", 200))
         min_yield = float(self.options.get("min_annualized_yield", 0.10))
@@ -99,7 +105,8 @@ class CashSecuredPutStrategy(_OptionsStrategyBase):
     name = "cash_secured_puts"
     description = "Sell OTM puts (delta 0.15-0.30) on watchlist names, fully cash-secured."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         min_oi = int(self.options.get("min_open_interest", 200))
         min_yield = float(self.options.get("min_annualized_yield", 0.12))
@@ -141,7 +148,8 @@ class WheelStrategy(Strategy):
     name = "wheel"
     description = "The wheel: CSPs while flat, covered calls once assigned."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         csp = CashSecuredPutStrategy(symbols=self.symbols, options=self.options)
         cc = CoveredCallStrategy(symbols=self.symbols, options=self.options)
@@ -163,7 +171,8 @@ class ProtectivePutStrategy(_OptionsStrategyBase):
     name = "protective_puts"
     description = "Hedge large single-name exposure with 0.25-0.40 delta puts."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         equity = float(portfolio.equity or 0)
         threshold = float(self.options.get("position_pct_trigger", 0.08))
@@ -204,7 +213,8 @@ class VerticalSpreadStrategy(_OptionsStrategyBase):
     name = "vertical_spreads"
     description = "Defined-risk bull put spreads: sell ~0.30 delta put, buy the next strike down."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         min_oi = int(self.options.get("min_open_interest", 200))
         min_credit_ratio = float(self.options.get("min_credit_to_width", 0.25))
@@ -254,7 +264,8 @@ class IronCondorStrategy(_OptionsStrategyBase):
     name = "iron_condors"
     description = "Short ~0.20 delta strangle wrapped with protective wings (defined risk)."
 
-    async def scan(self, router: DataRouter, portfolio: PortfolioState) -> list[Signal]:
+    async def scan(self, router: DataRouter, portfolio: PortfolioState, *,
+                   extra_symbols: list[str] | None = None) -> list[Signal]:
         signals: list[Signal] = []
         min_oi = int(self.options.get("min_open_interest", 300))
         for symbol in self.symbols:

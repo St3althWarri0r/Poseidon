@@ -190,6 +190,25 @@ reports:
   daily_summary: true
   daily_summary_cron: "15 16 * * 1-5"   # 16:15 ET weekdays
 
+# Market screener (OFF by default). Each review cycle, cheaply pre-screens a
+# broad index (S&P 500) with batched daily bars, ranks by blended momentum
+# behind a dollar-volume floor, and hands the AI the top-N names to deep-analyze
+# alongside your watchlist. ADVISORY selection only — it picks WHICH symbols the
+# AI evaluates, never whether to trade: every candidate still flows through the
+# full AI -> RiskEngine -> broker chain unchanged. A screen failure/timeout
+# silently degrades to the watchlist and never blocks the cycle. Needs a batched
+# bars provider for full throughput (Alpaca IEX data above); on other stacks it
+# degrades to bounded single-symbol fetches. Enable to widen beyond your
+# watchlist without hand-picking names.
+# screener:
+#   enabled: false            # true = screen the universe and add top-N candidates
+#   universe: sp500           # bundled S&P 500 snapshot (only option today)
+#   top_n: 15                 # candidates handed to the AI per cycle (1-100)
+#   min_dollar_volume: 20000000   # $20M median 20d ADV liquidity floor
+#   refresh_minutes: 15       # cache TTL for the ranked list (>= 1)
+#   bars_limit: 90            # daily bars/symbol for ranking (64-250)
+#   max_batch_symbols: 200    # symbols per batched bars request (1-500)
+
 watchlists:
   - name: core
     symbols: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOGL, META]
