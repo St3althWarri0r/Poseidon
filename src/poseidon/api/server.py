@@ -80,6 +80,27 @@ def build_dryrun_state(*, broker_is_paper: bool, active_broker: str, mode_value:
     }
 
 
+def broker_catalog_saved(saved_names: set[str], *, current_name: str) -> list[dict[str, Any]]:
+    """Annotate broker_catalog() with vault-presence flags (pure, testable).
+
+    Every entry gains `credential_saved` (its legacy single credential is in the
+    vault) and `is_current`. Entries that carry env-scoped credential names —
+    only Alpaca today — additionally gain `paper_saved`/`live_saved`, which the
+    toggle dropdown uses to decide which environments are reachable without
+    re-entering keys. Single-credential brokers never grow the env flags.
+    """
+    catalog = broker_catalog()
+    for entry in catalog:
+        cred = str(entry.get("credential", ""))
+        entry["credential_saved"] = bool(cred) and cred in saved_names
+        entry["is_current"] = entry["name"] == current_name
+        for env_key, flag in (("credential_paper", "paper_saved"),
+                              ("credential_live", "live_saved")):
+            if env_key in entry:
+                entry[flag] = str(entry[env_key]) in saved_names
+    return catalog
+
+
 class WebsocketHub:
     """Fan out every bus event to connected dashboard clients."""
 
@@ -542,14 +563,10 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.get("/api/brokers")
     async def brokers() -> JSONResponse:
-        catalog = broker_catalog()
         saved_names: set[str] = set()
         with contextlib.suppress(Exception):
             saved_names = set(kernel.vault.names())
-        for entry in catalog:
-            cred = str(entry.get("credential", ""))
-            entry["credential_saved"] = bool(cred) and cred in saved_names
-            entry["is_current"] = entry["name"] == kernel.broker.name
+        catalog = broker_catalog_saved(saved_names, current_name=kernel.broker.name)
         acct = kernel.portfolio.account
         return JSONResponse({
             "current": {

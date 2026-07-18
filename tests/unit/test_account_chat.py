@@ -73,6 +73,41 @@ def test_catalog_alpaca_env_credentials() -> None:
     assert "credential_paper" not in by_name["public"]
 
 
+def test_brokers_saved_flags_paper_only() -> None:
+    # Only the paper credential is in the vault → paper_saved true, live_saved false.
+    from poseidon.api.server import broker_catalog_saved
+
+    catalog = broker_catalog_saved({"alpaca_paper_keys"}, current_name="paper")
+    alpaca = next(e for e in catalog if e["name"] == "alpaca")
+    assert alpaca["paper_saved"] is True
+    assert alpaca["live_saved"] is False
+    # Legacy single-credential flag independent of the env flags.
+    assert alpaca["credential_saved"] is False
+    assert alpaca["is_current"] is False
+
+
+def test_brokers_saved_flags_both_and_current() -> None:
+    from poseidon.api.server import broker_catalog_saved
+
+    catalog = broker_catalog_saved(
+        {"alpaca_paper_keys", "alpaca_live_keys", "alpaca_keys"}, current_name="alpaca")
+    alpaca = next(e for e in catalog if e["name"] == "alpaca")
+    assert alpaca["paper_saved"] is True
+    assert alpaca["live_saved"] is True
+    assert alpaca["credential_saved"] is True
+    assert alpaca["is_current"] is True
+
+
+def test_brokers_saved_flags_absent_for_single_credential_brokers() -> None:
+    # Brokers without env-scoped credentials never grow paper_saved/live_saved.
+    from poseidon.api.server import broker_catalog_saved
+
+    catalog = broker_catalog_saved(set(), current_name="paper")
+    tradier = next(e for e in catalog if e["name"] == "tradier")
+    assert "paper_saved" not in tradier
+    assert "live_saved" not in tradier
+
+
 def test_catalog_paper_starting_cash_and_cost_notes() -> None:
     by_name = {e["name"]: e for e in broker_catalog()}
     keys = [f["key"] for f in by_name["paper"]["option_fields"]]
