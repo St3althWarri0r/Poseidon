@@ -188,7 +188,7 @@ class ApplicationKernel:
         # disabled, select_candidates() returns [] and the cycle is byte-identical
         # to today. Built in start() (needs the router).
         self.screener: MarketScreener
-        # Crypto twin of the screener —  24/7 over the bundled Coinbase BASE/USD
+        # Crypto twin of the screener — 24/7 over the bundled Coinbase BASE/USD
         # universe, routing gated to CRYPTO providers. Same advisory contract; OFF
         # by default. Built in start() alongside the equity screener.
         self.crypto_screener: MarketScreener
