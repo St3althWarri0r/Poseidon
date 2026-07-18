@@ -14,16 +14,27 @@ no risk-rule exemption, Decimal money — and each consequential action audits.
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields, is_dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from poseidon.core.enums import OrderSide, OrderStatus, OrderType, TradingMode
-from poseidon.core.errors import BrokerError
+from poseidon.core.enums import (
+    AssetClass,
+    BrokerCapability,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+    TradingMode,
+)
+from poseidon.core.errors import BrokerError, CircuitBreakerOpen, RiskViolation
 from poseidon.core.events import EventBus
-from poseidon.core.models import Order
+from poseidon.core.models import Order, Position
 from poseidon.execution.manager import HaltCleanupSummary, OrderManager
+from poseidon.risk.rules import reduce_only_breach
 from poseidon.security.audit import AuditLog
 from poseidon.storage.db import Database
 
@@ -200,3 +211,287 @@ async def test_switching_aborts_cleanup_without_canceling(harness) -> None:
     assert broker.cancel_calls == []
     assert summary.canceled == []
     assert "halt.cleanup_failed" in _actions(audit_calls)
+
+
+# ==========================================================================
+# Task 5 — flatten_all: reduce-only exits, full rule chain, skip survivors.
+# ==========================================================================
+#
+# The opt-in second cleanup phase of kernel.halt() (control-hardening spec
+# §3.2/§3.3). Given the engine-minted, identity-checked halt token, flatten_all
+# builds ONE reduce-only MARKET DAY exit per live position (long -> SELL /
+# BUY_TO_CLOSE for a short / SELL_TO_CLOSE for a long option), runs each through
+# the FULL rule chain (validate_order + the live _guard_reduce_only backstop —
+# never exempted by the token), skips any symbol whose resting order survived the
+# cancel pass (a resting order must never fill against a closing trade), records
+# every denial without retrying, and never consults the approval queue (the
+# operator's halt IS the human consent — audited as ``human``).
+
+
+class FlattenBroker(FakeBroker):
+    """Extends the cancel-fake with a controllable book + positions and a
+    submit spy, so flatten_all can be driven deterministically: what it flattens,
+    what it skips, and the exact orders it builds are all observable."""
+
+    def __init__(self, name: str = "fake") -> None:
+        super().__init__(name)
+        self.positions_list: list[Position] = []
+        self.open_orders_list: list[Order] = []
+        self.submit_calls: list[Order] = []
+        self.positions_calls = 0
+        self.fail_fetch = False
+
+    def capabilities(self) -> frozenset[BrokerCapability]:
+        return frozenset({
+            BrokerCapability.OPTIONS, BrokerCapability.CRYPTO,
+            BrokerCapability.FRACTIONAL_SHARES, BrokerCapability.EXTENDED_HOURS,
+        })
+
+    async def positions(self) -> list[Position]:
+        self.positions_calls += 1
+        if self.fail_fetch:
+            raise BrokerError(self.name, "positions feed down", retryable=True)
+        return list(self.positions_list)
+
+    async def open_orders(self) -> list[Order]:
+        return list(self.open_orders_list)
+
+    async def preflight(self, order: Order) -> str | None:
+        return None
+
+    async def submit_order(self, order: Order) -> Order:
+        self.submit_calls.append(order)
+        order.status = OrderStatus.SUBMITTED
+        order.broker = self.name
+        order.broker_order_id = f"bx-{order.id[:6]}"
+        return order
+
+    async def order_status(self, order: Order) -> Order:
+        return order
+
+
+class FakeRisk:
+    """A risk engine faithful to the ONLY two things flatten_all's rule chain
+    depends on: the halt-flatten carve-out predicate (identity-checked token) and
+    the reduce-only invariant — enforced through the REAL ``reduce_only_breach``
+    against a controllable ``held`` snapshot, so ``test_reduce_only_rule_still
+    _consulted`` exercises the genuine rule, not a stubbed raise. ``deny_symbols``
+    lets a test make any other rule deny a chosen symbol. Everything else _submit
+    touches is a recorded no-op."""
+
+    def __init__(self) -> None:
+        self.circuit = SimpleNamespace(is_open=True, reason="operator HALT")
+        self.token: object | None = None
+        self.held: dict[str, Decimal] = {}
+        self.reduce_open_orders: list[Order] = []
+        self.deny_symbols: dict[str, RiskViolation] = {}
+        self.validate_calls: list[Order] = []
+
+    def open_halt_flatten_window(self, *, ttl_seconds: float = 300.0) -> object:
+        self.token = object()
+        return self.token
+
+    def halt_exit_permitted(self, order: Order, token: object | None) -> bool:
+        return (token is not None and token is self.token
+                and order.side.is_risk_reducing and not order.legs)
+
+    async def validate_order(self, order: Order, *, halt_token: object | None = None):
+        self.validate_calls.append(order)
+        if self.circuit.is_open and not (
+                halt_token is not None and self.halt_exit_permitted(order, halt_token)):
+            raise CircuitBreakerOpen(self.circuit.reason)
+        if order.symbol.upper() in self.deny_symbols:
+            raise self.deny_symbols[order.symbol.upper()]
+        msg = reduce_only_breach(
+            order, lambda s: self.held.get(s.upper(), Decimal(0)), self.reduce_open_orders)
+        if msg is not None:
+            raise RiskViolation("reduce_only", msg)
+        return
+
+    def note_order_submitted(self, order: Order) -> None:
+        return None
+
+    def release_validated(self, order_id: str) -> None:
+        return None
+
+    def note_execution_error(self, reason: str) -> None:
+        return None
+
+
+def _pos(symbol: str, qty: str, *, asset_class: AssetClass = AssetClass.EQUITY) -> Position:
+    return Position(symbol=symbol, asset_class=asset_class, quantity=Decimal(qty),
+                    avg_entry_price=Decimal("100.00"), as_of=datetime.now(UTC))
+
+
+@pytest.fixture
+async def flat(tmp_path):
+    """Real DB + AuditLog + EventBus with a controllable book/positions broker and
+    a carve-out-faithful risk engine. The breaker is OPEN (a halt is in progress)
+    and a live token is minted, exactly as kernel.halt() will present to
+    flatten_all (task 6)."""
+    bus = EventBus()
+    db = Database(tmp_path / "flat.db")
+    await db.open()
+    audit = AuditLog(db)
+    broker = FlattenBroker()
+    risk = FakeRisk()
+    manager = OrderManager(broker, risk, MagicMock(), db, audit, bus,
+                           mode=TradingMode.AUTONOMOUS)
+    token = risk.open_halt_flatten_window()
+    yield {"manager": manager, "broker": broker, "risk": risk, "db": db,
+           "audit": audit, "bus": bus, "token": token}
+    await manager.stop()
+    await bus.close()
+    await db.close()
+
+
+# -- test_builds_reduce_only_market_exits ------------------------------------------
+
+async def test_builds_reduce_only_market_exits(flat) -> None:
+    manager, broker, risk = flat["manager"], flat["broker"], flat["risk"]
+    audit_calls = _spy_audit(flat["audit"])
+    # A long equity, a short equity, and a long option — the three sizing cases.
+    broker.positions_list = [
+        _pos("AAPL", "10"),
+        _pos("TSLA", "-5"),
+        _pos("AAPL260116C00150000", "3", asset_class=AssetClass.OPTION),
+    ]
+    risk.held = {"AAPL": Decimal("10"), "TSLA": Decimal("-5"),
+                 "AAPL260116C00150000": Decimal("3")}
+
+    summary = await manager.flatten_all(flat["token"], reason="operator HALT")
+
+    built = {o.symbol: o for o in broker.submit_calls}
+    assert set(built) == {"AAPL", "TSLA", "AAPL260116C00150000"}
+    # Long equity -> SELL; short equity -> BUY_TO_CLOSE; long option -> SELL_TO_CLOSE.
+    assert built["AAPL"].side is OrderSide.SELL
+    assert built["TSLA"].side is OrderSide.BUY_TO_CLOSE
+    assert built["AAPL260116C00150000"].side is OrderSide.SELL_TO_CLOSE
+    # Every exit is a reduce-only, leg-free MARKET DAY order sized to abs(qty),
+    # strategy halt_flatten — the exact shape halt_exit_permitted admits.
+    for order in broker.submit_calls:
+        assert order.order_type is OrderType.MARKET
+        assert order.time_in_force is TimeInForce.DAY
+        assert order.strategy == "halt_flatten"
+        assert order.legs == []
+        assert order.side.is_risk_reducing
+    assert built["AAPL"].quantity == Decimal("10")
+    assert built["TSLA"].quantity == Decimal("5")       # abs of the short
+    assert built["AAPL260116C00150000"].quantity == Decimal("3")
+    # All three submitted; nothing refused.
+    assert len(summary.submitted) == 3
+    assert summary.refused == []
+    # The token rode into every validate_order (the carve-out was consulted).
+    assert {o.symbol for o in risk.validate_calls} == {
+        "AAPL", "TSLA", "AAPL260116C00150000"}
+    # The operator's halt IS the consent: submissions audit as human/halt.flatten_submitted.
+    submitted_audits = [(actor, payload) for (actor, action, payload) in audit_calls
+                        if action == "halt.flatten_submitted"]
+    assert len(submitted_audits) == 3
+    assert all(actor == "human" for (actor, _payload) in submitted_audits)
+
+
+# -- test_skips_symbols_with_surviving_open_orders ---------------------------------
+
+async def test_skips_symbols_with_surviving_open_orders(flat) -> None:
+    manager, broker, risk = flat["manager"], flat["broker"], flat["risk"]
+    audit_calls = _spy_audit(flat["audit"])
+    broker.positions_list = [_pos("AAPL", "10"), _pos("MSFT", "7")]
+    risk.held = {"AAPL": Decimal("10"), "MSFT": Decimal("7")}
+    # A resting order for MSFT survived the cancel pass (cancel-failed / pending
+    # cancel / cross-broker): MSFT must NOT be flattened — a resting order can
+    # never be raced against a closing trade.
+    survivor = Order(symbol="MSFT", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("7"), limit_price=Decimal("300.00"),
+                     strategy="guardian_exit", broker="fake",
+                     status=OrderStatus.SUBMITTED)
+    broker.open_orders_list = [survivor]
+
+    summary = await manager.flatten_all(flat["token"], reason="operator HALT")
+
+    # Only AAPL is flattened; MSFT is excluded, not raced.
+    assert [o.symbol for o in broker.submit_calls] == ["AAPL"]
+    assert summary.submitted and all(  # AAPL got submitted
+        True for _ in summary.submitted)
+    assert any(r.get("symbol") == "MSFT" and r.get("reason") == "open_order_survives"
+               for r in summary.refused), summary.refused
+    # …and the exclusion is recorded for the operator.
+    assert any(
+        action == "halt.flatten_refused" and payload.get("symbol") == "MSFT"
+        and payload.get("reason") == "open_order_survives"
+        for (_actor, action, payload) in audit_calls
+    ), f"expected a halt.flatten_refused for MSFT; got {audit_calls}"
+    # MSFT never even reached validate_order (skipped before the rule chain).
+    assert "MSFT" not in {o.symbol for o in risk.validate_calls}
+
+
+# -- test_research_mode_refuses ----------------------------------------------------
+
+async def test_research_mode_refuses(flat) -> None:
+    manager, broker = flat["manager"], flat["broker"]
+    audit_calls = _spy_audit(flat["audit"])
+    manager.set_mode(TradingMode.RESEARCH)
+    broker.positions_list = [_pos("AAPL", "10")]
+
+    summary = await manager.flatten_all(flat["token"], reason="operator HALT")
+
+    # Research means no orders from anyone — flatten refuses entirely and never
+    # even reads positions.
+    assert summary.submitted == []
+    assert broker.submit_calls == []
+    assert broker.positions_calls == 0
+    assert "halt.flatten_refused" in _actions(audit_calls)
+
+
+# -- test_rule_denial_recorded_not_retried -----------------------------------------
+
+async def test_rule_denial_recorded_not_retried(flat) -> None:
+    manager, broker, risk = flat["manager"], flat["broker"], flat["risk"]
+    audit_calls = _spy_audit(flat["audit"])
+    broker.positions_list = [_pos("AAPL", "10"), _pos("MSFT", "7")]
+    risk.held = {"AAPL": Decimal("10"), "MSFT": Decimal("7")}
+    # A rule denies the AAPL exit (e.g. a one-sided book -> SlippageProtectionRule).
+    risk.deny_symbols = {"AAPL": RiskViolation("slippage", "book too dislocated to exit")}
+
+    summary = await manager.flatten_all(flat["token"], reason="operator HALT")
+
+    # The denied exit was validated EXACTLY ONCE — no retry loop on a rule denial.
+    aapl_validations = [o for o in risk.validate_calls if o.symbol == "AAPL"]
+    assert len(aapl_validations) == 1
+    # It never reached the broker, and it is recorded as refused + audited.
+    assert "AAPL" not in {o.symbol for o in broker.submit_calls}
+    assert any(r.get("symbol") == "AAPL" for r in summary.refused), summary.refused
+    assert any(
+        action == "halt.flatten_refused" and payload.get("symbol") == "AAPL"
+        for (_actor, action, payload) in audit_calls
+    )
+    # The loop CONTINUED: the healthy MSFT exit was still submitted.
+    assert "MSFT" in {o.symbol for o in broker.submit_calls}
+    assert len(summary.submitted) == 1
+
+
+# -- test_reduce_only_rule_still_consulted -----------------------------------------
+
+async def test_reduce_only_rule_still_consulted(flat) -> None:
+    manager, broker, risk = flat["manager"], flat["broker"], flat["risk"]
+    audit_calls = _spy_audit(flat["audit"])
+    # The broker reports 10 shares (so flatten builds a SELL 10), but the
+    # reduce-only snapshot shows only 8 closable — an oversized exit. Even on the
+    # sanctioned halt path, carrying a live token, the reduce-only rule is NEVER
+    # exempted: the exit must be rejected, not forced past into a short.
+    broker.positions_list = [_pos("AAPL", "10")]
+    risk.held = {"AAPL": Decimal("8")}
+
+    summary = await manager.flatten_all(flat["token"], reason="operator HALT")
+
+    # Rejected by the real reduce-only invariant, recorded, not submitted.
+    assert broker.submit_calls == []
+    assert len(summary.submitted) == 0
+    assert len(summary.refused) == 1
+    assert "reduce_only" in summary.refused[0]["reason"]
+    # Consulted exactly once (no retry), and audited as a refusal.
+    assert len([o for o in risk.validate_calls if o.symbol == "AAPL"]) == 1
+    assert any(
+        action == "halt.flatten_refused" and payload.get("symbol") == "AAPL"
+        for (_actor, action, payload) in audit_calls
+    )
