@@ -38,6 +38,7 @@ from ..core.models import (
     OptionChain,
     Quote,
 )
+from ..core.symbols import is_crypto_symbol
 from .base import DataCapability, MarketDataProvider
 
 log = structlog.get_logger(__name__)
@@ -140,7 +141,8 @@ class DataRouter:
     # -- public API -------------------------------------------------------------
 
     async def quote(self, symbol: str, *, allow_delayed: bool = False) -> Quote:
-        quote = await self._route(DataCapability.QUOTES, lambda p: p.quote(symbol))
+        req = DataCapability.CRYPTO if is_crypto_symbol(symbol) else None
+        quote = await self._route(DataCapability.QUOTES, lambda p: p.quote(symbol), require=req)
         as_of = quote.as_of
         grade = self._freshness.grade(as_of)
         if grade is DataFreshness.STALE or (grade is DataFreshness.DELAYED and not allow_delayed):
@@ -164,8 +166,10 @@ class DataRouter:
         return quote
 
     async def bars(self, symbol: str, *, timeframe: str = "1d", limit: int = 100) -> list[Bar]:
+        req = DataCapability.CRYPTO if is_crypto_symbol(symbol) else None
         bars = await self._route(
-            DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit)
+            DataCapability.BARS, lambda p: p.bars(symbol, timeframe=timeframe, limit=limit),
+            require=req,
         )
         # Drop structurally-malformed bars at the boundary so a feed glitch
         # cannot skew an indicator/VaR/volatility calculation downstream.
@@ -261,11 +265,21 @@ class DataRouter:
     # -- routing core -------------------------------------------------------------
 
     async def _route(self, capability: DataCapability,
-                     call: Callable[[MarketDataProvider], Awaitable[T]]) -> T:
-        capable = [s for s in self._slots if capability in s.provider.capabilities()]
+                     call: Callable[[MarketDataProvider], Awaitable[T]],
+                     *, require: DataCapability | None = None) -> T:
+        # `require` is an extra capability a provider must ALSO advertise to be
+        # eligible (e.g. CRYPTO for a BASE/USD symbol), so a crypto request can
+        # never reach an equity-only provider. Equity requests pass require=None
+        # and the capable set is byte-for-byte unchanged.
+        capable = [
+            s for s in self._slots
+            if capability in s.provider.capabilities()
+            and (require is None or require in s.provider.capabilities())
+        ]
         if not capable:
+            detail = f"'{capability}'" if require is None else f"'{capability}' with '{require}'"
             raise DataUnavailableError(
-                f"no configured provider supports '{capability}' — cannot proceed without live data"
+                f"no configured provider supports {detail} — cannot proceed without live data"
             )
         errors: list[str] = []
         # Snapshot availability ONCE up front. A provider that fails in the

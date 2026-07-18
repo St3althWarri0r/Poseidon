@@ -407,7 +407,9 @@ class SpreadRule(RiskRule):
 
 
 class VolumeRule(RiskRule):
-    """Liquidity filter: require adequate average daily volume."""
+    """Liquidity filter: require adequate average daily volume.
+    Crypto is exempt: ``min_avg_volume`` is a share-count floor and crypto
+    ``Bar.volume`` is a coin count — its liquidity is gated by spread instead."""
 
     name = "min_volume"
 
@@ -416,6 +418,12 @@ class VolumeRule(RiskRule):
             return  # entry filter only
         if ctx.order.asset_class is AssetClass.OPTION:
             return  # option liquidity is screened via the chain's OI upstream
+        if ctx.order.asset_class is AssetClass.CRYPTO:
+            # min_avg_volume is an equity SHARE-count floor (default 100k); crypto
+            # Bar.volume is a COIN count (BTC trades tens of thousands of coins/day,
+            # ~$30B notional), so a share floor is a category error here. Crypto
+            # liquidity stays gated by SpreadRule/SlippageProtectionRule (spread_pct).
+            return
         if not ctx.recent_bars:
             raise RiskViolation(self.name, "no volume history available")
         window = ctx.recent_bars[-20:]

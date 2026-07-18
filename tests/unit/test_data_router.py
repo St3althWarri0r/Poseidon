@@ -97,6 +97,62 @@ async def test_last_resort_does_not_rehit_failed_provider(policy: FreshnessPolic
     assert broken.calls == 1  # tried once, not re-hit in the second pass
 
 
+# -- crypto routing (DataCapability.CRYPTO + require=) -------------------------
+
+
+async def test_crypto_quote_only_served_by_crypto_capable_provider(
+    policy: FreshnessPolicy,
+) -> None:
+    # A crypto symbol must route ONLY to a CRYPTO-capable provider; the
+    # higher-priority equity-only provider must be skipped, never 404'd.
+    equity = FakeProvider(name="equity")  # QUOTES but NOT CRYPTO
+    crypto = FakeProvider(name="crypto", crypto=True)
+    router = DataRouter([(equity, 10), (crypto, 20)], policy)
+    quote = await router.quote("BTC/USD")
+    assert quote.source == "crypto"
+    assert equity.calls == 0 and crypto.calls == 1
+
+
+async def test_equity_only_provider_skipped_for_crypto(policy: FreshnessPolicy) -> None:
+    # With no CRYPTO-capable provider configured, a crypto quote must fail
+    # cleanly (no-data-no-trade) rather than hit the equity stocks endpoint.
+    equity = FakeProvider(name="equity")
+    router = DataRouter([(equity, 10)], policy)
+    with pytest.raises(DataUnavailableError):
+        await router.quote("BTC/USD")
+    assert equity.calls == 0  # never called for a crypto symbol
+
+
+async def test_equity_routing_unchanged_with_crypto_provider_present(
+    policy: FreshnessPolicy,
+) -> None:
+    # An equity symbol still routes by priority (require=None); the presence of
+    # a CRYPTO-capable provider must not perturb the equity path.
+    equity = FakeProvider(name="equity")
+    crypto = FakeProvider(name="crypto", crypto=True)
+    router = DataRouter([(equity, 10), (crypto, 20)], policy)
+    quote = await router.quote("AAPL")
+    assert quote.source == "equity"
+    assert equity.calls == 1 and crypto.calls == 0
+
+
+async def test_crypto_bars_require_crypto_capable_provider(policy: FreshnessPolicy) -> None:
+    equity = FakeProvider(name="equity", bars_count=90)
+    crypto = FakeProvider(name="crypto", crypto=True, bars_count=90)
+    router = DataRouter([(equity, 10), (crypto, 20)], policy)
+    bars = await router.bars("BTC/USD", timeframe="1d", limit=60)
+    assert bars and bars[0].source == "crypto"
+
+
+async def test_all_crypto_providers_fail_raises(policy: FreshnessPolicy) -> None:
+    router = DataRouter([(FakeProvider(name="crypto", crypto=True, fail=True), 10)], policy)
+    with pytest.raises(AllProvidersFailedError):
+        await router.quote("BTC/USD")
+
+
+# -- profile routing (DataCapability.PROFILE + caching) -----------------------
+
+
 class ProfileProvider(MarketDataProvider):
     """Profile-capable fake (conftest FakeProvider has no PROFILE)."""
 

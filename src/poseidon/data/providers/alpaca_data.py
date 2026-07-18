@@ -15,6 +15,7 @@ from typing import Any
 from ...core.enums import OptionRight
 from ...core.errors import ProviderError
 from ...core.models import Bar, Greeks, NewsArticle, OptionChain, OptionContract, Quote
+from ...core.symbols import is_crypto_symbol, normalize_crypto_symbol
 from ..base import DataCapability, MarketDataProvider, bar_end
 
 _DATA_BASE = "https://data.alpaca.markets"
@@ -52,14 +53,19 @@ class AlpacaDataProvider(MarketDataProvider):
         self._headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret}
 
     def capabilities(self) -> frozenset[DataCapability]:
+        # Alpaca serves spot crypto (v1beta3) free with the same alpaca_keys, so
+        # CRYPTO is advertised unconditionally alongside the equity capabilities.
         return frozenset(
-            {DataCapability.QUOTES, DataCapability.BARS, DataCapability.OPTIONS, DataCapability.NEWS}
+            {DataCapability.QUOTES, DataCapability.BARS, DataCapability.OPTIONS,
+             DataCapability.NEWS, DataCapability.CRYPTO}
         )
 
     async def _get(self, path: str, **params: Any) -> Any:
         return await self._get_json(f"{_DATA_BASE}{path}", params=params, headers=self._headers)
 
     async def quote(self, symbol: str) -> Quote:
+        if is_crypto_symbol(symbol):
+            return await self._crypto_quote(symbol)
         payload = await self._get(f"/v2/stocks/{symbol.upper()}/quotes/latest")
         q = payload.get("quote")
         if not q:
@@ -75,7 +81,32 @@ class AlpacaDataProvider(MarketDataProvider):
             as_of=as_of, source=self.name,
         )
 
+    async def _crypto_quote(self, symbol: str) -> Quote:
+        # Crypto data API (v1beta3) is multi-symbol and keyed by symbol:
+        #   GET /v1beta3/crypto/us/latest/quotes?symbols=BTC/USD
+        #   -> {"quotes": {"BTC/USD": {"bp":.., "ap":.., "bs":.., "as":.., "t":".."}}}
+        sym = normalize_crypto_symbol(symbol)
+        payload = await self._get("/v1beta3/crypto/us/latest/quotes", symbols=sym)
+        q = (payload.get("quotes") or {}).get(sym)
+        if not q:
+            raise ProviderError(self.name, f"no quote for {sym}")
+        if not q.get("t"):
+            raise ProviderError(self.name, f"quote for {sym} has no timestamp")
+        as_of = datetime.fromisoformat(q["t"].replace("Z", "+00:00"))
+        # bid_size/ask_size (Quote fields) are integer share/contract counts;
+        # crypto book sizes are fractional coins (e.g. 0.5 BTC) that cannot be an
+        # int without lying, and no downstream rule needs them (SpreadRule uses
+        # bid/ask) — so leave them unset for crypto.
+        return Quote(
+            symbol=sym,
+            bid=Decimal(str(q["bp"])) if q.get("bp") else None,
+            ask=Decimal(str(q["ap"])) if q.get("ap") else None,
+            as_of=as_of, source=self.name,
+        )
+
     async def bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
+        if is_crypto_symbol(symbol):
+            return await self._crypto_bars(symbol, timeframe=timeframe, limit=limit)
         tf = _TIMEFRAMES.get(timeframe)
         if tf is None:
             raise ProviderError(self.name, f"unsupported timeframe {timeframe}", retryable=False)
@@ -106,6 +137,44 @@ class AlpacaDataProvider(MarketDataProvider):
         bars.reverse()  # requested newest-first; consumers expect chronological
         if not bars:
             raise ProviderError(self.name, f"no bars for {symbol} ({timeframe})")
+        return bars
+
+    async def _crypto_bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
+        # Crypto bars (v1beta3) are multi-symbol and keyed by symbol; no split
+        # adjustment and no equity `feed` (the "us" feed is in the path):
+        #   GET /v1beta3/crypto/us/bars?symbols=BTC/USD&timeframe=1Day&start=..
+        #   -> {"bars": {"BTC/USD": [{"o","h","l","c","v","t"}, ...]}}
+        tf = _TIMEFRAMES.get(timeframe)
+        if tf is None:
+            raise ProviderError(self.name, f"unsupported timeframe {timeframe}", retryable=False)
+        sym = normalize_crypto_symbol(symbol)
+        lookback = 730 if timeframe in ("1d", "1w") else 30
+        start_date = (datetime.now(UTC) - timedelta(days=lookback)).date().isoformat()
+        payload = await self._get(
+            "/v1beta3/crypto/us/bars", symbols=sym, timeframe=tf,
+            limit=min(limit, 10000), start=start_date, sort="desc",
+        )
+        rows = (payload.get("bars") or {}).get(sym) or []
+        bars: list[Bar] = []
+        for row in rows:
+            try:
+                start = datetime.fromisoformat(row["t"].replace("Z", "+00:00"))
+                bars.append(
+                    Bar(
+                        symbol=sym,
+                        open=Decimal(str(row["o"])), high=Decimal(str(row["h"])),
+                        low=Decimal(str(row["l"])), close=Decimal(str(row["c"])),
+                        # crypto volume is fractional coins; Bar.volume is an int
+                        # coin count (VolumeRule is exempt for crypto, §E).
+                        volume=int(float(row.get("v", 0))),
+                        start=start, end=bar_end(start, timeframe), source=self.name,
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+        bars.reverse()  # requested newest-first; consumers expect chronological
+        if not bars:
+            raise ProviderError(self.name, f"no bars for {sym} ({timeframe})")
         return bars
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None) -> OptionChain:

@@ -26,6 +26,17 @@ class VaultLockedError(VaultError):
     """The vault has not been unlocked this session."""
 
 
+class UnsupportedSymbolError(PoseidonError):
+    """A symbol is well-formed but not tradable on this platform.
+
+    Raised for crypto pairs quoted in something other than USD (e.g.
+    stablecoin-quoted ``BTC/USDT``) or a bare base with no quote. Never
+    retryable — retrying the same symbol will always fail.
+    """
+
+    retryable = False
+
+
 # -- Data layer -------------------------------------------------------------
 
 

@@ -55,6 +55,12 @@ Fills are priced from **live quotes** via the data router (ask for buys,
 bid for sells; marketable-limit logic for limit orders). State persists to
 `paper_state.json` in the data dir. No credentials needed.
 
+Capabilities: equities (fractional), extended hours, tax lots, and **spot
+crypto** (`BASE/USD`). Crypto fills price from the same live-quote path, so
+you also need a crypto-capable data provider — enable `alpaca` data (see
+docs/api-configuration.md). Crypto is exempt from only the market-hours and
+share-count volume rules; every other risk rule still runs (docs/risk-controls.md).
+
 ## Alpaca
 
 1. Create an account at alpaca.markets; generate API keys (paper keys from
@@ -73,6 +79,13 @@ brokers:
 
 Capabilities: equities (fractional), options, crypto, extended hours,
 margin, client order IDs.
+
+> **Live crypto (follow-on).** The Alpaca live broker already advertises the
+> crypto capability and maps crypto positions, but crypto trading ships
+> **paper-only** for now. The remaining live wiring is verifying that
+> `submit_order` passes `BASE/USD` verbatim and that crypto TIF is `gtc`/`ioc`
+> (not `day`/`opg`/`cls`). Paper ignores TIF nuance, so paper crypto is
+> unaffected; use the built-in `paper` broker for crypto today.
 
 ## Tradier
 

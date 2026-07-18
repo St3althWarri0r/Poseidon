@@ -177,7 +177,7 @@ shifts to the next one.
 | `finnhub` | quotes, news, earnings calendar, economic calendar, sector taxonomy | finnhub.io | plain API key |
 | `twelvedata` | quotes, bars | twelvedata.com | plain API key |
 | `alphavantage` | EOD quotes, news+sentiment (bars not offered: free series is split-unadjusted) | alphavantage.co | plain API key |
-| `alpaca` | quotes, bars, option chains, news | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |
+| `alpaca` | quotes, bars, option chains, news, **crypto** (spot `BASE/USD`) | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |
 | `tradier_data` | quotes, daily bars, option chains + greeks | tradier.com | access token (options: `{sandbox: true}`) |
 
 ### Running on $0 of API subscriptions
@@ -207,6 +207,16 @@ Notes:
   is penalized.
 - `public_data` options: `{crypto_symbols: [BTC, ETH]}` marks watchlist
   symbols that should be quoted as crypto instruments.
+- **Crypto quotes (`BASE/USD`).** Spot crypto pairs — written with a slash,
+  e.g. `BTC/USD`, `ETH/USD` — are routed to whichever configured provider
+  advertises the `crypto` capability, and *never* to an equity-only provider.
+  `alpaca` serves crypto free on the same `alpaca_keys` credential (no extra
+  entitlement), so enabling the `alpaca` data provider is all it takes to quote
+  crypto. Only `BASE/USD` pairs are supported — stablecoin-quoted pairs such as
+  `BTC/USDT` are rejected with a clear error, never a 404. If no crypto-capable
+  provider is configured, a crypto quote fails cleanly (`no data, no trade`)
+  rather than falling back to a stocks endpoint. Crypto trading is **paper-only**
+  today; see docs/broker-setup.md for the live follow-on.
 - Alpha Vantage quotes are end-of-day: the freshness policy grades them
   DELAYED/STALE, so they can inform research but never orders — that is by
   design, not a bug.

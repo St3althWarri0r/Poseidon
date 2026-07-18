@@ -31,6 +31,7 @@ from poseidon.risk.rules import (
     DailyLossRule,
     EconBlackoutRule,
     FreshPortfolioRule,
+    MarketOpenRule,
     OrderNotionalRule,
     PortfolioVaRRule,
     PositionSizeRule,
@@ -491,6 +492,57 @@ class TestCircuitBreaker:
         cooldowns.record_trade("AAPL")
         assert cooldowns.remaining("aapl") > 290
         assert cooldowns.remaining("MSFT") == 0
+
+
+class _ClosedClock(MarketClock):
+    """A clock that always reports the equity market as CLOSED (e.g. a weekend),
+    so the crypto 24/7 exemption can be exercised deterministically."""
+
+    def session(self, at: datetime | None = None) -> MarketSession:
+        return MarketSession.CLOSED
+
+
+def crypto_buy(qty: str = "0.05", limit: str = "30000.00", symbol: str = "BTC/USD") -> Order:
+    return Order(symbol=symbol, asset_class=AssetClass.CRYPTO, side=OrderSide.BUY,
+                 order_type=OrderType.LIMIT, quantity=Decimal(qty), limit_price=Decimal(limit))
+
+
+class TestCryptoExemptions:
+    """Crypto is exempt from EXACTLY two rules — the NYSE market-hours gate and
+    the equity share-count volume floor — and from nothing else."""
+
+    def test_market_open_rule_exempts_crypto_when_closed(self) -> None:
+        closed = _ClosedClock()
+        assert closed.session() is MarketSession.CLOSED
+        # An equity order is blocked when the session is CLOSED...
+        equity_ctx = ctx(buy())
+        equity_ctx.clock = closed
+        with pytest.raises(RiskViolation, match="market_session"):
+            MarketOpenRule().check(equity_ctx)
+        # ...but a crypto order trades 24/7 and passes despite the closed session.
+        crypto_ctx = ctx(crypto_buy(), price="30000.00")
+        crypto_ctx.clock = closed
+        MarketOpenRule().check(crypto_ctx)
+
+    def test_volume_rule_exempts_crypto(self) -> None:
+        # BTC trades tens of thousands of COINS/day; a coin count near the 100k
+        # SHARE floor is normal, so the share-count floor must not apply.
+        low = _bars(volume=1_000)
+        with pytest.raises(RiskViolation, match="min_volume"):
+            VolumeRule().check(ctx(buy(), bars=low))  # equity: floor fires
+        VolumeRule().check(ctx(crypto_buy(), price="30000.00", bars=low))  # crypto: exempt
+        # Crypto is exempt even with no bar history at all.
+        VolumeRule().check(ctx(crypto_buy(), price="30000.00", bars=[]))
+
+    def test_other_rules_still_fire_for_crypto(self) -> None:
+        # Notional cap: a whole BTC at 30k is > the 25k max_order_notional and is
+        # correctly rejected (size fractionally), same as any oversized equity.
+        big = crypto_buy(qty="1", limit="30000.00")
+        with pytest.raises(RiskViolation, match="order_notional"):
+            OrderNotionalRule().check(ctx(big, price="30000.00"))
+        # Spread filter is asset-class-neutral: a wide crypto book is rejected.
+        with pytest.raises(RiskViolation, match="max_spread"):
+            SpreadRule().check(ctx(crypto_buy(), price="30000.00", spread="3000.00"))
 
 
 class TestSleeveOverride:
