@@ -196,7 +196,13 @@ class AlpacaDataProvider(MarketDataProvider):
         page_token: str | None = None
         while True:
             params: dict[str, Any] = {
-                "symbols": ",".join(chunk), "timeframe": tf, "limit": min(limit, 10000),
+                # Multi-symbol /v2/stocks/bars applies `limit` to the TOTAL bars
+                # across ALL symbols in a page (hence next_page_token), NOT
+                # per-symbol — so send the endpoint MAX, not the caller's small
+                # per-symbol bars_limit, or a ~200-symbol chunk paginates ~100x
+                # (spec §8 budget: 4-8 req/screen). The `start` window bounds the
+                # data and the final parsed[-limit:] trims per symbol.
+                "symbols": ",".join(chunk), "timeframe": tf, "limit": 10000,
                 "adjustment": "split", "feed": self._options.get("feed", "iex"),
                 "start": start_date, "sort": "desc",
             }

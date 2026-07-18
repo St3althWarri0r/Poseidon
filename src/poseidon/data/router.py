@@ -226,6 +226,15 @@ class DataRouter:
                 except NotImplementedError:
                     continue  # no batch path here — try the next provider, then degrade
                 except ProviderError as exc:
+                    if not exc.retryable and not isinstance(exc, ProviderAuthError):
+                        # Permanent request/capability mismatch (e.g. unsupported
+                        # timeframe): the provider is healthy — this request just
+                        # cannot succeed here. Fail over WITHOUT record_failure, so
+                        # its other capabilities aren't demoted into the penalty
+                        # box. Mirrors the _route contract.
+                        log.warning("batch bars unsupported by provider, failing over",
+                                    provider=slot.provider.name, error=str(exc))
+                        continue
                     slot.record_failure(retry_after=getattr(exc, "retry_after", None))
                     log.warning("batch bars provider failed, failing over",
                                 provider=slot.provider.name, error=str(exc))

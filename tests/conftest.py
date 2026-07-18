@@ -87,8 +87,11 @@ class FakeBatchProvider(MarketDataProvider):
     contract without a network:
       * ``unimplemented=True`` — ``bars_multi`` raises ``NotImplementedError`` so
         the router falls back to the single-symbol degrade path.
-      * ``fail=True`` — ``bars_multi`` raises ``ProviderError`` (whole-provider
-        failure → the router penalizes and fails over / degrades).
+      * ``fail=True`` — ``bars_multi`` raises a retryable ``ProviderError``
+        (whole-provider failure → the router penalizes and fails over / degrades).
+      * ``fail_nonretryable=True`` — ``bars_multi`` raises a NON-retryable
+        ``ProviderError`` (a permanent request/capability mismatch on a healthy
+        provider → the router fails over WITHOUT penalizing it).
       * ``absent`` — symbols simply omitted from the returned dict (mirrors a
         failed chunk / a name the feed has no data for: best-effort, absent).
       * ``frozen`` — symbols whose newest bar is weeks old (a stalled feed) so
@@ -101,13 +104,15 @@ class FakeBatchProvider(MarketDataProvider):
     name = "fakebatch"
 
     def __init__(self, *, name: str = "fakebatch", unimplemented: bool = False,
-                 fail: bool = False, bars_count: int = 90, volume: int = 1_000_000,
+                 fail: bool = False, fail_nonretryable: bool = False,
+                 bars_count: int = 90, volume: int = 1_000_000,
                  price: str = "100.00", absent: tuple[str, ...] = (),
                  frozen: tuple[str, ...] = (), unsound: tuple[str, ...] = ()) -> None:
         super().__init__(api_key="test")
         self.name = name
         self._unimplemented = unimplemented
         self._fail = fail
+        self._fail_nonretryable = fail_nonretryable
         self._bars_count = bars_count
         self._volume = volume
         self._price = float(Decimal(price))
@@ -149,6 +154,10 @@ class FakeBatchProvider(MarketDataProvider):
         self.multi_calls += 1
         if self._unimplemented:
             raise NotImplementedError
+        if self._fail_nonretryable:
+            # a permanent request/capability mismatch (healthy provider, request
+            # just can't succeed here) — the router must fail over WITHOUT penalty
+            raise ProviderError(self.name, "unsupported here", retryable=False)
         if self._fail:
             raise ProviderError(self.name, "simulated batch failure")
         return {

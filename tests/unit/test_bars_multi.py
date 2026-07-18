@@ -91,6 +91,38 @@ async def test_frozen_symbol_dropped(policy: FreshnessPolicy) -> None:
     assert "MSFT" not in result
 
 
+async def test_nonretryable_error_fails_over_without_penalty(policy: FreshnessPolicy) -> None:
+    # A NON-retryable ProviderError (permanent request/capability mismatch on a
+    # healthy provider) must fail over to the next provider WITHOUT demoting the
+    # first into the penalty box — mirroring the _route failover contract.
+    primary = FakeBatchProvider(name="primary", fail_nonretryable=True)
+    backup = FakeBatchProvider(name="backup", bars_count=90)
+    router = DataRouter([(primary, 10), (backup, 20)], policy)
+
+    result = await router.bars_multi(["AAPL", "MSFT"], timeframe="1d", limit=90)
+
+    assert set(result) == {"AAPL", "MSFT"}  # served by the backup
+    assert backup.multi_calls == 1
+    primary_slot = next(s for s in router._slots if s.provider is primary)
+    assert primary_slot.consecutive_failures == 0  # NOT penalized
+    assert primary_slot.available is True
+
+
+async def test_retryable_error_penalizes_and_fails_over(policy: FreshnessPolicy) -> None:
+    # By contrast a RETRYABLE ProviderError (a real provider fault) DOES penalize
+    # the first provider before failing over.
+    primary = FakeBatchProvider(name="primary", fail=True)
+    backup = FakeBatchProvider(name="backup", bars_count=90)
+    router = DataRouter([(primary, 10), (backup, 20)], policy)
+
+    result = await router.bars_multi(["AAPL", "MSFT"], timeframe="1d", limit=90)
+
+    assert set(result) == {"AAPL", "MSFT"}  # served by the backup
+    primary_slot = next(s for s in router._slots if s.provider is primary)
+    assert primary_slot.consecutive_failures == 1  # penalized
+    assert primary_slot.available is False
+
+
 def _alpaca(handler: Callable[[httpx.Request], httpx.Response]) -> AlpacaDataProvider:
     provider = AlpacaDataProvider(api_key="key_id", options={"secret_key": "shh"})
     provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -137,6 +169,10 @@ async def test_alpaca_bars_multi_parses_and_paginates() -> None:
     assert seen[0].url.path == "/v2/stocks/bars"
     assert seen[0].url.params.get("symbols") == "AAPL,MSFT"
     assert "/v2/stocks/AAPL/" not in str(seen[0].url)  # not the single-symbol path
+    # per-page `limit` is the ENDPOINT MAX, not the small per-symbol bars_limit:
+    # multi-symbol pagination counts TOTAL bars across symbols, so sending 90
+    # would paginate ~100x and blow the spec §8 4-8 req/screen budget.
+    assert seen[0].url.params.get("limit") == "10000"
 
     assert set(result) == {"AAPL", "MSFT"}
     # both pages merged, chronological by bar-open (the 07-15 page is older, first)
