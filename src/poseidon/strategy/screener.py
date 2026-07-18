@@ -31,7 +31,8 @@ from statistics import median
 
 import structlog
 
-from ..core.config import ScreenerConfig
+from ..core.config import ScreenerConfigBase
+from ..data.base import DataCapability
 from ..data.router import DataRouter
 from ..data.universe import load_universe
 from .base import pct_return
@@ -65,18 +66,30 @@ class MarketScreener:
     stampeding the data feed.
     """
 
-    def __init__(self, config: ScreenerConfig, router: DataRouter,
-                 *, now: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, config: ScreenerConfigBase, router: DataRouter,
+                 *, require: DataCapability | None = None,
+                 concurrency: int | None = None,
+                 now: Callable[[], float] = time.monotonic) -> None:
         self._config = config
         self._router = router
+        # ``require`` gates ``bars_multi`` to providers advertising this capability
+        # (crypto passes CRYPTO so a ``/USD`` batch can never reach an equity provider);
+        # ``concurrency`` bounds the per-symbol degrade fan-out. Equity passes both
+        # None ⇒ routing is byte-identical to the single-screener era.
+        self._require = require
+        self._concurrency = concurrency
         self._now = now
-        self._cache: list[str] = []
+        # The cache holds the full ScoredCandidate objects (not just symbols) so
+        # ``ranked_candidates`` can surface each candidate's screen rationale to the
+        # PM's prompt while ``select_candidates`` derives the bare symbol list — both
+        # served from one screen per TTL window.
+        self._cache: list[ScoredCandidate] = []
         self._cache_at = 0.0
         self._lock = asyncio.Lock()
 
-    async def select_candidates(self) -> list[str]:
-        """Return the cached top-N ranked symbols, re-screening when the cache TTL
-        lapses.
+    async def ranked_candidates(self) -> list[ScoredCandidate]:
+        """Return the cached top-N :class:`ScoredCandidate` objects (symbol +
+        blended-momentum metrics), re-screening when the cache TTL lapses.
 
         NEVER raises: a screen failure returns the last good cache (or ``[]``), so
         the caller degrades to the watchlist and the cycle is never blocked.
@@ -91,14 +104,20 @@ class MarketScreener:
             except Exception:  # noqa: BLE001 - screening must never block the cycle
                 log.exception("screener failed; reusing last candidates")
                 return list(self._cache)
-            self._cache = [c.symbol for c in ranked]
+            self._cache = ranked
             self._cache_at = self._now()
             return list(self._cache)
+
+    async def select_candidates(self) -> list[str]:
+        """Return the cached top-N ranked symbols, re-screening when the cache TTL
+        lapses. Thin symbol-only view over :meth:`ranked_candidates`; NEVER raises."""
+        return [c.symbol for c in await self.ranked_candidates()]
 
     async def _screen(self) -> list[ScoredCandidate]:
         universe = load_universe(self._config.universe)
         bars_by_symbol = await self._router.bars_multi(
-            universe, timeframe="1d", limit=self._config.bars_limit
+            universe, timeframe="1d", limit=self._config.bars_limit,
+            require=self._require, concurrency=self._concurrency,
         )
         floor = float(self._config.min_dollar_volume)  # Decimal cfg → float compare
         scored: list[ScoredCandidate] = []

@@ -14,7 +14,7 @@ from typing import Any
 
 import structlog
 
-from ..core.config import RiskConfig, SnapshotConfig
+from ..core.config import CycleBudgetConfig, RiskConfig, SnapshotConfig
 from ..core.errors import ConfigError, DataError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
@@ -24,7 +24,23 @@ from .analysis.snapshot import build_snapshot
 
 log = structlog.get_logger(__name__)
 
-_MAX_RESULT_CHARS = 60_000  # keep tool results bounded for the context window
+# Market-data tools whose results are the balloon risk for the context window
+# (large bar series, news bodies, snapshots). The per-cycle cumulative ceiling
+# gates ONLY these — portfolio/risk/workshop tools are small and are what the
+# PM needs to actually converge on a decision, so they always stay available.
+_DATA_TOOL_NAMES = frozenset({
+    "get_quote", "get_bars", "get_option_chain", "get_news",
+    "get_earnings_calendar", "get_economic_calendar", "get_market_snapshot",
+})
+
+_SOFT_BUDGET_NOTE = (
+    "substantial market data already gathered this cycle; prefer the candidate "
+    "summaries you already have and converge to submit_decision"
+)
+_HARD_BUDGET_INSTRUCTION = (
+    "Per-cycle data budget reached. Decide with the data you already have, or "
+    "record a data_gap. Do not request more market data this cycle."
+)
 
 # Patterns that resemble prompt-injection inside otherwise-data content (news
 # headlines/summaries the model reads). We ANNOTATE, never rewrite: the item is
@@ -60,7 +76,8 @@ class ToolDispatcher:
                  *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY",
                  risk_config: RiskConfig | None = None,
                  workshop: AlgorithmWorkshop | None = None,
-                 snapshot_config: SnapshotConfig | None = None) -> None:
+                 snapshot_config: SnapshotConfig | None = None,
+                 budget: CycleBudgetConfig | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
@@ -69,7 +86,17 @@ class ToolDispatcher:
         self._risk_config = risk_config or RiskConfig()
         self._workshop = workshop
         self._snapshot_config = snapshot_config or SnapshotConfig()
+        self._budget = budget or CycleBudgetConfig()
         self.sources_used: set[str] = set()
+        # Cumulative serialized tool-output chars this cycle; reset per cycle by
+        # ``reset_cycle_budget()`` (the agent calls it alongside sources_used).
+        self._cycle_tool_chars = 0
+
+    def reset_cycle_budget(self) -> None:
+        """Zero the per-cycle cumulative tool-output counter. Called once at the
+        start of each review cycle so the soft/hard ceilings measure THIS cycle,
+        never leaking accumulated output across cycles."""
+        self._cycle_tool_chars = 0
 
     async def dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Execute a tool call. Returns (result_json, is_error)."""
@@ -77,10 +104,30 @@ class ToolDispatcher:
             handler = getattr(self, f"_tool_{name}", None)
             if handler is None:
                 return json.dumps({"error": f"unknown tool {name}"}), True
+            budget = self._budget
+            is_data = name in _DATA_TOOL_NAMES
+            # Hard backstop: once this cycle's cumulative tool output has blown
+            # the ceiling, further DATA tools return a compact envelope instead
+            # of pulling (and accumulating) more raw market data. A last-resort
+            # guard against a runaway tool loop — never a normal path.
+            if is_data and self._cycle_tool_chars >= budget.hard_cycle_tool_chars:
+                payload = json.dumps({
+                    "budget_exhausted": True,
+                    "error": "per-cycle data budget reached",
+                    "instruction": _HARD_BUDGET_INSTRUCTION,
+                })
+                self._cycle_tool_chars += len(payload)
+                return payload, False
             result = await handler(**tool_input)
+            # Soft nudge: substantial data already gathered — attach a converge
+            # note but STILL return the real data (anti-starvation preserved).
+            if (is_data and isinstance(result, dict)
+                    and self._cycle_tool_chars >= budget.soft_cycle_tool_chars):
+                result = {"budget_note": _SOFT_BUDGET_NOTE, **result}
             payload = json.dumps(result, default=str)
-            if len(payload) > _MAX_RESULT_CHARS:
+            if len(payload) > budget.max_tool_result_chars:
                 payload = self._truncate(result)
+            self._cycle_tool_chars += len(payload)
             return payload, False
         except DataError as exc:
             log.warning("tool data error", tool=name, error=str(exc))
@@ -95,14 +142,14 @@ class ToolDispatcher:
             log.exception("tool failed", tool=name)
             return json.dumps({"error": f"internal error: {exc}"}), True
 
-    @staticmethod
-    def _truncate(result: Any) -> str:
+    def _truncate(self, result: Any) -> str:
+        limit = self._budget.max_tool_result_chars
         if isinstance(result, dict):
             for key, value in result.items():
                 if isinstance(value, list) and len(value) > 50:
                     result[key] = value[:50] + [f"... truncated {len(value) - 50} items"]
         payload = json.dumps(result, default=str)
-        if len(payload) <= _MAX_RESULT_CHARS:
+        if len(payload) <= limit:
             return payload
         # Still too large: never hand the model a mid-token slice of market
         # data (a price '412.87' cut to '412.8' reads as a plausible but wrong
@@ -111,7 +158,7 @@ class ToolDispatcher:
         # fragment, which would otherwise inflate the envelope past the bound.
         return json.dumps({
             "truncated": True,
-            "preview": payload[: _MAX_RESULT_CHARS // 2],
+            "preview": payload[: limit // 2],
             "error": "tool result exceeded the size limit and was truncated",
             "instruction": "The preview is an incomplete fragment. Treat any field not "
                            "fully visible in it as unavailable, record the gap in "
@@ -129,8 +176,16 @@ class ToolDispatcher:
         bars = await self._router.bars(symbol, timeframe=timeframe, limit=limit)
         for b in bars[:1]:
             self.sources_used.add(b.source)
-        return {"symbol": symbol.upper(), "timeframe": timeframe,
-                "bars": [b.model_dump(mode="json") for b in bars]}
+        cap = self._budget.max_bars_returned
+        out: dict[str, Any] = {"symbol": symbol.upper(), "timeframe": timeframe}
+        if len(bars) > cap:
+            # Keep the NEWEST cap bars (series is oldest→newest). The note tells
+            # the model the tail was capped for budget, NOT that data is missing,
+            # so it never confabulates a gap. No price is cut — only the count.
+            bars = bars[-cap:]
+            out["note"] = f"series capped to the most recent {cap} bars"
+        out["bars"] = [b.model_dump(mode="json") for b in bars]
+        return out
 
     async def _tool_get_option_chain(self, underlying: str,
                                      expiration: str | None) -> dict[str, Any]:
@@ -144,14 +199,21 @@ class ToolDispatcher:
         articles = await self._router.news(symbols or None, limit=limit)
         for a in articles[:1]:
             self.sources_used.add(a.source)
+        max_articles = self._budget.max_news_articles
+        summary_cap = self._budget.max_news_summary_chars
         out: list[dict[str, Any]] = []
-        for a in articles:
+        for a in articles[:max_articles]:
             item = a.model_dump(mode="json")
+            # Injection scan runs on the FULL text before any truncation so a
+            # payload split across the cap boundary can't dodge the detector.
             warning = _scan_injection(f"{a.headline}\n{a.summary or ''}")
             if warning:
                 item["injection_warning"] = warning
                 log.warning("news item flagged for possible prompt injection",
                             source=a.source, headline=(a.headline or "")[:120])
+            summary = item.get("summary")
+            if isinstance(summary, str) and len(summary) > summary_cap:
+                item["summary"] = summary[:summary_cap] + "…"
             out.append(item)
         return {"articles": out}
 
