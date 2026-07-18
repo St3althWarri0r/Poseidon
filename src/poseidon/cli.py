@@ -220,6 +220,9 @@ def cmd_research(args: argparse.Namespace) -> int:
             horizons=rc.horizons,
             min_cross=rc.min_cross,
             null=null,
+            n_groups=rc.n_groups,
+            # --universe labels the report with a survivorship caveat (§4.8); "" stays silent.
+            universe_note=args.universe,
         )
         print(rep.render())
         return 0
