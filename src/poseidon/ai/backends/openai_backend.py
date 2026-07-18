@@ -16,7 +16,7 @@ import httpx
 import structlog
 
 from ...core.config import AIConfig
-from ...core.errors import AgentError
+from ...core.errors import AgentError, BackendUnreachableError
 from .base import LLMResponse, StopReason, ToolCall, ToolResult
 
 log = structlog.get_logger(__name__)
@@ -69,6 +69,14 @@ class OpenAICompatibleBackend:
             r = await self._client.post("/chat/completions", json=payload)
             r.raise_for_status()
             data = r.json()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Connect-phase failure: the backend could not be reached at all
+            # (e.g. LM Studio not running). ConnectError/ConnectTimeout subclass
+            # httpx.HTTPError, so this branch MUST come first. A ReadTimeout
+            # mid-generation or an HTTP 4xx/5xx means the server is up but
+            # erroring — that stays a plain AgentError below.
+            raise BackendUnreachableError(
+                f"model backend unreachable at {self._client.base_url}: {exc}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise AgentError(f"local model backend error: {exc}") from exc
         if not isinstance(data, dict):
