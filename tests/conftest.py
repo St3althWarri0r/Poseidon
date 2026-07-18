@@ -21,12 +21,13 @@ class FakeProvider(MarketDataProvider):
 
     def __init__(self, *, name: str = "fake", price: str = "100.00", fail: bool = False,
                  stale: bool = False, bars_count: int = 60, volume: int = 500_000,
-                 frozen_days: int = 0, crypto: bool = False) -> None:
+                 frozen_days: int = 0, crypto: bool = False, age_seconds: float = 0.0) -> None:
         super().__init__(api_key="test")
         self.name = name
         self._price = Decimal(price)
         self._fail = fail
         self._stale = stale
+        self._age_seconds = age_seconds  # quote as_of this many seconds in the past
         self._bars_count = bars_count
         self._volume = volume
         self._frozen_days = frozen_days  # shift all bars this many days into the past
@@ -44,7 +45,9 @@ class FakeProvider(MarketDataProvider):
         self.calls += 1
         if self._fail:
             raise ProviderError(self.name, "simulated failure")
-        as_of = datetime.now(UTC) - (timedelta(hours=2) if self._stale else timedelta(seconds=0))
+        as_of = datetime.now(UTC) - (
+            timedelta(hours=2) if self._stale else timedelta(seconds=self._age_seconds)
+        )
         return Quote(
             symbol=symbol,
             bid=self._price - Decimal("0.05"),

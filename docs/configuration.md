@@ -35,7 +35,8 @@ Secrets never appear in this file: fields named `credential` hold the
 | Field | Default | Notes |
 | --- | --- | --- |
 | `providers[]` | — | `name`, `credential`, `priority` (lower = first), `enabled`, `options` |
-| `real_time_max_age_seconds` | 5 | freshness gate for REAL_TIME |
+| `real_time_max_age_seconds` | 5 | freshness gate for REAL_TIME (equities) |
+| `crypto_real_time_max_age_seconds` | 60 | REAL_TIME gate for crypto (24/7 REST cadence); equities stay strict |
 | `delayed_max_age_seconds` | 900 | gate for DELAYED |
 | `allow_delayed_for_research` | true | delayed data may inform research; orders always need fresh quotes |
 | `request_timeout_seconds` | 10 | per HTTP call |

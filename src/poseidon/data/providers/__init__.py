@@ -11,6 +11,7 @@ from __future__ import annotations
 from ..base import MarketDataProvider
 from .alpaca_data import AlpacaDataProvider
 from .alphavantage import AlphaVantageProvider
+from .coinbase_data import CoinbaseDataProvider
 from .finnhub import FinnhubProvider
 from .polygon import PolygonProvider
 from .public_data import PublicDataProvider
@@ -25,6 +26,7 @@ BUILTIN_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     AlpacaDataProvider.name: AlpacaDataProvider,
     TradierDataProvider.name: TradierDataProvider,
     PublicDataProvider.name: PublicDataProvider,
+    CoinbaseDataProvider.name: CoinbaseDataProvider,
 }
 
 __all__ = ["BUILTIN_PROVIDERS"]

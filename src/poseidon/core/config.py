@@ -163,7 +163,11 @@ class BrokerConfig(StrictModel):
 
 class DataConfig(StrictModel):
     providers: list[ProviderConfig] = Field(default_factory=list)
-    real_time_max_age_seconds: float = Field(default=5.0, gt=0)
+    real_time_max_age_seconds: float = Field(default=5.0, gt=0)  # equities: strict
+    # Crypto's own real-time window (24/7 REST cadence is looser than an equity
+    # feed); the freshness gate uses this for crypto symbols only — equities
+    # stay strict at real_time_max_age_seconds.
+    crypto_real_time_max_age_seconds: float = Field(default=60.0, gt=0)
     delayed_max_age_seconds: float = Field(default=900.0, gt=0)
     allow_delayed_for_research: bool = True  # delayed data OK for research, never for orders
     request_timeout_seconds: float = Field(default=10.0, gt=0)

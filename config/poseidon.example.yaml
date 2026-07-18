@@ -71,7 +71,8 @@ ai:
   #   output_price_per_mtok: 0
 
 data:
-  real_time_max_age_seconds: 5
+  real_time_max_age_seconds: 5          # equities: strict REAL_TIME gate
+  crypto_real_time_max_age_seconds: 60  # crypto trades 24/7 over a looser REST cadence
   delayed_max_age_seconds: 900
   allow_delayed_for_research: true   # delayed data OK for research; orders always require fresh quotes
   providers:
@@ -85,6 +86,10 @@ data:
     # - name: public_data
     #   credential: public_api_secret
     #   priority: 10
+    - name: coinbase             # FREE real-time spot crypto (BASE/USD); no key,
+      priority: 8                # no account — public Coinbase Exchange endpoint.
+                                 # Crypto-only, so it never serves equity requests;
+                                 # priority 8 = tried before alpaca for crypto.
     - name: finnhub              # free tier: real-time US quotes, news, earnings
       credential: finnhub_api_key
       priority: 20
