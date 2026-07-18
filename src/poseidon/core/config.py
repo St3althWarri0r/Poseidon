@@ -209,6 +209,11 @@ class RiskConfig(StrictModel):
     # positions when explicitly enabled. When off, protective stops are canceled
     # and the book sits unprotected until resume (called out in the halt summary).
     flatten_on_halt: bool = False
+    # Default TTL for an autonomous-mode consent grant, in hours. 0 = the grant
+    # never expires (current behaviour). When > 0, granting AUTONOMOUS stamps a
+    # durable ``mode.autonomous_expires_at`` bound that auto-reverts to APPROVAL
+    # when it lapses (control-hardening spec §5).
+    autonomous_ttl_hours: float = Field(default=0, ge=0)
 
     @field_validator("universe_exclude_symbols", "universe_allow_symbols")
     @classmethod

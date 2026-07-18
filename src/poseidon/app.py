@@ -12,7 +12,7 @@ import contextlib
 import json
 import signal
 import uuid
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import structlog
@@ -227,6 +227,11 @@ class ApplicationKernel:
         await self.audit.append("system", "startup", {"version": __version__, "mode": cfg.mode.value})
         await self.sync.start()
         await self.order_manager.resume_open_orders()
+        # Consent-bound handling: honor/stamp the autonomous-expiry latch and
+        # revert immediately if a boot re-armed AUTONOMOUS past an expired bound
+        # (spec §5.4 site 1). After the notifier is constructed so the critical
+        # revert notification is delivered; before the scheduler runs any cycle.
+        await self._init_autonomy_expiry()
         self.scheduler.start(self._effective_schedules())
         await self.health.start()
         await self.updates.start()
@@ -1170,12 +1175,88 @@ class ApplicationKernel:
 
     # ---------------------------------------------------------------- control
 
-    async def set_mode(self, mode: TradingMode) -> None:
+    async def set_mode(self, mode: TradingMode, *,
+                       expires_at: datetime | None = None) -> None:
+        """Operator mode change. Granting AUTONOMOUS also (re)writes the durable
+        consent bound ``mode.autonomous_expires_at`` (control-hardening spec §5.2):
+        an explicit ``expires_at`` wins; else a configured ``risk.autonomous_ttl_
+        hours`` stamps now+ttl; else the grant is unbounded (the key is cleared).
+        Leaving AUTONOMOUS clears the bound — the grant is consumed. The key always
+        gets rewritten on a grant so a stale bound from a prior grant can never leak
+        into a new one."""
         previous = self.order_manager.mode
         self.order_manager.set_mode(mode)
         await self.audit.append("human", "mode.changed",
                                 {"from": previous.value, "to": mode.value})
+        if mode is TradingMode.AUTONOMOUS:
+            if expires_at is not None:
+                bound = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+                stamped = bound.astimezone(UTC).isoformat()
+            elif self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+            else:
+                stamped = ""  # unbounded grant (status quo); "" clears the latch
+            await self.db.kv_set("mode.autonomous_expires_at", stamped)
+            await self.audit.append("human", "mode.autonomy_granted",
+                                    {"expires_at": stamped})
+        else:
+            # Leaving AUTONOMOUS consumes the grant — never leave a stale bound.
+            await self.db.kv_set("mode.autonomous_expires_at", "")
         log.info("operating mode changed", was=previous.value, now=mode.value)
+
+    async def _check_autonomy_expiry(self) -> bool:
+        """Revert AUTONOMOUS -> APPROVAL when the durable consent bound has lapsed
+        (control-hardening spec §5.3). Idempotent: a no-op unless the manager is
+        actually AUTONOMOUS with an expired/absent-but-set bound, so a second call
+        (or a scheduler tick after an already-handled expiry) never double-reverts
+        or double-notifies. The revert goes through ``order_manager.set_mode``
+        DIRECTLY — NOT ``kernel.set_mode`` — so the kv latch is preserved: a
+        crash-restart loop that re-arms AUTONOMOUS from config must re-observe the
+        expiry and revert again, never silently re-grant. An unparseable bound is
+        fail-safe treated as expired (a corrupt bound must not grant unbounded
+        autonomy). Returns True iff it reverted. No LLM; the expiry is audited."""
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
+        raw = await self.db.kv_get("mode.autonomous_expires_at")
+        if not raw:  # absent or "" (unbounded/cleared) — no expiry to enforce
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            expires_at = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            if datetime.now(UTC) < expires_at:
+                return False
+        except (ValueError, TypeError):
+            pass  # unparseable -> expired (fail-safe), fall through to revert
+        # Direct set_mode: leave the kv latch in place (see docstring).
+        self.order_manager.set_mode(TradingMode.APPROVAL)
+        await self.audit.append("system", "mode.autonomy_expired", {"expires_at": raw})
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical",
+            "title": "Autonomous mode expired",
+            "body": "Autonomous mode expired — reverted to approval mode.",
+        })
+        log.warning("autonomous mode expired; reverted to approval", expires_at=raw)
+        return True
+
+    async def _init_autonomy_expiry(self) -> None:
+        """Startup consent-bound handling (control-hardening spec §5.2 startup +
+        §5.4 site 1). When config boots AUTONOMOUS: an existing bound is honored
+        AS-IS (never extended — future kept, past reverted below); an absent bound
+        with a configured ttl stamps now+ttl; an absent bound with no ttl stays
+        unbounded (status quo). Then run the expiry checker so a boot with a stale
+        past bound reverts immediately. A crash-restart loop therefore can NEVER
+        re-arm expired autonomy — the stale key latches until an explicit operator
+        re-grant."""
+        if self.order_manager.mode is TradingMode.AUTONOMOUS:
+            existing = await self.db.kv_get("mode.autonomous_expires_at")
+            if not existing and self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+                await self.db.kv_set("mode.autonomous_expires_at", stamped)
+                await self.audit.append("system", "mode.autonomy_granted",
+                                        {"expires_at": stamped, "source": "startup"})
+        await self._check_autonomy_expiry()
 
     def _halt_file(self) -> Path:
         return self.config.data_dir / "HALT"
