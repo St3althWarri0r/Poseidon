@@ -13,8 +13,21 @@ from .anthropic_backend import AnthropicBackend
 from .base import ChatBackend, LLMResponse, ToolCall, ToolResult
 from .openai_backend import OpenAICompatibleBackend
 
-__all__ = ["ChatBackend", "LLMResponse", "ToolCall", "ToolResult",
-           "add_usage", "build_backend", "build_backends", "sum_usage"]
+__all__ = ["CURATED_CLAUDE_MODELS", "ChatBackend", "LLMResponse", "ToolCall",
+           "ToolResult", "add_usage", "build_backend", "build_backends", "sum_usage"]
+
+# Curated Claude model ids offered by the dashboard model selector (GET
+# /api/models → anthropic.models). Seeded from the canonical in-repo ids
+# (docs/api-configuration.md). Every id here must support adaptive thinking +
+# the effort control, because the anthropic backend always sends
+# thinking={"type":"adaptive"} + output_config={"effort"} on the trading
+# decision (force_tool is None) — a non-adaptive id would 400. A custom id can
+# still be typed in the UI; this list is only the curated menu. Extend it as
+# Anthropic ships adaptive-capable ids (verify via the claude-api skill).
+CURATED_CLAUDE_MODELS: tuple[str, ...] = (
+    "claude-opus-4-8",
+    "claude-haiku-4-5-20251001",
+)
 
 
 def add_usage(acc: list[dict[str, int]] | None, usage: object) -> None:

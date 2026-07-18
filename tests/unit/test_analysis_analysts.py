@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from poseidon.ai.analysis.analysts import run_analysts
+from poseidon.ai.analysis.analysts import _ROLES, run_analysts
 from poseidon.ai.analysis.parse import first_json_obj
 from poseidon.ai.analysis.snapshot import Snapshot
 
@@ -36,6 +36,31 @@ def test_first_json_obj_ignores_braces_inside_strings() -> None:
     # scan — it must not truncate extraction before the real closing brace.
     text = '{"a": "has } brace", "b": 2}'
     assert first_json_obj(text) == {"a": "has } brace", "b": 2}
+
+
+def test_technical_role_carries_indicator_guidance() -> None:
+    tech = _ROLES["technical"]
+    assert "using ONLY the snapshot" in tech
+    for phrase in (
+        "SMA50/SMA200",
+        "never time an entry off the cross alone",
+        "EMA10",
+        "MACD(12,26,9)",
+        "RSI14",
+        "walks the band",
+        "ATR14",
+        "NO directional content",
+        "NEVER estimate a missing",
+    ):
+        assert phrase in tech
+
+
+def test_guidance_absent_from_other_roles() -> None:
+    for role in ("fundamentals", "news", "sentiment"):
+        text = _ROLES[role]
+        for phrase in ("walks the band", "NO directional content",
+                       "SMA50/SMA200", "never time an entry off the cross alone"):
+            assert phrase not in text
 
 
 async def test_run_analysts_degrades_without_crashing() -> None:

@@ -9,6 +9,7 @@ broker reference used for submission and calls the engine first.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -65,6 +66,14 @@ class RiskEngine:
         # validation, promoted to _pending on submit, released on a pre-submit
         # rejection, or pruned after 15 min if neither happens.
         self._validated_notional: dict[str, tuple[str, Decimal, bool, datetime]] = {}
+        # Halt-flatten carve-out (§3.4): an unforgeable capability token whose
+        # IDENTITY is the capability. Only kernel.halt() opens the window (and
+        # closes it in a finally); only order_manager.flatten_all holds the
+        # token. A tripped breaker rejects every order that does not present the
+        # live token for a leg-free risk-reducing exit within the deadline. Never
+        # rides on the Order model, any schema, the DB, or any /api/chat payload.
+        self._halt_flatten_token: object | None = None
+        self._halt_flatten_deadline = 0.0
 
     # -- accounting ----------------------------------------------------------
 
@@ -135,9 +144,36 @@ class RiskEngine:
             self._orders_today_date = today
             self._orders_today = 0
 
+    # -- halt-flatten carve-out (§3.4) ------------------------------------------
+
+    def open_halt_flatten_window(self, *, ttl_seconds: float = 300.0) -> object:
+        """Mint a fresh capability token and arm the carve-out for ``ttl_seconds``.
+
+        The returned bare ``object()`` cannot be forged (identity IS the
+        capability), serialized, persisted, or replayed. The ONLY caller is
+        ``kernel.halt()``, which passes it straight to ``flatten_all`` and closes
+        the window in a ``finally``. Rewriting the token invalidates any prior one.
+        """
+        self._halt_flatten_token = object()
+        self._halt_flatten_deadline = time.monotonic() + ttl_seconds
+        return self._halt_flatten_token
+
+    def close_halt_flatten_window(self) -> None:
+        """Disarm the carve-out. ``kernel.halt()`` calls this in a ``finally`` so
+        a crashed flatten still leaves the breaker rejecting every order."""
+        self._halt_flatten_token = None
+
+    def halt_exit_permitted(self, order: Order, token: object | None) -> bool:
+        """True only for the sanctioned halt-flatten exit: the live token, an
+        open window before its deadline, and a leg-free risk-reducing order.
+        Even a stolen live token admits nothing else."""
+        return (token is not None and token is self._halt_flatten_token
+                and time.monotonic() < self._halt_flatten_deadline
+                and order.side.is_risk_reducing and not order.legs)
+
     # -- validation -------------------------------------------------------------
 
-    async def validate_order(self, order: Order) -> Quote:
+    async def validate_order(self, order: Order, *, halt_token: object | None = None) -> Quote:
         """Run every risk rule against live data.
 
         Returns the fresh quote used, so the caller can reuse it (e.g. for
@@ -146,7 +182,12 @@ class RiskEngine:
         context cannot be assembled (in which case the order must not go
         out — no data, no trade).
         """
-        if self.circuit.is_open:
+        # Breaker gate with the halt-flatten carve-out (§3.4). The
+        # ``halt_token is not None`` short-circuit means every existing caller
+        # (all pass nothing) never consults the window — a tripped breaker still
+        # rejects EVERY normal order, including risk-reducing guardian exits.
+        if self.circuit.is_open and not (
+                halt_token is not None and self.halt_exit_permitted(order, halt_token)):
             raise CircuitBreakerOpen(self.circuit.reason or "open")
         self._roll_daily_counter()
         self._reconcile_pending()

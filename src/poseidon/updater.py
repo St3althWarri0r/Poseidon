@@ -1,11 +1,13 @@
 """Self-update service.
 
 For a private git-installed deployment the update channel is the git
-remote: the updater periodically fetches, compares HEAD to the upstream
-branch, and either notifies (default) or — when ``auto_apply`` is on —
-performs ``git pull --ff-only`` plus ``pip install -e .`` and asks systemd
-to restart the service. Non-fast-forward situations are never forced; they
-produce a notification for the human instead.
+remote: on launch and then periodically the updater fetches and compares
+HEAD to the upstream branch. When ``auto_apply`` is on (the default) it
+performs ``git pull --ff-only`` plus ``pip install -e .`` and then notifies
+the operator to restart — it never bounces the running engine itself, so an
+update only takes effect on the next restart. Set ``auto_apply: false`` to
+only be notified that an update is available. Non-fast-forward situations
+are never forced; they produce a notification for the human instead.
 """
 
 from __future__ import annotations
@@ -139,6 +141,15 @@ class UpdateService:
                 "body": output[-500:],
             })
             return False
+        # Louder than the desktop toast alone: a WARNING lands in the terminal
+        # and the journal for a headless `poseidon run` service, where a human
+        # watching logs would otherwise miss the toast. The restart stays
+        # user-initiated — we never bounce the engine ourselves.
+        log.warning(
+            "update installed — restart to activate",
+            remote=self.available,
+            restart_cmd="systemctl --user restart poseidon",
+        )
         await self._bus.publish(Topics.NOTIFY, {
             "level": "info", "title": "Update applied",
             "body": "New version installed. Restart the service to activate "

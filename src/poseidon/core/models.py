@@ -92,6 +92,23 @@ class Bar(PoseidonModel):
     source: str
 
 
+class InstrumentProfile(PoseidonModel):
+    """Resolved instrument identity (reference data, no Money fields)."""
+
+    symbol: str
+    name: str
+    exchange: str | None = None
+    currency: str | None = None
+    asset_type: str = "equity"
+    as_of: datetime
+    source: str
+
+    @field_validator("symbol")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.strip().upper()
+
+
 class Greeks(PoseidonModel):
     delta: float | None = None
     gamma: float | None = None

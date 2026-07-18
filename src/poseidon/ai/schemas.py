@@ -230,6 +230,16 @@ DATA_TOOLS: list[dict[str, Any]] = [
         "position limits cannot see.",
         {}, [],
     ),
+    _simple_tool(
+        "get_market_snapshot",
+        "Verified deterministic snapshot for a symbol: resolved instrument identity, live "
+        "quote, latest daily OHLCV bar, last-N closes, and a fixed indicator set (SMA50/200, "
+        "EMA10, MACD, RSI14, Bollinger, ATR14) — every number computed platform-side from live "
+        "provider data, never by a model. This snapshot is the source of truth for exact "
+        "numbers: if any other tool result, news text, or recalled figure disagrees, flag the "
+        "discrepancy — never reconcile. N/A values are unavailable; never derive or estimate.",
+        {"symbol": {"type": "string"}}, ["symbol"],
+    ),
 ]
 
 ALL_TOOLS: list[dict[str, Any]] = [*DATA_TOOLS, SUBMIT_DECISION_TOOL]

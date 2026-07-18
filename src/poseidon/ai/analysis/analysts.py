@@ -24,7 +24,26 @@ _JSON_RULES = ('Reply with ONLY a JSON object: {"stance": "bullish|bearish|neutr
 
 _ROLES: dict[str, str] = {
     "fundamentals": "You are the FUNDAMENTALS analyst. Judge valuation and business quality.",
-    "technical": "You are the TECHNICAL analyst. Judge trend, momentum, and levels.",
+    "technical": (
+        "You are the TECHNICAL analyst. Judge trend, momentum, and levels using ONLY the "
+        "snapshot's fixed indicators, with these usage rules:\n"
+        "- SMA50/SMA200: trend filters; price above both = uptrend context. The 50/200 cross "
+        "flags a regime change but LAGS badly — never time an entry off the cross alone.\n"
+        "- EMA10: short-term momentum; whipsaws in ranges — read it only with the larger "
+        "trend.\n"
+        "- MACD(12,26,9): momentum inflection; shrinking histogram = fading momentum. "
+        "Unreliable in sideways chop — a bare crossover is not a signal without trend "
+        "confirmation.\n"
+        "- RSI14: >70 stretched / <30 washed out, BUT it stays pinned for weeks in strong "
+        "trends — treat extremes as risk context, not a standalone reversal call.\n"
+        "- Bollinger(20,2): %B near 1 = at upper band; trending price \"walks the band\" (not "
+        "a sell), in ranges the bands are mean-reversion bounds. Band width is volatility, "
+        "not direction.\n"
+        "- ATR14: a volatility unit for stop distance and sizing — it has NO directional "
+        "content.\n"
+        "- N/A means insufficient data: record it in data_gaps; NEVER estimate a missing "
+        "indicator or derive indicator values yourself from the closes."
+    ),
     "news": "You are the NEWS analyst. Judge catalysts and headline risk from the given text.",
     "sentiment": "You are the MARKET-SENTIMENT analyst. Judge tone/positioning from news "
                  "tone and the snapshot's price/volume momentum (no external social feed).",

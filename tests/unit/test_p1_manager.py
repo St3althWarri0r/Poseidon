@@ -61,6 +61,23 @@ def make_decision(qty: str = "10", limit: str = "100.05") -> Decision:
     )
 
 
+def make_exit_decision(qty: str = "10") -> Decision:
+    """A risk-reducing MARKET SELL — the shape the guardian dispatches through
+    ``execute_decision`` when a stop/target fires. Even this must be blocked by a
+    tripped breaker (the normal-order paths carry no halt token)."""
+    return Decision(
+        action=DecisionAction.SELL,
+        trades=[ProposedTrade(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                              quantity=Decimal(qty), strategy="guardian_exit")],
+        rationale=TradeRationale(
+            thesis="stop hit", timing="now", expected_edge="e", risk="r", reward="w",
+            confidence=0.8, portfolio_impact="small", exit_plan=ExitPlan(),
+            max_expected_loss="$100",
+        ),
+        cycle_id="p1exit", created_at=datetime.now(UTC),
+    )
+
+
 @pytest.fixture
 async def stack(tmp_path):
     """Real components wired together over a fake data feed — a copy of the
@@ -253,3 +270,107 @@ async def test_trade_to_order_carries_crypto_asset_class(stack) -> None:
     order = manager._trade_to_order(decision.trades[0], decision)
     assert order.asset_class is AssetClass.CRYPTO
     assert order.symbol == "BTC/USD"
+
+
+def _spy_submit(broker: PaperBroker) -> list[Order]:
+    """Record every order that actually reaches ``broker.submit_order`` (still
+    delegating to the real fill). The adversarial invariant: a tripped breaker
+    means this list stays empty for EVERY normal path."""
+    calls: list[Order] = []
+    real = broker.submit_order
+
+    async def spy(order):
+        calls.append(order)
+        return await real(order)
+
+    broker.submit_order = spy
+    return calls
+
+
+# Task 3 — adversarial "a tripped breaker rejects EVERY normal order".
+# The halt-flatten carve-out (§3.4) admits ONLY kernel.halt()'s flatten path,
+# which presents an engine-minted identity token. No /api/decision, /api/manual,
+# or guardian path carries a token (no parameter exists on those entry points),
+# so a tripped breaker must still block them all — including risk-reducing exits.
+
+
+# execute_decision: a tripped breaker blocks BOTH an opening BUY and a
+# risk-reducing SELL. Neither carries a halt token, so both are rejected before
+# the broker is ever contacted — the AI cannot trade a halted book in any
+# direction. The tooth is the empty submit-spy plus REJECTED_RISK on both.
+async def test_tripped_breaker_blocks_execute_decision_buy_and_sell(stack) -> None:
+    manager = stack["manager"]
+    submit_calls = _spy_submit(stack["broker"])
+    stack["risk"].circuit.force_open("operator HALT")
+
+    buy = await manager.execute_decision(make_decision())
+    sell = await manager.execute_decision(make_exit_decision())
+
+    assert len(buy) == 1 and len(sell) == 1
+    for order in (buy[0], sell[0]):
+        assert order.status is OrderStatus.REJECTED_RISK, order.status
+    assert submit_calls == [], "a halted breaker let an order reach the broker"
+
+
+# submit_manual: the operator's own dashboard ticket is no exception — manual
+# orders run the full risk gate, and a tripped breaker rejects them too (the
+# operator's remedy is resume(), not a manual bypass).
+async def test_tripped_breaker_blocks_submit_manual(stack) -> None:
+    manager = stack["manager"]
+    submit_calls = _spy_submit(stack["broker"])
+    stack["risk"].circuit.force_open("operator HALT")
+
+    order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                  quantity=Decimal("10"), limit_price=Decimal("100.05"), strategy="manual")
+    result = await manager.submit_manual(order)
+
+    assert result.status is OrderStatus.REJECTED_RISK
+    assert submit_calls == [], "a halted breaker let a manual order reach the broker"
+
+
+# guardian dispatch: the guardian routes its stop/target exits through
+# execute_decision (guardian.py:274), so a risk-reducing SELL on that path must
+# also be blocked while the breaker is open — a resting/guardian exit gets NO
+# carve-out (only kernel.halt()'s own flatten does, via a token).
+async def test_tripped_breaker_blocks_guardian_dispatch(stack) -> None:
+    manager = stack["manager"]
+    submit_calls = _spy_submit(stack["broker"])
+    stack["risk"].circuit.force_open("operator HALT")
+
+    # The exact call the guardian makes: execute_decision(reduce-only exit).
+    orders = await manager.execute_decision(make_exit_decision())
+
+    assert len(orders) == 1
+    assert orders[0].status is OrderStatus.REJECTED_RISK
+    assert submit_calls == [], "a halted breaker let a guardian exit reach the broker"
+
+
+# The token thread: with an OPEN breaker, _submit's pre-submit re-check honors a
+# live, engine-minted halt token for a leg-free risk-reducing exit — it does NOT
+# reject with "halted before submit"; the exit reaches the broker and fills.
+# This is the driver for the manager change (the reshaped predicate + kwarg);
+# on pre-change code _submit ignores the token and rejects the valid exit.
+async def test_submit_recheck_honors_active_token(stack) -> None:
+    manager = stack["manager"]
+    risk = stack["risk"]
+    submit_calls = _spy_submit(stack["broker"])
+
+    # Establish a real 10-share AAPL position so the reduce-only SELL is genuine
+    # (broker.positions() shows the holding; the live reduce-only backstop passes).
+    opened = await manager.execute_decision(make_decision())
+    assert opened[0].status is OrderStatus.FILLED, opened[0].status
+    submit_calls.clear()  # ignore the opening fill; watch only the halt exit
+
+    # Now trip the breaker and mint the halt-flatten token, exactly as
+    # kernel.halt() will (task 6). Only this path holds the token.
+    risk.circuit.force_open("operator HALT")
+    token = risk.open_halt_flatten_window()
+
+    exit_order = Order(symbol="AAPL", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                       quantity=Decimal("10"), strategy="halt_flatten")
+    result = await manager._submit(exit_order, halt_token=token)
+
+    # Tooth: the token carried the exit past the pre-submit breaker re-check.
+    assert result.status is OrderStatus.FILLED, (result.status, result.status_reason)
+    assert "halted before submit" not in (result.status_reason or "")
+    assert submit_calls == [exit_order], "the token-bearing exit never reached the broker"

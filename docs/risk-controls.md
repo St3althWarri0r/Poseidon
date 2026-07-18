@@ -31,6 +31,7 @@ audited.
 | `slippage_protection` | `slippage_limit_pct` | limit prices far from the live quote; market orders when the spread exceeds the band |
 | `volatility_halt` | `volatility_halt_daily_move_pct` | new entries in a name that has already moved violently today (per-name circuit-breaker analogue) |
 | `news_blackout` | `news_blackout_minutes_before_econ` | new entries in the minutes before high-importance economic releases (FOMC, CPI, …) |
+| `universe` | `universe_exclude_symbols`, `universe_allow_symbols` | **opens** outside the configured tradeable universe — a denylist (`exclude`, checked first) and an optional allowlist (`allow`; empty = allow all). Deterministic, config-only, no data fetch. Denial is by **underlying**, so an excluded equity cannot be re-entered through its options. Risk-reducing exits always pass (an excluded symbol's position can always be closed). Both lists empty = no-op (the conservative default). Applies to AI decisions **and** the operator's own manual tickets — the config file is the single override. |
 
 **Sector taxonomy.** The concentration rule classifies symbols through
 any SECTOR-capable provider (Finnhub's free company profile today);
@@ -88,10 +89,10 @@ Halts and entry filters exist to stop *new* risk — they must never trap
 the operator in a position. Orders whose side reduces risk (`sell`,
 `sell_to_close`, `buy_to_close`) are therefore exempt from the loss-limit
 halts (daily/weekly/drawdown), the liquidity entry filters
-(spread/volume), and the per-symbol cooldown. They still pass everything
-else: session checks, notional bounds, slippage protection, duplicate
-prevention, and the circuit breaker. `sell_to_open` (opening short option
-risk) is deliberately **not** exempt.
+(spread/volume), the per-symbol cooldown, and the `universe` gate. They
+still pass everything else: session checks, notional bounds, slippage
+protection, duplicate prevention, and the circuit breaker. `sell_to_open`
+(opening short option risk) is deliberately **not** exempt.
 
 ### Asset-class exemptions (crypto)
 
@@ -155,7 +156,30 @@ trigger is audited and notified.
   `circuit_breaker_cooldown_seconds`. While open, every order is refused
   and a critical notification is sent.
 - **Manual halt**: the dashboard HALT button (or `POST /api/halt`)
-  force-opens the breaker until you resume — the kill switch.
+  force-opens the breaker until you resume — the kill switch. The halt is
+  durable three ways (in-memory latch, a DB marker, and a filesystem
+  `HALT` sentinel), so a crash or reboot in autonomous mode cannot
+  silently re-arm trading. After the latch, halt runs two deterministic
+  order-cleanup phases:
+  - **Cancel-all (always).** Every resting broker order — including
+    **guardian protective stops**, which are resting broker orders too — is
+    canceled exactly once, so none can fill mid-halt. A cancel that fails
+    is recorded and surfaced (never retried); cross-broker orders are
+    skipped and reported. With flatten off, the book is left *unprotected*
+    until you resume (the summary notification says so explicitly).
+  - **Flatten (opt-in, `risk.flatten_on_halt`, default off).** When
+    enabled and not in research mode, halt closes every live position with
+    a reduce-only MARKET exit. This runs through the **full risk rule
+    chain** — `ReduceOnlyRule` is never exempted, so an oversized exit is
+    rejected, not forced — carried past the tripped breaker only by an
+    engine-minted, identity-checked capability token that no AI, chat, API,
+    or decision payload can hold. Cancel-all completes before any flatten
+    submits, and any symbol whose resting order survived the cancel pass is
+    excluded, so a resting order can never fill against a closing trade.
+    Flatten is best-effort: session, slippage, and daily-order-budget rules
+    can deny individual exits in a dislocated or after-hours market — every
+    denial is loud. One critical summary notification reports what was
+    canceled, flattened, refused, or failed.
 - **Audit-integrity halt**: a failed nightly audit-chain verification
   force-opens the breaker.
 - **Loss-limit halts**: daily/weekly/drawdown rules act as latched halts —
@@ -202,4 +226,16 @@ the platform's own records, not broker marketing.
   confidence, exit plan, max loss, alternatives) are voided at parse time.
 - Research mode is the config default; autonomous mode must be enabled
   deliberately and is highlighted amber in the dashboard.
+- **Autonomy consent can expire.** An autonomous grant may carry a bound —
+  a default TTL (`risk.autonomous_ttl_hours`, `0` = never expires, the
+  current behavior) or an explicit `expires_in_hours` / `expires_at` passed
+  when you switch to autonomous via `POST /api/mode`. Once past the bound,
+  Poseidon auto-reverts AUTONOMOUS → APPROVAL (checked at startup, on a
+  60-second job that fires even overnight with no AI running, and at the
+  start of every review cycle) and notifies you. The bound is durable and
+  the revert is idempotent and restart-safe: a crash-restart loop can never
+  re-arm expired autonomy, and an unparseable bound is treated as expired
+  (fail-safe — a corrupt bound must never grant unbounded autonomy).
+  In-flight decisions at the boundary route into the approval queue;
+  already-submitted orders, pollers, and guardian plans are untouched.
 - Every consequential action lands in the tamper-evident audit log.

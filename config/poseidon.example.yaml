@@ -254,7 +254,10 @@ dashboard:
 updates:
   enabled: true
   check_interval_hours: 24
-  auto_apply: false
+  # Self-update on launch: git pull --ff-only + pip install, then a restart
+  # prompt. Restart-gated (never restarts the engine for you) and safe
+  # (fast-forward only — a diverged checkout notifies instead of forcing).
+  auto_apply: true
 
 # Offline factor research (poseidon research factors). Pure analysis — never
 # trades. Point-in-time IC/IR; give it a BROAD --symbols universe (hundreds of

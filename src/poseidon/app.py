@@ -12,7 +12,7 @@ import contextlib
 import json
 import signal
 import uuid
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import structlog
@@ -23,6 +23,7 @@ from .ai.agent import ClaudeAgent
 from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
+from .ai.hardware import DEFAULT_LM_STUDIO_URL, probe_local_models
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
@@ -43,13 +44,20 @@ from .core.config import (
 )
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
-from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError, VaultError
+from .core.errors import (
+    AgentError,
+    AgentRefusedError,
+    BackendUnreachableError,
+    ConfigError,
+    DataError,
+    VaultError,
+)
 from .core.events import EventBus, Topics
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
 from .execution.approvals import ApprovalQueue
 from .execution.guardian import PositionGuardian
-from .execution.manager import OrderManager
+from .execution.manager import FlattenSummary, HaltCleanupSummary, OrderManager
 from .health.monitor import HealthMonitor
 from .notifications.service import NotificationService
 from .portfolio.state import PortfolioState
@@ -64,6 +72,24 @@ from .strategy.workshop import AlgorithmWorkshop
 from .updater import UpdateService
 
 log = structlog.get_logger(__name__)
+
+_OVERLAY_HEADER = (
+    "# Managed by the Poseidon dashboard (Account view).\n"
+    "# Broker connections chosen in the UI persist here and are merged over\n"
+    "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
+    "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
+)
+
+
+def _env_credential(entry: dict[str, object], paper: bool) -> str:
+    """Vault credential name for a broker's paper/live environment.
+
+    Alpaca is the only broker whose paper and live accounts are distinct with
+    their own API keys; its catalog entry carries ``credential_paper`` and
+    ``credential_live``. When those are absent (every other broker) this falls
+    back to the single ``credential`` name — unchanged behaviour."""
+    env_key = "credential_paper" if paper else "credential_live"
+    return str(entry.get(env_key) or entry.get("credential", ""))
 
 
 class ApplicationKernel:
@@ -109,6 +135,10 @@ class ApplicationKernel:
         self.dashboard: DashboardServer
         self.updates: UpdateService
         self._cycle_lock = asyncio.Lock()
+        # Serializes halt() and resume() so a resume can never interleave with a
+        # halt's cancel-all/flatten cleanup (and vice versa) — the breaker latch
+        # and the order-cleanup phases must move as one atomic operator action.
+        self._halt_lock = asyncio.Lock()
         self._shutdown = asyncio.Event()
 
     # ------------------------------------------------------------------ wiring
@@ -138,6 +168,11 @@ class ApplicationKernel:
                 f"audit chain verification FAILED at seq {bad_seq} — the audit log has been "
                 "tampered with or corrupted; refusing to start (see docs/troubleshooting.md)"
             )
+
+        migrated_to = await self._migrate_legacy_alpaca_credential()
+        if migrated_to is not None:
+            log.info("migrated legacy alpaca_keys to env-scoped credential",
+                     credential=migrated_to)
 
         self.router = self._build_router()
         self.broker = await self._build_broker()
@@ -186,6 +221,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -197,6 +233,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -221,6 +258,11 @@ class ApplicationKernel:
         await self.audit.append("system", "startup", {"version": __version__, "mode": cfg.mode.value})
         await self.sync.start()
         await self.order_manager.resume_open_orders()
+        # Consent-bound handling: honor/stamp the autonomous-expiry latch and
+        # revert immediately if a boot re-armed AUTONOMOUS past an expired bound
+        # (spec §5.4 site 1). After the notifier is constructed so the critical
+        # revert notification is delivered; before the scheduler runs any cycle.
+        await self._init_autonomy_expiry()
         self.scheduler.start(self._effective_schedules())
         await self.health.start()
         await self.updates.start()
@@ -267,7 +309,8 @@ class ApplicationKernel:
             # news/fundamentals retrieval fast-follow lands.
             scan=None,
             record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
-            over_budget=self._over_ai_budget)
+            over_budget=self._over_ai_budget,
+            snapshot_config=ai_cfg.snapshot)
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
@@ -367,8 +410,15 @@ class ApplicationKernel:
         # name) — the dashboard switch must not silently discard them. Form
         # options (paper starting_cash, reset) layer on top.
         existing = next((b for b in self.config.brokers if b.name == name), None)
-        credential = (existing.credential if existing and existing.credential
-                      else str(entry.get("credential", "")))
+        # Credential is ENV-scoped: a matching-env config entry (name + paper +
+        # a saved credential) wins so an operator's custom vault name is kept;
+        # otherwise resolve the catalog's per-env name. Matching by name ALONE
+        # would hand a live switch the paper credential (or vice-versa) whenever
+        # the config holds only the opposite-env entry — a real-money hazard.
+        existing_env = next((b for b in self.config.brokers
+                             if b.name == name and b.paper == paper and b.credential), None)
+        credential = (existing_env.credential if existing_env
+                      else _env_credential(entry, paper))
         merged_options: dict[str, object] = dict(existing.options) if existing else {}
         merged_options.update(options or {})
         return BrokerConfig(name=name, enabled=True, primary=True,
@@ -450,6 +500,21 @@ class ApplicationKernel:
             old = self.broker
             self.broker = new_broker
             self.order_manager.set_broker(new_broker)
+            if not new_broker.is_paper and self.order_manager.mode is TradingMode.AUTONOMOUS:
+                # A real-money account just became the active broker while armed
+                # for autonomous trading. Demote to APPROVAL server-side so a
+                # mis-click (or any HTTP caller) can never auto-execute real
+                # money — the operator must deliberately re-arm Autonomous.
+                # Done HERE, still inside the switch guard (_switching is True so
+                # orders are refused and synced_at is None), so there is no
+                # window where the LIVE broker is live, the pipeline is reopened,
+                # and the mode is still AUTONOMOUS — a concurrent scheduler
+                # decision or guardian exit cannot slip a real order in before
+                # the clamp. Demotion-only: RESEARCH/APPROVAL are never raised,
+                # and a paper switch never clamps the mode. set_mode() writes the
+                # mode.changed audit record; the notify build below still reads
+                # the already-demoted mode string, so it stays accurate.
+                await self.set_mode(TradingMode.APPROVAL)
             await self.sync.set_broker(new_broker)
             self._apply_broker_to_config(cfg)
             # Everything account-scoped belongs to the OLD account. Clear the
@@ -563,18 +628,248 @@ class ApplicationKernel:
                                   "priority": 10, "enabled": True})
             data["providers"] = providers
             existing["data"] = data
-        header = (
-            "# Managed by the Poseidon dashboard (Account view).\n"
-            "# Broker connections chosen in the UI persist here and are merged over\n"
-            "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
-            "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
-        )
+        self._save_overlay(overlay_file, existing)
+
+    def _write_ai_overlay(self, cfg: AIConfig, *, clear_utility: bool = False) -> None:
+        """Persist the dashboard's AI backend/model choice to poseidon.local.yaml
+        (merged over the main config at startup). Mirrors
+        ``_write_broker_overlay``: read the existing overlay (parse error →
+        ConfigError), set only the managed ``ai`` sub-block, atomic-write.
+
+        Secrets never land here — only the backend id, model id, and base_url.
+        The vault credential is referenced by NAME in the base config and is
+        never copied into the overlay.
+
+        ``clear_utility`` writes an explicit ``utility_model: null`` so the
+        startup deep-merge overrides a base ``ai.utility_model``. It is set only
+        when a backend change cleared the (now cross-backend-stale) utility
+        model; on a same-backend model change the key is omitted so a base
+        value survives untouched."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        ai_block: dict[str, object | None] = {
+            "backend": cfg.backend,
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+        }
+        if clear_utility:
+            ai_block["utility_model"] = None
+        existing["ai"] = ai_block
+        self._save_overlay(overlay_file, existing)
+
+    @staticmethod
+    def _save_overlay(overlay_file: Path, existing: dict[str, object]) -> None:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must not leave a truncated overlay that
         # bricks the next startup.
         tmp = overlay_file.with_name(overlay_file.name + ".tmp")
-        tmp.write_text(header + yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+        tmp.write_text(_OVERLAY_HEADER + yaml.safe_dump(existing, sort_keys=False),
+                       encoding="utf-8")
         tmp.replace(overlay_file)
+
+    async def _migrate_legacy_alpaca_credential(self) -> str | None:
+        """One-time, idempotent migration of the pre-toggle single
+        ``alpaca_keys`` vault credential to the env-scoped
+        ``alpaca_paper_keys`` / ``alpaca_live_keys`` names the paper/live toggle
+        resolves.
+
+        Fires only when the alpaca BROKER is still configured on the legacy
+        ``alpaca_keys`` name and neither env name exists yet; the credential is
+        COPIED (never moved) into the current-env name and the broker config +
+        overlay are repointed. ``alpaca_keys`` is RETAINED because the Alpaca
+        *data provider* references it as its ``ProviderConfig.credential`` —
+        deleting it would break market data. Returns the new credential name
+        when a migration ran, else ``None`` (nothing to do / already migrated).
+        """
+        if not self.vault.unlocked:
+            return None  # locked vault: can't enumerate names — graceful no-op
+        # Anchor on the alpaca broker still carrying the legacy name; a
+        # data-provider-only ``alpaca_keys`` (no alpaca broker) is NOT migrated,
+        # and an already env-scoped broker is left alone. This is also what tells
+        # us which env (paper/live) the legacy account was, and which overlay
+        # entry to repoint.
+        legacy = next((b for b in self.config.brokers
+                       if b.name == "alpaca" and b.credential == "alpaca_keys"), None)
+        if legacy is None:
+            return None
+        names = set(self.vault.names())
+        if "alpaca_keys" not in names:
+            return None  # nothing to copy from
+        if "alpaca_paper_keys" in names or "alpaca_live_keys" in names:
+            return None  # already env-scoped — idempotent skip
+        target = "alpaca_paper_keys" if legacy.paper else "alpaca_live_keys"
+        # Copy within the vault (secret value never leaves it); legacy retained.
+        await asyncio.to_thread(self.vault.set, target, self.vault.get("alpaca_keys"))
+        migrated = legacy.model_copy(update={"credential": target})
+        self.config.brokers = [migrated if b is legacy else b
+                               for b in self.config.brokers]
+        await asyncio.to_thread(self._persist_migrated_broker_credential, migrated)
+        await self.audit.append("system", "broker.credential_migrated", {
+            "broker": "alpaca", "from": "alpaca_keys", "to": target,
+            "paper": legacy.paper,
+        })
+        return target
+
+    def _persist_migrated_broker_credential(self, cfg: BrokerConfig) -> None:
+        """Repoint the alpaca broker overlay entry's credential NAME, preserving
+        its primary/enabled/paper/options. Unlike ``_write_broker_overlay`` this
+        does NOT force the entry primary — the migration must never change which
+        broker trades. Secrets never land here (only the vault name)."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        brokers_raw = existing.get("brokers")
+        brokers = [dict(b) for b in brokers_raw if isinstance(b, dict)] \
+            if isinstance(brokers_raw, list) else []
+        others = [b for b in brokers if b.get("name") != cfg.name]
+        if cfg.primary:
+            others = [{**b, "primary": False} for b in others]
+        entry: dict[str, object] = {"name": cfg.name, "enabled": cfg.enabled,
+                                    "primary": cfg.primary, "paper": cfg.paper,
+                                    "credential": cfg.credential}
+        if cfg.options:
+            entry["options"] = dict(cfg.options)
+        existing["brokers"] = [*others, entry]
+        self._save_overlay(overlay_file, existing)
+
+    async def apply_ai_config(self, *, backend: str, model: str) -> dict[str, object]:
+        """Live-swap the portfolio-manager brain between the Claude API and a
+        local LM Studio backend (and/or change the model within one). Config-only:
+        touches ``ai.*``, the overlay, and the backend objects — never the order
+        path, the operating mode, or any secret.
+
+        Ordering mirrors ``switch_broker`` — PROVE the target is usable before
+        touching anything, then commit: switching TO the Claude API requires the
+        anthropic key to already be in the vault, and switching TO local requires
+        the endpoint to be reachable; a bad request raises here with the old
+        backend still live, never half-switching into a dead brain. The swap
+        itself runs under ``_cycle_lock`` so a decision already in flight (a
+        multi-round tool loop holds the lock for its whole duration) finishes
+        entirely on its original backend/model and the swap can never land
+        mid-cycle. The two frozen refs (agent, chat) are rebound via their
+        setters — ``_wire_ai`` is deliberately NOT re-run (it double-subscribes
+        reflection); the reviewer, reflection, and analysis roles auto-follow
+        (they read ``self._backend`` fresh / resolve ``self._utility_backend``
+        via a lambda at call time)."""
+        if self.agent is None or self.chat is None \
+                or self._backend is None or self._utility_backend is None:
+            raise ConfigError("AI is not configured")
+        agent, chat = self.agent, self.chat
+        old_primary: ChatBackend = self._backend
+        old_utility: ChatBackend = self._utility_backend
+
+        base = self.config.ai
+        backend_changed = backend != base.backend
+        base_url = (base.base_url or DEFAULT_LM_STUDIO_URL) \
+            if backend == "openai_compatible" else base.base_url
+        update: dict[str, object | None] = {
+            "backend": backend, "model": model, "base_url": base_url,
+        }
+        if backend_changed:
+            # A stale cross-backend utility id would break the new backend, so
+            # utility follows the primary until the operator re-tiers in YAML.
+            update["utility_model"] = None
+        # Constructing the target runs the AIConfig validator early — a bad
+        # base_url / missing credential name surfaces here, before any swap.
+        target = base.model_copy(update=update)
+
+        # -- Preconditions: prove, THEN commit. This runs BEFORE build_backends
+        #    (which would otherwise raise a raw VaultError from vault.get) and
+        #    before any rebind, so a failure leaves the running backend intact.
+        if backend == "anthropic":
+            if base.api_key_credential not in self.vault.names():
+                raise ConfigError(
+                    "Set your Anthropic API key in the vault first (Account view / "
+                    "poseidon vault set anthropic_api_key) before switching to the "
+                    "Claude API."
+                )
+        else:
+            reachable, _ = await probe_local_models(base_url or DEFAULT_LM_STUDIO_URL)
+            if not reachable:
+                raise ConfigError(
+                    f"LM Studio not reachable at {base_url} — start it and load a "
+                    "model, then retry."
+                )
+
+        paid = backend == "anthropic"
+        # -- The swap, guarded so it can never land mid-cycle. Ordering mirrors
+        #    ``switch_broker``: PROVE (build) -> PERSIST -> only THEN swap the
+        #    in-memory brain. If the persist raises (an unparseable hand-edited
+        #    overlay -> ConfigError, or a filesystem fault in ``_save_overlay``
+        #    -> OSError: disk full / read-only fs / permissions), the freshly
+        #    built but uncommitted backends are closed and a clean error is
+        #    raised with the OLD backend still live — so the caller's 422 never
+        #    lies about a switch that silently happened (which, into the paid
+        #    Claude API, would bill while the UI reported failure). Only after a
+        #    durable persist do we rebind, audit, and — past the lock — notify.
+        async with self._cycle_lock:
+            new_primary, new_utility = build_backends(target, self.vault.get)
+            try:
+                await asyncio.to_thread(self._write_ai_overlay, target,
+                                        clear_utility=backend_changed)
+            except Exception as exc:
+                # Persist failed: nothing is swapped. Drop the proven-but-
+                # uncommitted backends (de-duped for the untiered shared-object
+                # case) and surface an actionable error; ConfigError/VaultError
+                # keep their message, any other fault (OSError from the atomic
+                # write) is wrapped so the route maps it to 422, not a 500.
+                closed_fail: set[int] = set()
+                for b in (new_primary, new_utility):
+                    if id(b) in closed_fail:
+                        continue
+                    closed_fail.add(id(b))
+                    with contextlib.suppress(Exception):
+                        await b.aclose()
+                if isinstance(exc, ConfigError | VaultError):
+                    raise
+                raise ConfigError(f"could not persist the AI config: {exc}") from exc
+            self._backend = new_primary
+            agent.rebind_backend(new_primary)
+            self._utility_backend = new_utility
+            chat.rebind_backend(new_utility)
+            self.config.ai = target
+            await self.audit.append("human", "ai.backend_changed",
+                                    {"backend": backend, "model": model, "paid": paid})
+
+        # -- Close the displaced backends AFTER releasing the lock (mirrors
+        #    shutdown). Skip any object reused as a new backend, and de-dupe the
+        #    untiered shared-object case so it is never closed twice.
+        closed: set[int] = set()
+        for b in (old_primary, old_utility):
+            if b is new_primary or b is new_utility or id(b) in closed:
+                continue
+            closed.add(id(b))
+            with contextlib.suppress(Exception):
+                await b.aclose()
+
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "warning" if paid else "info",
+            "title": f"AI brain: {'Claude API' if paid else 'Local'} · {model}",
+            "body": (("Trading decisions now run on the paid Claude API — billed per token."
+                      if paid else
+                      "Trading decisions now run on the free local model.")
+                     + " Switching the AI brain does not change your operating mode."),
+        })
+        return {"backend": backend, "model": model, "base_url": base_url, "paid": paid}
 
     # ------------------------------------------------------------------- chat
 
@@ -639,6 +934,8 @@ class ApplicationKernel:
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
+        # Consent-bound expiry: fires overnight, no AI needed (spec §5.4 site 2).
+        self.scheduler.register_job("autonomy_expiry", self._autonomy_expiry_job)
         if self.analysis is not None:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
         if self.strategy_health is not None:
@@ -682,6 +979,13 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="risk-metrics", job="risk_metrics",
                                every_seconds=900, only_market_hours=True)
+            )
+        if not any(s.job == "autonomy_expiry" and s.enabled for s in schedules):
+            # Unconditional + NOT market-hours gated: an autonomy grant that
+            # lapses overnight must still revert (spec §5.4 site 2).
+            schedules.append(
+                ScheduleConfig(name="autonomy-expiry", job="autonomy_expiry",
+                               every_seconds=60, only_market_hours=False)
             )
         if self.config.ai.analysis.enabled and not any(
             s.job == "analysis_sweep" and s.enabled for s in schedules
@@ -743,6 +1047,10 @@ class ApplicationKernel:
             log.info("review cycle already running; skipping")
             return
         async with self._cycle_lock:
+            # First statement under the lock (spec §5.4 site 3): a lapsed autonomy
+            # grant reverts AUTONOMOUS -> APPROVAL BEFORE the agent runs, so the
+            # cycle prompt (and every order it produces) sees the reverted mode.
+            await self._check_autonomy_expiry()
             if await self._over_ai_budget():
                 log.warning("monthly AI budget reached; skipping review cycle")
                 await self.bus.publish(Topics.NOTIFY, {
@@ -764,6 +1072,8 @@ class ApplicationKernel:
                 packets = (await self.analysis.relevant_packets(
                     self.config.all_watchlist_symbols())
                     if self.analysis is not None else [])
+                identities = await self._instrument_identities(
+                    self.config.all_watchlist_symbols())
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -773,6 +1083,7 @@ class ApplicationKernel:
                     market_regime=await self._regime_line(),
                     trade_lessons=lessons,
                     analysis_packets=packets,
+                    instrument_identities=identities,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -783,6 +1094,24 @@ class ApplicationKernel:
                 await self._record_ai_usage(
                     self.agent.last_cycle_usage(), "refused",
                     cycle_id=f"refused-{uuid.uuid4().hex[:8]}")
+                return
+            except BackendUnreachableError as exc:
+                # Connect-phase failure: the model backend is down, not erroring.
+                # Degrade exactly like the generic branch below (meter usage, publish,
+                # return — never re-raise) but emit a tailored, actionable hint under a
+                # distinct component so the operator knows the fix. Must precede the
+                # generic branch because BackendUnreachableError subclasses AgentError.
+                log.error("model backend unreachable", error=str(exc))
+                await self._record_ai_usage(
+                    self.agent.last_cycle_usage(), "failed",
+                    cycle_id=f"failed-{uuid.uuid4().hex[:8]}")
+                if self.config.ai.backend == "openai_compatible":
+                    hint = (f"Model backend unreachable at {self.config.ai.base_url} — "
+                            "is LM Studio (or your model server) running?")
+                else:
+                    hint = "Cannot reach the Anthropic API — check your network."
+                await self.bus.publish(Topics.SYSTEM_ERROR,
+                                       {"component": "model_backend", "error": hint})
                 return
             except (AgentError, DataError) as exc:
                 log.error("review cycle failed", error=str(exc))
@@ -831,6 +1160,24 @@ class ApplicationKernel:
 
     async def _risk_metrics_job(self) -> None:
         await self.refresh_risk_metrics()
+
+    async def _instrument_identities(self, symbols: list[str]) -> dict[str, str]:
+        """Resolved identity lines for the cycle prompt (design §3.5). Fails
+        open per symbol — an unresolved/erroring profile is simply omitted, so
+        this can never block or fail a review cycle. The router's weekly cache
+        makes it ≤1 HTTP call per symbol on the first cycle, free after."""
+        if not self.config.ai.snapshot.identity:
+            return {}
+        identities: dict[str, str] = {}
+        for sym in symbols:
+            try:
+                prof = await self.router.profile(sym)
+            except Exception:
+                continue
+            if prof is None:
+                continue
+            identities[sym] = f"{prof.name} ({prof.exchange}, {prof.asset_type})"
+        return identities
 
     async def _regime_line(self) -> str | None:
         """Regime summary for the cycle prompt. Uses the cached metrics when
@@ -1142,12 +1489,103 @@ class ApplicationKernel:
 
     # ---------------------------------------------------------------- control
 
-    async def set_mode(self, mode: TradingMode) -> None:
+    async def set_mode(self, mode: TradingMode, *,
+                       expires_at: datetime | None = None) -> None:
+        """Operator mode change. Granting AUTONOMOUS also (re)writes the durable
+        consent bound ``mode.autonomous_expires_at`` (control-hardening spec §5.2):
+        an explicit ``expires_at`` wins; else a configured ``risk.autonomous_ttl_
+        hours`` stamps now+ttl; else the grant is unbounded (the key is cleared).
+        Leaving AUTONOMOUS clears the bound — the grant is consumed. The key always
+        gets rewritten on a grant so a stale bound from a prior grant can never leak
+        into a new one."""
         previous = self.order_manager.mode
         self.order_manager.set_mode(mode)
         await self.audit.append("human", "mode.changed",
                                 {"from": previous.value, "to": mode.value})
+        if mode is TradingMode.AUTONOMOUS:
+            if expires_at is not None:
+                bound = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+                stamped = bound.astimezone(UTC).isoformat()
+            elif self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+            else:
+                stamped = ""  # unbounded grant (status quo); "" clears the latch
+            await self.db.kv_set("mode.autonomous_expires_at", stamped)
+            await self.audit.append("human", "mode.autonomy_granted",
+                                    {"expires_at": stamped})
+        else:
+            # Leaving AUTONOMOUS consumes the grant — never leave a stale bound.
+            await self.db.kv_set("mode.autonomous_expires_at", "")
         log.info("operating mode changed", was=previous.value, now=mode.value)
+
+    async def _check_autonomy_expiry(self) -> bool:
+        """Revert AUTONOMOUS -> APPROVAL when the durable consent bound has lapsed
+        (control-hardening spec §5.3). Idempotent: a no-op unless the manager is
+        actually AUTONOMOUS with an expired/absent-but-set bound, so a second call
+        (or a scheduler tick after an already-handled expiry) never double-reverts
+        or double-notifies. The revert goes through ``order_manager.set_mode``
+        DIRECTLY — NOT ``kernel.set_mode`` — so the kv latch is preserved: a
+        crash-restart loop that re-arms AUTONOMOUS from config must re-observe the
+        expiry and revert again, never silently re-grant. An unparseable bound is
+        fail-safe treated as expired (a corrupt bound must not grant unbounded
+        autonomy). Returns True iff it reverted. No LLM; the expiry is audited."""
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
+        raw = await self.db.kv_get("mode.autonomous_expires_at")
+        if not raw:  # absent or "" (unbounded/cleared) — no expiry to enforce
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            expires_at = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            if datetime.now(UTC) < expires_at:
+                return False
+        except (ValueError, TypeError):
+            pass  # unparseable -> expired (fail-safe), fall through to revert
+        # Re-assert AUTONOMOUS after the kv_get await: the scheduler job and the
+        # cycle-start hook can BOTH pass the top guard, both await kv_get, and both
+        # reach here — without this a second caller reverts again and publishes a
+        # DUPLICATE critical NOTIFY. This check and the synchronous set_mode below
+        # run with no await between them, so only the first caller mutates; any
+        # concurrent caller now observes APPROVAL and bails. The revert stays
+        # idempotent; mode still always ends APPROVAL.
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
+        # Direct set_mode: leave the kv latch in place (see docstring).
+        self.order_manager.set_mode(TradingMode.APPROVAL)
+        await self.audit.append("system", "mode.autonomy_expired", {"expires_at": raw})
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical",
+            "title": "Autonomous mode expired",
+            "body": "Autonomous mode expired — reverted to approval mode.",
+        })
+        log.warning("autonomous mode expired; reverted to approval", expires_at=raw)
+        return True
+
+    async def _autonomy_expiry_job(self) -> None:
+        """Scheduler entry point for the consent-bound expiry check (spec §5.4
+        site 2). A thin ``-> None`` wrapper so the scheduler's ``Job`` type is
+        satisfied; the bool return of the checker is irrelevant to a tick."""
+        await self._check_autonomy_expiry()
+
+    async def _init_autonomy_expiry(self) -> None:
+        """Startup consent-bound handling (control-hardening spec §5.2 startup +
+        §5.4 site 1). When config boots AUTONOMOUS: an existing bound is honored
+        AS-IS (never extended — future kept, past reverted below); an absent bound
+        with a configured ttl stamps now+ttl; an absent bound with no ttl stays
+        unbounded (status quo). Then run the expiry checker so a boot with a stale
+        past bound reverts immediately. A crash-restart loop therefore can NEVER
+        re-arm expired autonomy — the stale key latches until an explicit operator
+        re-grant."""
+        if self.order_manager.mode is TradingMode.AUTONOMOUS:
+            existing = await self.db.kv_get("mode.autonomous_expires_at")
+            if not existing and self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+                await self.db.kv_set("mode.autonomous_expires_at", stamped)
+                await self.audit.append("system", "mode.autonomy_granted",
+                                        {"expires_at": stamped, "source": "startup"})
+        await self._check_autonomy_expiry()
 
     def _halt_file(self) -> Path:
         return self.config.data_dir / "HALT"
@@ -1157,23 +1595,106 @@ class ApplicationKernel:
         survives a restart, a DB loss, and an unreachable dashboard: the
         in-memory breaker latch, a DB kv marker, and a filesystem HALT sentinel
         the breaker reads directly. With systemd Restart=always a crash/reboot
-        in autonomous mode would otherwise silently re-arm trading."""
-        self.risk.circuit.force_open(reason)
-        with contextlib.suppress(OSError):
-            self._halt_file().write_text(reason, encoding="utf-8")
-        await self.db.kv_set("circuit.manual_halt", reason)
-        await self.audit.append("human", "trading.halted", {"reason": reason})
-        log.warning("trading halted by operator", reason=reason)
+        in autonomous mode would otherwise silently re-arm trading.
+
+        After the latch, halt drives two deterministic order-cleanup phases
+        (control-hardening spec §3.2): (2) cancel EVERY resting broker order —
+        always, so none can fill mid-halt; (3) opt-in (``risk.flatten_on_halt``,
+        default off, never in RESEARCH), mint the engine's identity-checked
+        flatten token, close every live position with a reduce-only MARKET exit
+        through the FULL risk chain, and close the window in ``finally``.
+        Cancel-all completes (and ``flatten_all``'s quiet-book check runs) before
+        any flatten submit, so a resting order can never fill against a closing
+        trade. ANY exception in phases 2-3 is caught here — the halt latch ALWAYS
+        stands (a failed cleanup must never un-halt trading). Serialized with
+        ``resume()`` via ``_halt_lock``. No LLM anywhere; every action audited."""
+        async with self._halt_lock:
+            # Phase 1 — latch first, always. Synchronous breaker trip: trading is
+            # dead before any broker/DB I/O below (order unchanged from the
+            # original halt(); mirrors /api/halt force_open-before-audit).
+            self.risk.circuit.force_open(reason)
+            with contextlib.suppress(OSError):
+                self._halt_file().write_text(reason, encoding="utf-8")
+            await self.db.kv_set("circuit.manual_halt", reason)
+            await self.audit.append("human", "trading.halted", {"reason": reason})
+            log.warning("trading halted by operator", reason=reason)
+            # Phases 2-3 — best-effort cleanup. Any exception is caught so the
+            # latch above always stands (spec §3.2.4).
+            try:
+                cancel_summary = await self.order_manager.cancel_all_open(reason=reason)
+                flatten_summary = None
+                if (self.config.risk.flatten_on_halt
+                        and self.order_manager.mode is not TradingMode.RESEARCH):
+                    # The ONLY caller of open_halt_flatten_window(): the token is
+                    # minted here and handed only to flatten_all. Closed in
+                    # finally so a crashed flatten cannot leave the window ajar.
+                    token = self.risk.open_halt_flatten_window()
+                    try:
+                        flatten_summary = await self.order_manager.flatten_all(
+                            token, reason=reason)
+                    finally:
+                        self.risk.close_halt_flatten_window()
+            except Exception as exc:  # noqa: BLE001 — cleanup is best-effort; latch stands.
+                await self.audit.append("system", "halt.cleanup_failed",
+                                        {"reason": reason, "error": str(exc)})
+                await self.bus.publish(Topics.NOTIFY, {
+                    "level": "critical", "title": "Halt cleanup failed",
+                    "body": (f"Trading is halted, but order cleanup errored: {exc}. "
+                             "Verify open orders and positions at the brokerage."),
+                })
+                log.error("halt cleanup failed", reason=reason, error=str(exc))
+                return
+            await self._notify_halt_summary(reason, cancel_summary, flatten_summary)
+
+    async def _notify_halt_summary(
+        self, reason: str, cancel_summary: HaltCleanupSummary,
+        flatten_summary: FlattenSummary | None,
+    ) -> None:
+        """One loud critical summary after a halt's cleanup (spec §3.2.4): what
+        was canceled, what failed, what was flattened/refused, and — because
+        cancel-all removes resting guardian protective stops too (§3.3) — an
+        explicit note when the book is left unprotected."""
+        lines = [
+            f"Trading halted: {reason}",
+            f"Orders canceled: {len(cancel_summary.canceled)}",
+        ]
+        if cancel_summary.failed:
+            lines.append(
+                f"Cancel FAILED ({len(cancel_summary.failed)}) — verify at the brokerage: "
+                + ", ".join(f"{f['symbol']} ({f['error']})" for f in cancel_summary.failed)
+            )
+        if cancel_summary.skipped:
+            lines.append(f"Cross-broker orders skipped (survive the halt): "
+                         f"{len(cancel_summary.skipped)}")
+        if flatten_summary is None:
+            lines.append(
+                "Positions NOT flattened (flatten_on_halt off). Resting protective "
+                "stops were canceled — the book is unprotected until resume."
+            )
+        else:
+            lines.append(f"Positions flattened: {len(flatten_summary.submitted)}")
+            if flatten_summary.refused:
+                lines.append(
+                    f"Flatten REFUSED ({len(flatten_summary.refused)}): "
+                    + ", ".join(f"{r.get('symbol', '?')} ({r.get('reason', '')})"
+                                for r in flatten_summary.refused)
+                )
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical", "title": "Trading halted — cleanup summary",
+            "body": "\n".join(lines),
+        })
 
     async def resume(self) -> None:
         """Clear an operator halt (dashboard Resume): the breaker latch, the DB
-        marker, and the filesystem sentinel."""
-        self.risk.circuit.force_close()
-        with contextlib.suppress(OSError):
-            self._halt_file().unlink(missing_ok=True)
-        await self.db.kv_set("circuit.manual_halt", "")
-        await self.audit.append("human", "trading.resumed", {})
-        log.warning("trading resumed by operator")
+        marker, and the filesystem sentinel. Serialized with ``halt()`` via
+        ``_halt_lock`` so a resume never interleaves with a halt's cleanup."""
+        async with self._halt_lock:
+            self.risk.circuit.force_close()
+            with contextlib.suppress(OSError):
+                self._halt_file().unlink(missing_ok=True)
+            await self.db.kv_set("circuit.manual_halt", "")
+            await self.audit.append("human", "trading.resumed", {})
+            log.warning("trading resumed by operator")
 
     async def _restore_manual_halt(self) -> None:
         """Rehydrate an operator HALT that was active before a restart. Called

@@ -376,6 +376,90 @@ async def test_f021_approval_decline_releases_reservation(tmp_path) -> None:
         await bus.close()
 
 
+async def test_halt_cancels_remainder_flattens_and_blocks_reentry(stack, tmp_path) -> None:
+    # Control-hardening spec §8 task 9 — the full operator-HALT story exercised
+    # end-to-end over the REAL stack (PaperBroker + RiskEngine + OrderManager),
+    # driven through the real kernel.halt() orchestration:
+    #   1) a resting PARTIALLY_FILLED order's remainder is canceled,
+    #   2) with flatten_on_halt on, the already-filled position is flattened by a
+    #      reduce-only halt_flatten MARKET SELL through the FULL rule chain (only
+    #      the engine-minted identity-checked token carries it past the breaker),
+    #   3) the breaker latch stands: a follow-up normal BUY is still rejected.
+    # No LLM anywhere; every consequential action is hash-chained into the audit.
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.security.vault import Vault
+
+    manager, broker, risk = stack["manager"], stack["broker"], stack["risk"]
+    db, audit, bus = stack["db"], stack["audit"], stack["bus"]
+
+    # (1) The already-filled portion of a partially-filled buy: a live 10-share
+    # AAPL long, established by a market BUY that fills at the broker.
+    pos_buy = await manager.submit_manual(Order(
+        symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.MARKET,
+        quantity=Decimal("10"), strategy="momentum"))
+    assert pos_buy.status is OrderStatus.FILLED
+    held = {p.symbol: p for p in await broker.positions()}
+    assert held["AAPL"].quantity == Decimal("10")
+
+    # (2) The resting remainder: model the still-open portion of that partial fill
+    # as a PARTIALLY_FILLED AAPL BUY limit already live at the broker. It is seeded
+    # directly into the DB + paper book (a real partial fill entered the book
+    # earlier; re-submitting a second AAPL buy would — correctly — hit the
+    # per-symbol cooldown), exactly the live-order state cancel_all_open enumerates.
+    remainder = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                      quantity=Decimal("5"), limit_price=Decimal("99.00"),
+                      strategy="momentum", broker=broker.name,
+                      status=OrderStatus.PARTIALLY_FILLED)
+    remainder.broker_order_id = f"paper-{remainder.client_order_id[:12]}"
+    await manager._persist(remainder)
+    broker._open_orders[remainder.id] = remainder
+    assert remainder.id in broker._open_orders
+
+    # Refresh the portfolio snapshot so the reduce-only rule sees the live 10-share
+    # long (its closable-position check reads the synced snapshot; the F022 submit
+    # backstop reads live broker positions — both must agree the exit is valid).
+    await stack["sync"].sync_once()
+
+    # (3) A real kernel wired around the live stack, opting into flatten.
+    config = AppConfig(data_dir=tmp_path)
+    config.risk.flatten_on_halt = True
+    kernel = ApplicationKernel(config, Vault(tmp_path / "v.bin"))
+    kernel.bus, kernel.db, kernel.audit = bus, db, audit
+    kernel.risk = risk  # type: ignore[assignment]
+    kernel.broker = broker  # type: ignore[assignment]
+    kernel.order_manager = manager
+
+    await kernel.halt("integration HALT")
+
+    # -- the remainder was canceled (killing only the resting portion) --
+    row = await db.fetch_one("SELECT status FROM orders WHERE id = ?", (remainder.id,))
+    assert row[0] == OrderStatus.CANCELED.value
+    assert remainder.id not in broker._open_orders
+
+    # -- the filled position was flattened by ONE reduce-only halt_flatten SELL --
+    recent = await manager.recent_orders(50)
+    exits = [o for o in recent if o.get("strategy") == "halt_flatten"]
+    assert len(exits) == 1, exits
+    assert exits[0]["side"] == OrderSide.SELL.value
+    assert Decimal(str(exits[0]["quantity"])) == Decimal("10")
+    after = {p.symbol: p for p in await broker.positions()}
+    assert "AAPL" not in after or after["AAPL"].quantity == Decimal("0")
+
+    # -- the breaker latch stands three ways; a follow-up normal BUY is rejected --
+    assert risk.circuit.is_open is True
+    assert await db.kv_get("circuit.manual_halt") == "integration HALT"
+    assert (tmp_path / "HALT").read_text() == "integration HALT"
+    reentry = await manager.submit_manual(Order(
+        symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.MARKET,
+        quantity=Decimal("1"), strategy="momentum"))
+    assert reentry.status is OrderStatus.REJECTED_RISK
+
+    # -- and the tamper-evident audit chain still verifies end-to-end --
+    ok, bad_seq = await audit.verify_chain()
+    assert ok, f"audit chain broke at seq {bad_seq}"
+
+
 async def test_f022_backstop_fails_closed_on_positions_error(tmp_path) -> None:
     # F022 regression (adversarial review): the live-state backstop is the safety net;
     # a NON-BrokerError from positions() must fail CLOSED (RiskViolation), not escape

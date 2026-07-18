@@ -3,8 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import anthropic
+import httpx
+import pytest
+
 from poseidon.ai.backends.anthropic_backend import AnthropicBackend
 from poseidon.core.config import AIConfig
+from poseidon.core.errors import AgentError, BackendUnreachableError
 
 
 class _FakeMessages:
@@ -19,6 +24,22 @@ class _FakeMessages:
 class _FakeClient:
     def __init__(self, resp: Any, sink: dict) -> None:
         self.messages = _FakeMessages(resp, sink)
+
+    async def close(self) -> None:
+        return None
+
+
+class _RaisingMessages:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def create(self, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+class _RaisingClient:
+    def __init__(self, exc: BaseException) -> None:
+        self.messages = _RaisingMessages(exc)
 
     async def close(self) -> None:
         return None
@@ -71,3 +92,25 @@ async def test_pause_turn_maps_to_pause() -> None:
     b = AnthropicBackend(AIConfig(), api_key="k",
                          client=_FakeClient(_resp("pause_turn", []), {}))
     assert (await b.complete([], tools=[], system="s")).stop_reason == "pause"
+
+
+async def test_connection_error_maps_to_backend_unreachable() -> None:
+    exc = anthropic.APIConnectionError(
+        message="All connection attempts failed",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    b = AnthropicBackend(AIConfig(), api_key="k", client=_RaisingClient(exc))
+    with pytest.raises(BackendUnreachableError) as ei:
+        await b.complete([], tools=[], system="s")
+    assert isinstance(ei.value, AgentError)  # still caught by existing handlers
+    assert ei.value.retryable is True
+
+
+async def test_api_status_error_stays_plain_agent_error() -> None:
+    exc = anthropic.APIStatusError(
+        "boom", response=httpx.Response(
+            500, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")),
+        body=None)
+    b = AnthropicBackend(AIConfig(), api_key="k", client=_RaisingClient(exc))
+    with pytest.raises(AgentError) as ei:
+        await b.complete([], tools=[], system="s")
+    assert not isinstance(ei.value, BackendUnreachableError)

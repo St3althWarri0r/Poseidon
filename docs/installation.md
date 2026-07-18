@@ -92,8 +92,10 @@ automatically, and `Restart=always` covers crashes.
 - `poseidon update check` — fetch and report.
 - `poseidon update apply` — fast-forward pull + reinstall (installer layout
   only), then `systemctl --user restart poseidon`.
-- Automatic checks run daily; set `updates.auto_apply: true` to apply
-  without asking (a restart notification is sent either way).
+- Automatic checks run on launch and daily; **auto-apply is on by default**
+  (fast-forward pull + reinstall, then a restart notification — the running
+  engine is never restarted for you). Set `updates.auto_apply: false` to be
+  notified of updates without applying them.
 
 ## Uninstalling
 

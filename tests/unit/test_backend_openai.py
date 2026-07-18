@@ -8,7 +8,7 @@ import pytest
 from poseidon.ai.backends.base import ToolResult
 from poseidon.ai.backends.openai_backend import OpenAICompatibleBackend
 from poseidon.core.config import AIConfig
-from poseidon.core.errors import AgentError
+from poseidon.core.errors import AgentError, BackendUnreachableError
 
 
 def _cfg() -> AIConfig:
@@ -92,8 +92,28 @@ async def test_http_error_becomes_agenterror() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "boom"})
 
-    with pytest.raises(AgentError):
+    # A 5xx means the server is up but erroring — a plain AgentError, NOT the
+    # "unreachable" subtype.
+    with pytest.raises(AgentError) as exc_info:
         await _backend(handler).complete([{"role": "user", "content": "x"}], tools=[], system="s")
+    assert not isinstance(exc_info.value, BackendUnreachableError)
+
+
+async def test_connect_error_becomes_backend_unreachable() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed")
+
+    with pytest.raises(BackendUnreachableError):
+        await _backend(handler).complete([{"role": "user", "content": "x"}], tools=[], system="s")
+
+
+async def test_non_object_json_is_plain_agenterror() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])  # valid JSON, not an object
+
+    with pytest.raises(AgentError) as exc_info:
+        await _backend(handler).complete([{"role": "user", "content": "x"}], tools=[], system="s")
+    assert not isinstance(exc_info.value, BackendUnreachableError)
 
 
 def test_tool_result_messages_one_per_call() -> None:

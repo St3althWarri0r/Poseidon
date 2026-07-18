@@ -16,10 +16,13 @@ import argparse
 import asyncio
 import getpass
 import sys
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
+import httpx
+
 from . import __version__
-from .core.config import AppConfig, default_config_dir, load_config
+from .core.config import AIConfig, AppConfig, default_config_dir, load_config
 from .core.errors import ConfigError, PoseidonError, VaultError
 from .core.logging import configure_logging
 from .security.vault import Vault
@@ -113,10 +116,33 @@ def cmd_cycle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _symbols_from_lines(lines: list[str]) -> list[str]:
+    """Parse a one-symbol-per-line list: strip whitespace, skip blank and ``#``-comment
+    lines (a leading ``#`` header would otherwise load as a bogus symbol), upcase, and
+    order-preservingly dedupe. Shared by --symbols-file and the bundled --universe file."""
+    seen: dict[str, None] = {}
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        seen.setdefault(s.upper())
+    return list(seen)
+
+
+def _universe_file(name: str) -> Traversable:
+    """Resolve a bundled research universe (e.g. ``sp500``) to its packaged data file.
+    Read at the CLI edge only — research/ never reads it — so the offline lab stays
+    severed from I/O. Returns a Traversable via importlib.resources (the wheel ships the
+    non-.py data files under poseidon/research/data/); ``.read_text`` works whether the
+    install is an unpacked tree or a zip."""
+    from importlib.resources import files
+    return files("poseidon.research") / "data" / f"{name}.txt"
+
+
 def _research_symbols(args: argparse.Namespace, config: AppConfig) -> list[str]:
-    """Resolve the research universe from --symbols, --symbols-file, or --watchlist
-    (checked in that order; the first one supplied wins). Empty list means the
-    caller should print a usage message and exit non-zero."""
+    """Resolve the research universe from --symbols, --symbols-file, --universe, or
+    --watchlist (checked in that order; the first one supplied wins). Empty list means
+    the caller should print a usage message and exit non-zero."""
     if args.symbols:
         return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if args.symbols_file:
@@ -125,7 +151,14 @@ def _research_symbols(args: argparse.Namespace, config: AppConfig) -> list[str]:
         except OSError as exc:
             print(f"cannot read --symbols-file {args.symbols_file}: {exc}", file=sys.stderr)
             return []
-        return [s.strip().upper() for s in lines if s.strip()]
+        return _symbols_from_lines(lines)
+    if args.universe:
+        try:
+            lines = _universe_file(args.universe).read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"cannot read bundled universe {args.universe!r}: {exc}", file=sys.stderr)
+            return []
+        return _symbols_from_lines(lines)
     if args.watchlist:
         return config.all_watchlist_symbols()
     return []
@@ -149,8 +182,21 @@ def cmd_research(args: argparse.Namespace) -> int:
 
     from .app import ApplicationKernel
     from .research.factors import ALL_FACTORS
+    from .research.ic import NullSpec
     from .research.loader import load_history
     from .research.report import run_report
+
+    # Random-control null configuration (design §4.7): seeds/threshold/min_n_eff come
+    # from config.research; --train-frac (a per-run knob) overrides config.train_frac
+    # when supplied. Every field is an explicit config value — never wall-clock.
+    rc = config.research
+    null = NullSpec(
+        n_seeds=rc.null_seeds,
+        base_seed=rc.null_base_seed,
+        train_frac=(args.train_frac if args.train_frac is not None else rc.train_frac),
+        alpha_t_threshold=rc.alpha_t_threshold,
+        min_n_eff=rc.verdict_min_n_eff,
+    )
 
     async def main() -> int:
         kernel = ApplicationKernel(config, vault)
@@ -159,7 +205,7 @@ def cmd_research(args: argparse.Namespace) -> int:
         # only ever reads bars. _build_router only touches config + vault, both
         # already constructed above, so calling it standalone is safe.
         router = kernel._build_router()  # noqa: SLF001 — CLI is a trusted caller
-        days = args.days if args.days is not None else config.research.lookback_days
+        days = args.days if args.days is not None else rc.lookback_days
         hist = await load_history(router, symbols, days)
         if len(hist) < 2:
             print(
@@ -170,16 +216,65 @@ def cmd_research(args: argparse.Namespace) -> int:
         rep = run_report(
             ALL_FACTORS,
             hist,
-            horizon=args.horizon if args.horizon is not None else config.research.horizon,
+            horizon=args.horizon if args.horizon is not None else rc.horizon,
             rebalance_every=(args.rebalance_every if args.rebalance_every is not None
-                             else config.research.rebalance_every),
-            horizons=config.research.horizons,
-            min_cross=config.research.min_cross,
+                             else rc.rebalance_every),
+            horizons=rc.horizons,
+            min_cross=rc.min_cross,
+            null=null,
+            n_groups=rc.n_groups,
+            # --universe labels the report with a survivorship caveat (§4.8); "" stays silent.
+            universe_note=args.universe,
         )
         print(rep.render())
         return 0
 
     return asyncio.run(main())
+
+
+def probe_model_backend(
+    ai: AIConfig,
+    api_key: str | None,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[bool, str]:
+    """Reachability liveness probe for the configured model backend.
+
+    Returns ``(ok, detail)``. ``transport`` lets tests inject an
+    ``httpx.MockTransport`` (a fake backend) so no network call is made.
+    Read-only: issues a single GET and never places or triggers any order.
+    """
+    if ai.backend == "openai_compatible":
+        base = (ai.base_url or "").rstrip("/")
+        try:
+            with httpx.Client(timeout=5.0, transport=transport) as c:
+                c.get(f"{base}/models").raise_for_status()
+            return True, f"reachable at {base}"
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Connect phase failed — nothing is listening. Actionable: start it.
+            return False, (
+                f"unreachable at {base} — start LM Studio / the model server ({exc})"
+            )
+        except httpx.HTTPStatusError as exc:
+            # We connected and got a response, just a bad status (e.g. a running
+            # LM Studio returning 500) — the server is up, don't say "start it".
+            return False, (
+                f"backend reachable at {base} but returned {exc.response.status_code}"
+            )
+        except httpx.HTTPError as exc:
+            # Any other transport-level failure (read timeout, protocol error…).
+            return False, f"backend probe to {base} failed ({exc})"
+    try:  # anthropic: cheap authed liveness
+        with httpx.Client(timeout=5.0, transport=transport) as c:
+            r = c.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": api_key or "", "anthropic-version": "2023-06-01"},
+            )
+        if r.status_code == 401:
+            return False, "Anthropic API reachable but key rejected (401)"
+        return True, "Anthropic API reachable"
+    except httpx.HTTPError as exc:
+        return False, f"cannot reach Anthropic API ({exc})"
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -220,6 +315,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             names = set(vault.names())
             check("anthropic api key stored", config.ai.api_key_credential in names,
                   config.ai.api_key_credential)
+            key_or_none = (
+                vault.get(config.ai.api_key_credential)
+                if config.ai.backend == "anthropic"
+                and config.ai.api_key_credential in names
+                else None
+            )
+            ok, detail = probe_model_backend(config.ai, key_or_none)
+            check(f"model backend reachable ({config.ai.backend})", ok, detail)
             for provider in config.data.providers:
                 if provider.enabled and provider.credential:
                     check(f"credential '{provider.credential}' (provider {provider.name})",
@@ -377,6 +480,16 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _unit_fraction(text: str) -> float:
+    """argparse type for --train-frac: a float in the half-open unit interval [0, 1).
+    0 disables the split; 1 is rejected because a whole-history "split" leaves no test
+    segment. Out-of-range or non-numeric input dies as a usage error, not a traceback."""
+    value = float(text)
+    if not (0.0 <= value < 1.0):
+        raise argparse.ArgumentTypeError("must be a float in [0, 1)")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="poseidon", description="Poseidon — autonomous AI trading platform")
     parser.add_argument("--version", action="version", version=f"poseidon {__version__}")
@@ -392,7 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
     research_sub = research.add_subparsers(dest="research_action", required=True)
     fac = research_sub.add_parser("factors", help="rank factors by point-in-time IC/IR")
     fac.add_argument("--symbols", default="", help="comma-separated symbols, e.g. AAA,BBB")
-    fac.add_argument("--symbols-file", default="", help="path to a file, one symbol per line")
+    fac.add_argument("--symbols-file", default="",
+                     help="path to a file, one symbol per line (# comment lines skipped, "
+                          "duplicates removed)")
+    fac.add_argument("--universe", choices=["sp500"], default="",
+                     help="use a bundled universe snapshot (adds a survivorship caveat to "
+                          "the report)")
     fac.add_argument("--watchlist", action="store_true", help="use all configured watchlist symbols")
     fac.add_argument("--days", type=_positive_int, default=None,
                      help="history window (default: research.lookback_days)")
@@ -400,6 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="forward-return horizon in bars (default: research.horizon)")
     fac.add_argument("--rebalance-every", dest="rebalance_every", type=_positive_int, default=None,
                      help="trading days between IC samples (default: research.rebalance_every)")
+    fac.add_argument("--train-frac", dest="train_frac", type=_unit_fraction, default=None,
+                     help="chronological OOS split fraction in [0, 1); 0 disables "
+                          "(default: research.train_frac)")
     fac.set_defaults(func=cmd_research)
 
     vault = sub.add_parser("vault", help="manage the encrypted credential vault")

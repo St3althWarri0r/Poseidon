@@ -61,6 +61,16 @@ opens the circuit breaker until *Resume*; asks for confirmation). Action
 feedback arrives as toasts; the AI Desk item shows a badge while trades
 await your approval.
 
+**HALT also cancels every resting broker order** — so nothing fills while
+you are halted — and this **includes the guardian's protective stops**
+(they are resting broker orders too). With the default settings the book is
+therefore left *unprotected* until you *Resume*; a critical notification
+spells out exactly what was canceled. If you set `risk.flatten_on_halt`,
+HALT goes further and closes every open position with a reduce-only market
+order (cancels first, then flattens — always through the full risk rules),
+so the book is flat rather than merely unprotected. A summary notification
+reports what was canceled, flattened, refused, or failed at the brokerage.
+
 - **Overview** — equity, day P&L, cash/buying power, drawdown, exposure,
   and regime tiles; the equity curve with crosshair inspection; loss-limit
   meters; allocation; and the live event feed.
