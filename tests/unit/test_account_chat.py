@@ -59,6 +59,20 @@ def test_catalog_live_only_brokers() -> None:
     assert by_name["schwab"]["paper_choice"] == "live_only"
 
 
+def test_catalog_alpaca_env_credentials() -> None:
+    by_name = {e["name"]: e for e in broker_catalog()}
+    alpaca = by_name["alpaca"]
+    # Legacy single credential kept for migration + back-compat.
+    assert alpaca["credential"] == "alpaca_keys"
+    # Per-env credential names surfaced for the paper/live toggle.
+    assert alpaca["credential_paper"] == "alpaca_paper_keys"
+    assert alpaca["credential_live"] == "alpaca_live_keys"
+    # Other brokers are single-credential: env names are absent (not wired).
+    assert "credential_paper" not in by_name["tradier"]
+    assert "credential_live" not in by_name["tradier"]
+    assert "credential_paper" not in by_name["public"]
+
+
 def test_catalog_paper_starting_cash_and_cost_notes() -> None:
     by_name = {e["name"]: e for e in broker_catalog()}
     keys = [f["key"] for f in by_name["paper"]["option_fields"]]
