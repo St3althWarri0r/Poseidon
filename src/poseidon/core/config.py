@@ -204,6 +204,11 @@ class RiskConfig(StrictModel):
     # never be trapped outside the universe. Both empty = allow everything.
     universe_exclude_symbols: list[str] = Field(default_factory=list)  # denylist
     universe_allow_symbols: list[str] = Field(default_factory=list)  # allowlist; empty = all
+    # Opt-in reduce-only flatten after halt cancel-all (control-hardening spec §3.2).
+    # OFF by default: halt always cancels resting orders, but only flattens
+    # positions when explicitly enabled. When off, protective stops are canceled
+    # and the book sits unprotected until resume (called out in the halt summary).
+    flatten_on_halt: bool = False
 
     @field_validator("universe_exclude_symbols", "universe_allow_symbols")
     @classmethod

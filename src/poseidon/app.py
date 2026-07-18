@@ -49,7 +49,7 @@ from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
 from .execution.approvals import ApprovalQueue
 from .execution.guardian import PositionGuardian
-from .execution.manager import OrderManager
+from .execution.manager import FlattenSummary, HaltCleanupSummary, OrderManager
 from .health.monitor import HealthMonitor
 from .notifications.service import NotificationService
 from .portfolio.state import PortfolioState
@@ -109,6 +109,10 @@ class ApplicationKernel:
         self.dashboard: DashboardServer
         self.updates: UpdateService
         self._cycle_lock = asyncio.Lock()
+        # Serializes halt() and resume() so a resume can never interleave with a
+        # halt's cancel-all/flatten cleanup (and vice versa) — the breaker latch
+        # and the order-cleanup phases must move as one atomic operator action.
+        self._halt_lock = asyncio.Lock()
         self._shutdown = asyncio.Event()
 
     # ------------------------------------------------------------------ wiring
@@ -1181,23 +1185,106 @@ class ApplicationKernel:
         survives a restart, a DB loss, and an unreachable dashboard: the
         in-memory breaker latch, a DB kv marker, and a filesystem HALT sentinel
         the breaker reads directly. With systemd Restart=always a crash/reboot
-        in autonomous mode would otherwise silently re-arm trading."""
-        self.risk.circuit.force_open(reason)
-        with contextlib.suppress(OSError):
-            self._halt_file().write_text(reason, encoding="utf-8")
-        await self.db.kv_set("circuit.manual_halt", reason)
-        await self.audit.append("human", "trading.halted", {"reason": reason})
-        log.warning("trading halted by operator", reason=reason)
+        in autonomous mode would otherwise silently re-arm trading.
+
+        After the latch, halt drives two deterministic order-cleanup phases
+        (control-hardening spec §3.2): (2) cancel EVERY resting broker order —
+        always, so none can fill mid-halt; (3) opt-in (``risk.flatten_on_halt``,
+        default off, never in RESEARCH), mint the engine's identity-checked
+        flatten token, close every live position with a reduce-only MARKET exit
+        through the FULL risk chain, and close the window in ``finally``.
+        Cancel-all completes (and ``flatten_all``'s quiet-book check runs) before
+        any flatten submit, so a resting order can never fill against a closing
+        trade. ANY exception in phases 2-3 is caught here — the halt latch ALWAYS
+        stands (a failed cleanup must never un-halt trading). Serialized with
+        ``resume()`` via ``_halt_lock``. No LLM anywhere; every action audited."""
+        async with self._halt_lock:
+            # Phase 1 — latch first, always. Synchronous breaker trip: trading is
+            # dead before any broker/DB I/O below (order unchanged from the
+            # original halt(); mirrors /api/halt force_open-before-audit).
+            self.risk.circuit.force_open(reason)
+            with contextlib.suppress(OSError):
+                self._halt_file().write_text(reason, encoding="utf-8")
+            await self.db.kv_set("circuit.manual_halt", reason)
+            await self.audit.append("human", "trading.halted", {"reason": reason})
+            log.warning("trading halted by operator", reason=reason)
+            # Phases 2-3 — best-effort cleanup. Any exception is caught so the
+            # latch above always stands (spec §3.2.4).
+            try:
+                cancel_summary = await self.order_manager.cancel_all_open(reason=reason)
+                flatten_summary = None
+                if (self.config.risk.flatten_on_halt
+                        and self.order_manager.mode is not TradingMode.RESEARCH):
+                    # The ONLY caller of open_halt_flatten_window(): the token is
+                    # minted here and handed only to flatten_all. Closed in
+                    # finally so a crashed flatten cannot leave the window ajar.
+                    token = self.risk.open_halt_flatten_window()
+                    try:
+                        flatten_summary = await self.order_manager.flatten_all(
+                            token, reason=reason)
+                    finally:
+                        self.risk.close_halt_flatten_window()
+            except Exception as exc:  # noqa: BLE001 — cleanup is best-effort; latch stands.
+                await self.audit.append("system", "halt.cleanup_failed",
+                                        {"reason": reason, "error": str(exc)})
+                await self.bus.publish(Topics.NOTIFY, {
+                    "level": "critical", "title": "Halt cleanup failed",
+                    "body": (f"Trading is halted, but order cleanup errored: {exc}. "
+                             "Verify open orders and positions at the brokerage."),
+                })
+                log.error("halt cleanup failed", reason=reason, error=str(exc))
+                return
+            await self._notify_halt_summary(reason, cancel_summary, flatten_summary)
+
+    async def _notify_halt_summary(
+        self, reason: str, cancel_summary: HaltCleanupSummary,
+        flatten_summary: FlattenSummary | None,
+    ) -> None:
+        """One loud critical summary after a halt's cleanup (spec §3.2.4): what
+        was canceled, what failed, what was flattened/refused, and — because
+        cancel-all removes resting guardian protective stops too (§3.3) — an
+        explicit note when the book is left unprotected."""
+        lines = [
+            f"Trading halted: {reason}",
+            f"Orders canceled: {len(cancel_summary.canceled)}",
+        ]
+        if cancel_summary.failed:
+            lines.append(
+                f"Cancel FAILED ({len(cancel_summary.failed)}) — verify at the brokerage: "
+                + ", ".join(f"{f['symbol']} ({f['error']})" for f in cancel_summary.failed)
+            )
+        if cancel_summary.skipped:
+            lines.append(f"Cross-broker orders skipped (survive the halt): "
+                         f"{len(cancel_summary.skipped)}")
+        if flatten_summary is None:
+            lines.append(
+                "Positions NOT flattened (flatten_on_halt off). Resting protective "
+                "stops were canceled — the book is unprotected until resume."
+            )
+        else:
+            lines.append(f"Positions flattened: {len(flatten_summary.submitted)}")
+            if flatten_summary.refused:
+                lines.append(
+                    f"Flatten REFUSED ({len(flatten_summary.refused)}): "
+                    + ", ".join(f"{r.get('symbol', '?')} ({r.get('reason', '')})"
+                                for r in flatten_summary.refused)
+                )
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical", "title": "Trading halted — cleanup summary",
+            "body": "\n".join(lines),
+        })
 
     async def resume(self) -> None:
         """Clear an operator halt (dashboard Resume): the breaker latch, the DB
-        marker, and the filesystem sentinel."""
-        self.risk.circuit.force_close()
-        with contextlib.suppress(OSError):
-            self._halt_file().unlink(missing_ok=True)
-        await self.db.kv_set("circuit.manual_halt", "")
-        await self.audit.append("human", "trading.resumed", {})
-        log.warning("trading resumed by operator")
+        marker, and the filesystem sentinel. Serialized with ``halt()`` via
+        ``_halt_lock`` so a resume never interleaves with a halt's cleanup."""
+        async with self._halt_lock:
+            self.risk.circuit.force_close()
+            with contextlib.suppress(OSError):
+                self._halt_file().unlink(missing_ok=True)
+            await self.db.kv_set("circuit.manual_halt", "")
+            await self.audit.append("human", "trading.resumed", {})
+            log.warning("trading resumed by operator")
 
     async def _restore_manual_halt(self) -> None:
         """Rehydrate an operator HALT that was active before a restart. Called

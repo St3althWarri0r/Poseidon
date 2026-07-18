@@ -21,6 +21,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from poseidon.app import ApplicationKernel
+from poseidon.core.config import AppConfig
 from poseidon.core.enums import (
     AssetClass,
     BrokerCapability,
@@ -31,11 +33,12 @@ from poseidon.core.enums import (
     TradingMode,
 )
 from poseidon.core.errors import BrokerError, CircuitBreakerOpen, RiskViolation
-from poseidon.core.events import EventBus
+from poseidon.core.events import EventBus, Topics
 from poseidon.core.models import Order, Position
 from poseidon.execution.manager import HaltCleanupSummary, OrderManager
 from poseidon.risk.rules import reduce_only_breach
 from poseidon.security.audit import AuditLog
+from poseidon.security.vault import Vault
 from poseidon.storage.db import Database
 
 
@@ -495,3 +498,291 @@ async def test_reduce_only_rule_still_consulted(flat) -> None:
         action == "halt.flatten_refused" and payload.get("symbol") == "AAPL"
         for (_actor, action, payload) in audit_calls
     )
+
+
+# ==========================================================================
+# Task 6 — kernel.halt() orchestration: latch, then cancel-all, then opt-in
+# flatten; the latch survives any cleanup failure (control-hardening spec §3.2).
+# ==========================================================================
+#
+# kernel.halt() drives the two OrderManager cleanup phases in a provably safe
+# order: (1) it latches the breaker synchronously — trading is dead before any
+# broker/DB I/O; (2) it cancels every resting order (always); (3) only when
+# ``risk.flatten_on_halt`` is on AND the mode is not RESEARCH does it mint the
+# engine's identity-checked flatten token, run ``flatten_all`` through the full
+# rule chain, and close the window in ``finally``. Cancel-all ALWAYS completes
+# (and the quiet-book check inside flatten_all runs) before any flatten submit,
+# so a resting order can never fill against a closing trade. Any exception in
+# phases 2-3 is caught: the halt latch always stands. No LLM, Decimal money,
+# every consequential action hash-chained into the audit log.
+
+
+class RecordingBroker(FlattenBroker):
+    """A FlattenBroker that also appends each broker call into a shared ordered
+    event list, so kernel.halt()'s phase ordering (latch → cancel → flatten) is
+    observable end-to-end across the real orchestration."""
+
+    def __init__(self, events: list[str], name: str = "fake") -> None:
+        super().__init__(name)
+        self._events = events
+
+    async def cancel_order(self, order: Order) -> Order:
+        self._events.append(f"cancel:{order.symbol}")
+        return await super().cancel_order(order)
+
+    async def positions(self) -> list[Position]:
+        self._events.append("positions")
+        return await super().positions()
+
+    async def open_orders(self) -> list[Order]:
+        self._events.append("open_orders")
+        return await super().open_orders()
+
+    async def submit_order(self, order: Order) -> Order:
+        self._events.append(f"submit:{order.symbol}")
+        return await super().submit_order(order)
+
+
+class _RecordingCircuit:
+    """A breaker faithful to the ONE thing the halt latch needs: ``force_open``
+    trips it synchronously (it starts CLOSED, exactly as the real breaker does
+    before a halt). Records the trip into the shared event list so a test can
+    prove the latch precedes every broker call."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.is_open = False
+        self.reason: str | None = None
+
+    def force_open(self, reason: str) -> None:
+        self._events.append("force_open")
+        self.is_open = True
+        self.reason = reason
+
+    def force_close(self, reason: str | None = None) -> None:
+        self.is_open = False
+
+
+class KernelRisk(FakeRisk):
+    """FakeRisk wired for the kernel: a recording circuit that starts CLOSED
+    (``force_open`` trips it, as the real halt latch does) and a real
+    ``close_halt_flatten_window`` so the window's open/close is observable."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.circuit = _RecordingCircuit(events)  # type: ignore[assignment]
+        self.window_opened = False
+        self.window_closed = False
+
+    def open_halt_flatten_window(self, *, ttl_seconds: float = 300.0) -> object:
+        self.window_opened = True
+        return super().open_halt_flatten_window(ttl_seconds=ttl_seconds)
+
+    def close_halt_flatten_window(self) -> None:
+        self.window_closed = True
+        self.token = None
+
+
+@pytest.fixture
+async def kernel_ctx(tmp_path):
+    """A real ApplicationKernel with its heavyweight deps replaced by the
+    controllable halt-cleanup fakes (real DB + AuditLog + EventBus, a recording
+    broker/risk, a real OrderManager). ``flatten_on_halt`` starts OFF; a test
+    flips ``kernel.config.risk.flatten_on_halt`` to exercise the opt-in phase.
+    NOTIFY payloads are captured synchronously by wrapping ``bus.publish``."""
+    events: list[str] = []
+    notifies: list[dict] = []
+    bus = EventBus()
+    db = Database(tmp_path / "kernel_halt.db")
+    await db.open()
+    audit = AuditLog(db)
+    broker = RecordingBroker(events)
+    risk = KernelRisk(events)
+    manager = OrderManager(broker, risk, MagicMock(), db, audit, bus,
+                           mode=TradingMode.AUTONOMOUS)
+    config = AppConfig(data_dir=tmp_path)  # flatten_on_halt default False
+    kernel = ApplicationKernel(config, Vault(tmp_path / "v.bin"))
+    kernel.bus = bus
+    kernel.db = db
+    kernel.audit = audit
+    kernel.risk = risk  # type: ignore[assignment]
+    kernel.broker = broker  # type: ignore[assignment]
+    kernel.order_manager = manager
+
+    orig_publish = bus.publish
+
+    async def spy_publish(topic, payload=None):
+        if topic == Topics.NOTIFY:
+            notifies.append(payload or {})
+        return await orig_publish(topic, payload)
+
+    bus.publish = spy_publish  # type: ignore[method-assign]
+    yield {"kernel": kernel, "manager": manager, "broker": broker, "risk": risk,
+           "db": db, "audit": audit, "bus": bus, "events": events,
+           "notifies": notifies, "config": config, "tmp_path": tmp_path}
+    await manager.stop()
+    await bus.close()
+    await db.close()
+
+
+# -- test_latch_precedes_any_broker_call -------------------------------------------
+
+async def test_latch_precedes_any_broker_call(kernel_ctx) -> None:
+    kernel, manager, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                             kernel_ctx["risk"])
+    events = kernel_ctx["events"]
+    audit_calls = _spy_audit(kernel_ctx["audit"])
+    await _seed_open(manager, symbol="AAPL", broker="fake")
+
+    await kernel.halt("operator HALT")
+
+    # The breaker is tripped FIRST — trading is dead before any broker I/O.
+    assert events, "expected the halt to have driven cleanup"
+    assert events[0] == "force_open"
+    broker_calls = [i for i, e in enumerate(events)
+                    if e.startswith(("cancel:", "submit:")) or e in ("positions", "open_orders")]
+    assert broker_calls, "expected at least the cancel pass to touch the broker"
+    assert events.index("force_open") < min(broker_calls)
+    # The latch is durable three ways: in-memory breaker, kv marker, sentinel file.
+    assert risk.circuit.is_open is True
+    assert await kernel_ctx["db"].kv_get("circuit.manual_halt") == "operator HALT"
+    assert (kernel_ctx["tmp_path"] / "HALT").read_text() == "operator HALT"
+    assert "trading.halted" in _actions(audit_calls)
+
+
+# -- test_cancel_completes_before_first_flatten_submit -----------------------------
+
+async def test_cancel_completes_before_first_flatten_submit(kernel_ctx) -> None:
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    events = kernel_ctx["events"]
+    kernel.config.risk.flatten_on_halt = True
+    # A resting order to cancel, plus a live position to flatten. The book is
+    # quiet AFTER the cancel pass (open_orders empty), so AAPL flattens.
+    await _seed_open(manager, symbol="AAPL", broker="fake")
+    broker.positions_list = [_pos("AAPL", "10")]
+    broker.open_orders_list = []
+    risk.held = {"AAPL": Decimal("10")}
+
+    await kernel.halt("operator HALT")
+
+    cancels = [i for i, e in enumerate(events) if e.startswith("cancel:")]
+    submits = [i for i, e in enumerate(events) if e.startswith("submit:")]
+    assert cancels, "expected the resting order to be canceled"
+    assert submits, "expected the live position to be flattened"
+    # EVERY cancel completes before the FIRST flatten submit — a resting order
+    # can never fill against a closing trade.
+    assert max(cancels) < min(submits)
+    # The flatten window was opened and closed (in finally).
+    assert risk.window_opened is True
+    assert risk.window_closed is True
+
+
+# -- test_flatten_off_by_default_no_positions_call ---------------------------------
+
+async def test_flatten_off_by_default_no_positions_call(kernel_ctx) -> None:
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    events = kernel_ctx["events"]
+    # flatten_on_halt is OFF (default). A live position exists but must NOT be read.
+    await _seed_open(manager, symbol="AAPL", broker="fake")
+    broker.positions_list = [_pos("AAPL", "10")]
+
+    await kernel.halt("operator HALT")
+
+    # Cancel-all still ran (it is the non-gated fix), but flatten is skipped
+    # entirely: no positions() call, no window, no submit.
+    assert broker.positions_calls == 0
+    assert "positions" not in events
+    assert [e for e in events if e.startswith("submit:")] == []
+    assert risk.window_opened is False
+    assert broker.cancel_calls  # the resting order was still canceled
+
+
+# -- test_partial_fill_cancel_remainder_then_flatten_filled_position ---------------
+
+async def test_partial_fill_cancel_remainder_then_flatten_filled_position(kernel_ctx) -> None:
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    events = kernel_ctx["events"]
+    kernel.config.risk.flatten_on_halt = True
+    # A PARTIALLY_FILLED resting order: cancel kills the resting remainder; the
+    # already-filled portion is a live position that flatten then closes.
+    remainder = await _seed_open(manager, symbol="AAPL", broker="fake",
+                                 status=OrderStatus.PARTIALLY_FILLED)
+    broker.positions_list = [_pos("AAPL", "6")]  # the filled portion, now a position
+    broker.open_orders_list = []                 # quiet book after the cancel
+    risk.held = {"AAPL": Decimal("6")}
+
+    await kernel.halt("operator HALT")
+
+    # The remainder was canceled exactly once…
+    assert broker.cancel_calls.count(remainder.id) == 1
+    row = await kernel_ctx["db"].fetch_one(
+        "SELECT status FROM orders WHERE id = ?", (remainder.id,))
+    assert row[0] == OrderStatus.CANCELED.value
+    # …and the filled position was flattened with a reduce-only SELL sized to it.
+    exits = [o for o in broker.submit_calls if o.symbol == "AAPL"]
+    assert len(exits) == 1
+    assert exits[0].side is OrderSide.SELL
+    assert exits[0].quantity == Decimal("6")
+    assert exits[0].strategy == "halt_flatten"
+    # Cancel strictly before the flatten submit.
+    assert max(i for i, e in enumerate(events) if e.startswith("cancel:")) < \
+        min(i for i, e in enumerate(events) if e.startswith("submit:"))
+
+
+# -- test_cleanup_failure_keeps_latch ----------------------------------------------
+
+async def test_cleanup_failure_keeps_latch(kernel_ctx) -> None:
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    audit_calls = _spy_audit(kernel_ctx["audit"])
+
+    async def boom(*, reason: str):
+        raise RuntimeError("DB unavailable during cancel pass")
+
+    manager.cancel_all_open = boom  # type: ignore[method-assign]
+
+    await kernel.halt("operator HALT")
+
+    # The cleanup blew up, but the latch ALWAYS stands: breaker tripped, kv
+    # marker and sentinel written, halt audited.
+    assert risk.circuit.is_open is True
+    assert await kernel_ctx["db"].kv_get("circuit.manual_halt") == "operator HALT"
+    assert (kernel_ctx["tmp_path"] / "HALT").read_text() == "operator HALT"
+    assert "trading.halted" in _actions(audit_calls)
+    # The failure is loud: audited as halt.cleanup_failed and a critical notify.
+    assert "halt.cleanup_failed" in _actions(audit_calls)
+    assert any(n.get("level") == "critical" for n in kernel_ctx["notifies"])
+    # Flatten never attempted after a cancel-phase failure.
+    assert risk.window_opened is False
+    assert broker.submit_calls == []
+
+
+# -- test_audit_facts_chain --------------------------------------------------------
+
+async def test_audit_facts_chain(kernel_ctx) -> None:
+    kernel, manager, broker, risk = (kernel_ctx["kernel"], kernel_ctx["manager"],
+                                     kernel_ctx["broker"], kernel_ctx["risk"])
+    audit = kernel_ctx["audit"]
+    kernel.config.risk.flatten_on_halt = True
+    await _seed_open(manager, symbol="AAPL", broker="fake")
+    broker.positions_list = [_pos("AAPL", "10")]
+    broker.open_orders_list = []
+    risk.held = {"AAPL": Decimal("10")}
+    audit_calls = _spy_audit(audit)
+
+    await kernel.halt("operator HALT")
+
+    actions = _actions(audit_calls)
+    # The full halt-cleanup story is hash-chained: the latch, the cancel, and
+    # the flatten submit are all recorded facts.
+    assert "trading.halted" in actions
+    assert "halt.order_canceled" in actions
+    assert "halt.flatten_submitted" in actions
+    # And the audit chain still verifies end-to-end (tamper-evident, intact).
+    ok, bad_seq = await audit.verify_chain()
+    assert ok, f"audit chain broke at seq {bad_seq}"
+    # A single loud critical summary notification was raised.
+    assert any(n.get("level") == "critical" for n in kernel_ctx["notifies"])
