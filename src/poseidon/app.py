@@ -617,6 +617,43 @@ class ApplicationKernel:
             existing["data"] = data
         self._save_overlay(overlay_file, existing)
 
+    def _write_ai_overlay(self, cfg: AIConfig, *, clear_utility: bool = False) -> None:
+        """Persist the dashboard's AI backend/model choice to poseidon.local.yaml
+        (merged over the main config at startup). Mirrors
+        ``_write_broker_overlay``: read the existing overlay (parse error →
+        ConfigError), set only the managed ``ai`` sub-block, atomic-write.
+
+        Secrets never land here — only the backend id, model id, and base_url.
+        The vault credential is referenced by NAME in the base config and is
+        never copied into the overlay.
+
+        ``clear_utility`` writes an explicit ``utility_model: null`` so the
+        startup deep-merge overrides a base ``ai.utility_model``. It is set only
+        when a backend change cleared the (now cross-backend-stale) utility
+        model; on a same-backend model change the key is omitted so a base
+        value survives untouched."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        ai_block: dict[str, object | None] = {
+            "backend": cfg.backend,
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+        }
+        if clear_utility:
+            ai_block["utility_model"] = None
+        existing["ai"] = ai_block
+        self._save_overlay(overlay_file, existing)
+
     @staticmethod
     def _save_overlay(overlay_file: Path, existing: dict[str, object]) -> None:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
