@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -57,6 +58,28 @@ _POLL_INTERVAL_MAX = 300.0  # long-lived GTC polls back off to every 5 min
 # longer, resume_open_orders() re-attaches a fresh poller on the next restart.
 _POLL_TIMEOUT_DAY = 8 * 60 * 60
 _POLL_TIMEOUT_GTC = 5 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class HaltCleanupSummary:
+    """The immutable outcome of ``cancel_all_open`` (control-hardening spec §3.2).
+
+    ``kernel.halt()`` consumes this to (a) decide which symbols still carry a
+    live order and must be EXCLUDED from any opt-in flatten (a resting order
+    must never fill against a closing trade), and (b) drive the single loud
+    summary notification. All three fields are records, never retried actions:
+
+      * ``canceled`` — order ids the active broker confirmed canceled.
+      * ``failed``   — ``{order_id, symbol, error}`` per cancel that raised;
+                       attempted exactly once, recorded here, never retried.
+      * ``skipped``  — order ids left untouched (cross-broker rows, or a
+                       broker-switch abort) — never canceled against the wrong
+                       brokerage, surfaced so the operator knows they survived.
+    """
+
+    canceled: list[str] = field(default_factory=list)
+    failed: list[dict[str, str]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
 
 class OrderManager:
@@ -718,6 +741,60 @@ class OrderManager:
                 await self._persist(order)
                 log.warning("ambiguous order not live at broker; flagged", order_id=order.id)
         return count
+
+    async def cancel_all_open(self, *, reason: str) -> HaltCleanupSummary:
+        """Cancel every order the broker may still hold live — the first cleanup
+        phase of ``kernel.halt()`` (control-hardening spec §3.2). Deterministic,
+        no LLM, no risk-rule involvement: it only cancels resting orders so none
+        can fill mid-halt.
+
+        Each live order (``SUBMITTED``/``ACCEPTED``/``PARTIALLY_FILLED``) is
+        canceled **exactly once**: success → persist + audit
+        (``human``/``halt.order_canceled``); any exception → audit
+        (``system``/``halt.cancel_failed``) + append to ``failed`` and CONTINUE
+        the loop — never retried, so one wedged order cannot stall the halt or
+        hammer the broker. Cross-broker rows are skipped and recorded (mirroring
+        ``cancel()``'s guard — never cancel against the wrong brokerage). A
+        ``PARTIALLY_FILLED`` cancel kills only the resting remainder; the filled
+        portion is a live position handled by flatten sizing (spec §3.3).
+
+        If a broker swap is in flight the book's broker is indeterminate, so the
+        whole pass aborts (recorded) rather than risk a cross-broker cancel."""
+        summary = HaltCleanupSummary()
+        if self._switching:
+            await self._audit.append("system", "halt.cleanup_failed",
+                                     {"phase": "cancel_all_open",
+                                      "error": "broker switch in progress — cleanup aborted"})
+            return summary
+        rows = await self._db.fetch_all(
+            "SELECT payload FROM orders WHERE status IN (?, ?, ?)",
+            (OrderStatus.SUBMITTED.value, OrderStatus.ACCEPTED.value,
+             OrderStatus.PARTIALLY_FILLED.value),
+        )
+        for (payload,) in rows:
+            order = Order.model_validate(json.loads(payload))
+            # Never cancel an order that belongs to another brokerage: its ids
+            # mean nothing here and a cancel could misfire (mirrors cancel()).
+            if order.broker and order.broker != self._broker.name:
+                summary.skipped.append(order.id)
+                continue
+            try:
+                canceled = await self._broker.cancel_order(order)
+            except Exception as exc:  # noqa: BLE001 — ANY failure is recorded, never
+                # retried: a retry loop could double-cancel, hammer a struggling
+                # broker, or wedge the halt. The halt latch already stands.
+                summary.failed.append({"order_id": order.id, "symbol": order.symbol,
+                                       "error": str(exc)})
+                await self._audit.append("system", "halt.cancel_failed",
+                                         {"order_id": order.id, "symbol": order.symbol,
+                                          "error": str(exc)})
+                continue
+            await self._persist(canceled)
+            summary.canceled.append(order.id)
+            await self._audit.append("human", "halt.order_canceled",
+                                     {"order_id": order.id, "symbol": order.symbol,
+                                      "reason": reason})
+        return summary
 
     async def cancel(self, order_id: str) -> Order:
         row = await self._db.fetch_one("SELECT payload FROM orders WHERE id = ?", (order_id,))
