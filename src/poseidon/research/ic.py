@@ -115,6 +115,10 @@ class ICResult:
     alpha_t_train: float | None = None
     alpha_t_test: float | None = None
     n_eff: int = 0
+    # Honest verdict from the loose base gate AND the random-control null (design §4.3).
+    # Defaults to "insufficient_data" so a never-evaluated factor (n_periods == 0) reads as
+    # unmeasured, not as a measured category.
+    verdict: str = "insufficient_data"
 
 
 @dataclass(frozen=True)
@@ -272,6 +276,50 @@ def _split_alpha_t(alpha: list[float], *, horizon: int, rebalance_every: int,
     return t_train, t_test
 
 
+# Loose base gate — FIXED policy (design §4.3), not config; matches the program's legacy
+# survival gate. Only alpha_t_threshold (null survival) is configurable via NullSpec.
+_GATE_IC_MEAN = 0.02     # ic_mean must exceed this
+_GATE_HIT = 0.55         # hit_rate must reach this
+_GATE_T = 2.0            # |t_stat| must exceed this
+
+
+def _verdict(*, n_eff: int, ic_mean: float, hit_rate: float, t_stat: float, alpha_t: float,
+             alpha_t_test: float | None, split_ran: bool, null: NullSpec) -> str:
+    """Honest verdict for a factor (design §4.3), pure and directly testable. First match
+    wins:
+
+    1. n_eff < null.min_n_eff -> "insufficient_data" (few non-overlapping windows never
+       yield a confident category; n_periods == 0 collapses to n_eff == 0, the same branch).
+    2. alpha_t <= -null.alpha_t_threshold -> "reversed" (significantly worse than its own
+       within-date random control; subsumes the legacy ic_mean<-0.02 & |t|>2 reversed).
+    3. Gate = ic_mean > 0.02 AND hit_rate >= 0.55 AND |t_stat| > 2 AND
+       alpha_t >= threshold (the loose base gate AND null survival). Fail -> "noise" —
+       this is the VT 12/12->1/12 case when raw IC/t pass but alpha_t falls short.
+    4. Gate passed and the split ran: alpha_t_test >= thr -> "confirmed_alive";
+       alpha_t_test <= -thr -> "reversed" (OOS sign flip); else -> "train_only".
+    5. Gate passed, no split (off or n/a) -> "confirmed_alive".
+
+    `alpha_t` is a plain float here: the caller passes 0.0 when n_periods == 0, but rule 1
+    fires first in that case, so the value never decides the verdict."""
+    thr = null.alpha_t_threshold
+    if n_eff < null.min_n_eff:
+        return "insufficient_data"
+    if alpha_t <= -thr:
+        return "reversed"
+    gate = (ic_mean > _GATE_IC_MEAN and hit_rate >= _GATE_HIT
+            and abs(t_stat) > _GATE_T and alpha_t >= thr)
+    if not gate:
+        return "noise"
+    if split_ran:
+        assert alpha_t_test is not None     # split_ran True <=> both split t-stats are floats
+        if alpha_t_test >= thr:
+            return "confirmed_alive"
+        if alpha_t_test <= -thr:
+            return "reversed"
+        return "train_only"
+    return "confirmed_alive"
+
+
 def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: int,
                     rebalance_every: int, horizons: list[int],
                     min_cross: int = 5, null: NullSpec = _DEFAULT_NULL) -> ICResult:
@@ -325,6 +373,14 @@ def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: i
         s, _ = _ic_series(factor, history, dates, h, min_cross, calendar)
         by_h[h] = statistics.fmean(s) if s else None
     breadth = int(statistics.median(widths)) if widths else 0
+    # Honest verdict (design §4.3). The split ran only when it produced both segment
+    # t-stats; alpha_t is None IFF n_periods == 0, where rule 1 fires on n_eff regardless,
+    # so passing 0.0 in that case is safe (see _verdict docstring).
+    split_ran = alpha_t_train is not None and alpha_t_test is not None
+    verdict = _verdict(n_eff=n_eff, ic_mean=ic_mean, hit_rate=hit_rate, t_stat=t_stat,
+                       alpha_t=alpha_t if alpha_t is not None else 0.0,
+                       alpha_t_test=alpha_t_test, split_ran=split_ran, null=null)
     return ICResult(factor.name, horizon, ic_mean, ic_std, ir, t_stat, hit_rate, n,
                     by_h, breadth, alpha_mean=alpha_mean, alpha_t=alpha_t,
-                    alpha_t_train=alpha_t_train, alpha_t_test=alpha_t_test, n_eff=n_eff)
+                    alpha_t_train=alpha_t_train, alpha_t_test=alpha_t_test, n_eff=n_eff,
+                    verdict=verdict)

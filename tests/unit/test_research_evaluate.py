@@ -224,3 +224,131 @@ def test_evaluate_factor_rejects_bad_nullspec() -> None:
                 NullSpec(alpha_t_threshold=0.0), NullSpec(min_n_eff=1)):
         with pytest.raises(ValueError):
             evaluate_factor(probe, hist, horizon=5, rebalance_every=5, horizons=[5], null=bad)
+
+
+# --- Verdict function (design §4.3; spec §7 task 3) ---------------------------------
+# Pure, table-driven tests over _verdict. Default NullSpec: alpha_t_threshold=2.0,
+# min_n_eff=10. A "passing" baseline clears every gate leg AND the null so the tables
+# below isolate exactly the leg each case perturbs.
+
+
+def _passing() -> dict:
+    # Every gate leg passes AND alpha survives the null: ic_mean>0.02, hit>=0.55,
+    # |t|>2, alpha_t>=2.0; n_eff above the floor; no split by default.
+    return {"n_eff": 20, "ic_mean": 0.05, "hit_rate": 0.60, "t_stat": 3.0, "alpha_t": 3.0,
+            "alpha_t_test": None, "split_ran": False}
+
+
+def test_verdict_insufficient_data_below_n_eff_floor() -> None:
+    # Rule 1: n_eff < null.min_n_eff (default 10) -> insufficient_data, regardless of how
+    # strong the other stats look (few dates never yield a confident category). n_eff==0
+    # (n_periods==0) is the same branch.
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    for n_eff in (0, 1, 9):
+        assert _verdict(**{**_passing(), "n_eff": n_eff}, null=null) == "insufficient_data"
+    assert _verdict(**{**_passing(), "n_eff": 10}, null=null) != "insufficient_data"  # floor is exclusive-below
+
+
+def test_verdict_reversed_full_sample() -> None:
+    # Rule 2: alpha_t <= -threshold -> reversed (significantly worse than its own random
+    # control). Fires BEFORE the gate, even when ic_mean/hit/t would otherwise pass.
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    assert _verdict(**{**_passing(), "alpha_t": -2.0}, null=null) == "reversed"   # exactly -thr
+    assert _verdict(**{**_passing(), "alpha_t": -5.0}, null=null) == "reversed"
+    # Just inside the reversed band (not <= -thr) and failing the gate -> noise, not reversed.
+    assert _verdict(**{**_passing(), "alpha_t": -1.9}, null=null) == "noise"
+
+
+def test_verdict_noise_each_gate_leg_failing_alone() -> None:
+    # Rule 3: the gate is ic_mean>0.02 AND hit>=0.55 AND |t|>2 AND alpha_t>=thr. With the
+    # other three legs passing, any single failing leg -> noise. The alpha_t leg failing
+    # while raw IC/t pass is the VT 12/12 -> 1/12 case (strong raw signal, no null survival).
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    cases = {
+        "ic_mean": {"ic_mean": 0.02},          # not strictly > 0.02
+        "hit_rate": {"hit_rate": 0.54},        # < 0.55
+        "t_stat": {"t_stat": 2.0},             # |t| not > 2
+        "alpha_t": {"alpha_t": 1.9},           # 0 < alpha_t < thr: raw IC passes, null fails (VT)
+    }
+    for leg, override in cases.items():
+        assert _verdict(**{**_passing(), **override}, null=null) == "noise", leg
+    # Negative t magnitude still clears |t|>2, so a strong-but-negative t alone stays a gate
+    # pass on that leg (ic_mean leg then decides): confirm |t| uses magnitude.
+    assert _verdict(**{**_passing(), "t_stat": -3.0}, null=null) == "confirmed_alive"
+
+
+def test_verdict_confirmed_alive_full_sample_and_oos_survival() -> None:
+    # Rule 5: gate passed, no split -> confirmed_alive. Rule 4: gate passed, split ran and
+    # alpha_t_test >= thr -> confirmed_alive (OOS survival).
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    assert _verdict(**_passing(), null=null) == "confirmed_alive"                 # no split
+    assert _verdict(**{**_passing(), "split_ran": True, "alpha_t_test": 2.0},
+                    null=null) == "confirmed_alive"                               # OOS survives (exactly thr)
+
+
+def test_verdict_train_only_when_oos_neither_survives_nor_reverses() -> None:
+    # Rule 4: gate passed, split ran, -thr < alpha_t_test < thr -> train_only (holds in
+    # sample, fades out of sample without flipping sign).
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    for oos in (1.9, 0.0, -1.9):
+        assert _verdict(**{**_passing(), "split_ran": True, "alpha_t_test": oos},
+                        null=null) == "train_only", oos
+
+
+def test_verdict_reversed_on_oos_sign_flip() -> None:
+    # Rule 4: gate passed, split ran, alpha_t_test <= -thr -> reversed (out-of-sample sign
+    # flip), distinct from a full-sample reversal.
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    assert _verdict(**{**_passing(), "split_ran": True, "alpha_t_test": -2.0},
+                    null=null) == "reversed"
+    assert _verdict(**{**_passing(), "split_ran": True, "alpha_t_test": -4.0},
+                    null=null) == "reversed"
+
+
+def test_verdict_split_na_falls_back_to_full_sample() -> None:
+    # When the split is n/a (split_ran False, alpha_t_test None) the verdict falls back to
+    # the full-sample logic (rule 5) — never a silent crash on the missing OOS value.
+    from poseidon.research.ic import NullSpec, _verdict
+    null = NullSpec()
+    assert _verdict(**{**_passing(), "split_ran": False, "alpha_t_test": None},
+                    null=null) == "confirmed_alive"
+    # Full-sample gate fails while split n/a -> noise (fallback, not an OOS category).
+    assert _verdict(**{**_passing(), "alpha_t": 1.0, "split_ran": False, "alpha_t_test": None},
+                    null=null) == "noise"
+
+
+def test_verdict_respects_configurable_alpha_t_threshold() -> None:
+    # alpha_t_threshold is configurable (HLZ: 3.5 for whole-library scans). An alpha_t of
+    # 3.0 that confirms at thr=2.0 becomes gate-failing noise at thr=3.5.
+    from poseidon.research.ic import NullSpec, _verdict
+    assert _verdict(**{**_passing(), "alpha_t": 3.0}, null=NullSpec()) == "confirmed_alive"
+    assert _verdict(**{**_passing(), "alpha_t": 3.0},
+                    null=NullSpec(alpha_t_threshold=3.5)) == "noise"
+
+
+def test_evaluate_factor_stores_verdict_on_result() -> None:
+    # Wiring: evaluate_factor computes _verdict and stores it on ICResult.verdict. A drift+
+    # wiggle universe has a high-but-varying IC (so t_stat is defined and large) that
+    # survives its own random control -> confirmed_alive (no split by default). A perfectly
+    # clean drift instead has ic_std == 0 -> t_stat 0 -> the |t|>2 gate leg fails -> noise;
+    # both are asserted so the verdict is genuinely wired, not a constant.
+    from poseidon.research.ic import NullSpec
+    mom = Factor("mom5", lambda b: float(b[-1].close) / float(b[-6].close) - 1.0, min_bars=6)
+    wiggle = _wiggle_universe(140)
+    res = evaluate_factor(mom, wiggle, horizon=5, rebalance_every=5, horizons=[5],
+                          null=NullSpec(min_n_eff=2))
+    assert res.n_eff >= 2 and res.verdict == "confirmed_alive"
+    clean = _hist({f"S{n}": [100 * (1 + 0.003 * n) ** k for k in range(120)] for n in range(8)})
+    res_clean = evaluate_factor(mom, clean, horizon=5, rebalance_every=5, horizons=[5],
+                                null=NullSpec(min_n_eff=2))
+    assert res_clean.ic_std == 0.0 and res_clean.verdict == "noise"   # zero-variance IC -> |t| fails
+    # No-data factor (impossible min_bars) -> n_periods 0 -> insufficient_data default holds.
+    dead = Factor("dead", lambda b: float(b[-1].close), min_bars=10_000)
+    res0 = evaluate_factor(dead, wiggle, horizon=5, rebalance_every=5, horizons=[5])
+    assert res0.n_periods == 0 and res0.verdict == "insufficient_data"
