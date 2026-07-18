@@ -144,3 +144,10 @@ class AgentRefusedError(AgentError):
     """The model declined the request; the cycle is skipped, never faked."""
 
     retryable = False
+
+
+class BackendUnreachableError(AgentError):
+    """Model backend could not be reached (connect-phase failure), distinct from
+    a model/schema/HTTP error. The server may return — honestly retryable."""
+
+    retryable = True
