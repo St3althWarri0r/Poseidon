@@ -361,3 +361,188 @@ async def test_live_guard_fires_through_connect_endpoint(wired) -> None:
     assert resp.status_code == 200
     assert resp.json()["broker"]["paper"] is False
     assert kernel.order_manager.mode is TradingMode.APPROVAL
+
+
+# ------------------------------------------- legacy alpaca_keys migration (T6)
+#
+# Pre-toggle installs saved ONE ``alpaca_keys`` vault credential (used for both
+# the broker and the Alpaca data provider). The toggle needs env-scoped
+# ``alpaca_paper_keys`` / ``alpaca_live_keys``. On kernel start, if the alpaca
+# broker still carries the legacy name and neither env name exists yet, the
+# credential is COPIED into the current-env name and the broker overlay is
+# repointed — one-time, idempotent, audited (``broker.credential_migrated``).
+# ``alpaca_keys`` is RETAINED: the Alpaca data provider references it as its
+# ``ProviderConfig.credential`` and deleting it would break market data.
+
+
+async def _kernel_with_audit(tmp_path, brokers):
+    from poseidon.security.audit import AuditLog
+    from poseidon.storage.db import Database
+
+    cfg = AppConfig(brokers=brokers, data_dir=tmp_path)
+    cfg.config_path = tmp_path / "poseidon.yaml"
+    kernel = ApplicationKernel(cfg, Vault(tmp_path / "v.bin"))
+    db = Database(tmp_path / "mig.db")
+    await db.open()
+    kernel.db = db
+    kernel.audit = AuditLog(db)
+    return kernel, db
+
+
+def _spy_audit(kernel) -> list[tuple[str, str, dict]]:
+    audits: list[tuple[str, str, dict]] = []
+    real_append = kernel.audit.append
+
+    async def spy(actor, action, payload=None):
+        audits.append((actor, action, payload or {}))
+        return await real_append(actor, action, payload)
+
+    kernel.audit.append = spy  # type: ignore[method-assign]
+    return audits
+
+
+def _legacy_alpaca_cfg(paper: bool) -> BrokerConfig:
+    return BrokerConfig(name="alpaca", primary=True, credential="alpaca_keys",
+                        paper=paper)
+
+
+@pytest.mark.parametrize(
+    ("paper", "env_name", "other_env"),
+    [(True, "alpaca_paper_keys", "alpaca_live_keys"),
+     (False, "alpaca_live_keys", "alpaca_paper_keys")],
+)
+async def test_migration_copies_legacy_to_current_env(
+        tmp_path, paper, env_name, other_env) -> None:
+    """Legacy ``alpaca_keys`` present + env names absent ⇒ copied to the
+    CURRENT-env name (per the broker config's ``paper``); ``alpaca_keys`` is
+    retained (data provider) and the opposite env is left absent."""
+    kernel, db = await _kernel_with_audit(tmp_path, [_legacy_alpaca_cfg(paper)])
+    audits = _spy_audit(kernel)
+    kernel.vault.create("test-passphrase")
+    legacy = json.dumps({"key_id": "AKLEGACY", "secret_key": "s-legacy"})
+    kernel.vault.set("alpaca_keys", legacy)
+    try:
+        result = await kernel._migrate_legacy_alpaca_credential()
+        assert result == env_name
+        # Copied verbatim into the current-env name.
+        assert kernel.vault.get(env_name) == legacy
+        # Legacy retained for the data provider; opposite env untouched.
+        names = kernel.vault.names()
+        assert "alpaca_keys" in names
+        assert other_env not in names
+        # Broker config repointed at the env-scoped name.
+        alpaca = next(b for b in kernel.config.brokers if b.name == "alpaca")
+        assert alpaca.credential == env_name
+        # Audited exactly once, with NO secret value in the payload.
+        migs = [p for _a, act, p in audits if act == "broker.credential_migrated"]
+        assert len(migs) == 1
+        assert migs[0]["from"] == "alpaca_keys"
+        assert migs[0]["to"] == env_name
+        assert "s-legacy" not in json.dumps(migs[0])
+        assert "AKLEGACY" not in json.dumps(migs[0])
+    finally:
+        await db.close()
+
+
+async def test_migration_is_idempotent(tmp_path) -> None:
+    """A second run is a no-op: no re-copy, no config churn, no second audit —
+    the env name now exists, so the legacy branch is skipped."""
+    kernel, db = await _kernel_with_audit(tmp_path, [_legacy_alpaca_cfg(True)])
+    kernel.vault.create("test-passphrase")
+    legacy = json.dumps({"key_id": "AKLEGACY", "secret_key": "s-legacy"})
+    kernel.vault.set("alpaca_keys", legacy)
+    try:
+        first = await kernel._migrate_legacy_alpaca_credential()
+        assert first == "alpaca_paper_keys"
+        # Tamper the env key to prove a second run does NOT overwrite it.
+        kernel.vault.set("alpaca_paper_keys", json.dumps({"key_id": "UNCHANGED"}))
+        audits = _spy_audit(kernel)
+        second = await kernel._migrate_legacy_alpaca_credential()
+        assert second is None
+        assert kernel.vault.get_json("alpaca_paper_keys") == {"key_id": "UNCHANGED"}
+        assert not any(act == "broker.credential_migrated" for _a, act, _p in audits)
+    finally:
+        await db.close()
+
+
+async def test_migration_retains_legacy_for_data_provider(tmp_path) -> None:
+    """Guard for the Alpaca data provider: ``alpaca_keys`` must still resolve
+    after migration (deleting it would break market data)."""
+    kernel, db = await _kernel_with_audit(tmp_path, [_legacy_alpaca_cfg(True)])
+    kernel.vault.create("test-passphrase")
+    legacy = json.dumps({"key_id": "AKLEGACY", "secret_key": "s-legacy"})
+    kernel.vault.set("alpaca_keys", legacy)
+    try:
+        await kernel._migrate_legacy_alpaca_credential()
+        assert kernel.vault.get("alpaca_keys") == legacy
+    finally:
+        await db.close()
+
+
+async def test_migration_noop_without_alpaca_broker(tmp_path) -> None:
+    """Data-provider-ONLY installs (``alpaca_keys`` in the vault but no alpaca
+    BROKER config) are not migrated — env-scoped keys only serve the broker
+    toggle, and seeding one from a data key could point the wrong environment
+    at a trading key."""
+    kernel, db = await _kernel_with_audit(tmp_path, [])
+    kernel.vault.create("test-passphrase")
+    kernel.vault.set("alpaca_keys", json.dumps({"key_id": "DATAONLY"}))
+    try:
+        result = await kernel._migrate_legacy_alpaca_credential()
+        assert result is None
+        assert "alpaca_paper_keys" not in kernel.vault.names()
+        assert "alpaca_live_keys" not in kernel.vault.names()
+    finally:
+        await db.close()
+
+
+async def test_migration_noop_when_broker_already_env_scoped(tmp_path) -> None:
+    """An alpaca broker already on an env-scoped credential is left alone even
+    if a stray ``alpaca_keys`` (data provider) is present."""
+    kernel, db = await _kernel_with_audit(tmp_path, [
+        BrokerConfig(name="alpaca", primary=True, credential="alpaca_live_keys",
+                     paper=False),
+    ])
+    kernel.vault.create("test-passphrase")
+    kernel.vault.set("alpaca_keys", json.dumps({"key_id": "DATAONLY"}))
+    try:
+        result = await kernel._migrate_legacy_alpaca_credential()
+        assert result is None
+        assert "alpaca_paper_keys" not in kernel.vault.names()
+    finally:
+        await db.close()
+
+
+async def test_migration_persists_overlay_preserving_primary(tmp_path) -> None:
+    """The migration repoints the alpaca overlay entry's credential and keeps
+    its primary flag, so the choice survives a restart without changing which
+    broker trades."""
+    kernel, db = await _kernel_with_audit(tmp_path, [_legacy_alpaca_cfg(True)])
+    kernel.vault.create("test-passphrase")
+    kernel.vault.set("alpaca_keys", json.dumps({"key_id": "AKLEGACY"}))
+    try:
+        await kernel._migrate_legacy_alpaca_credential()
+        from poseidon.core.config import local_overlay_path
+        overlay = local_overlay_path(kernel.config.config_path)
+        assert overlay.exists()
+        import yaml as _yaml
+        data = _yaml.safe_load(overlay.read_text(encoding="utf-8"))
+        entry = next(b for b in data["brokers"] if b["name"] == "alpaca")
+        assert entry["credential"] == "alpaca_paper_keys"
+        assert entry["primary"] is True
+        # No secret ever lands in the overlay.
+        assert "AKLEGACY" not in overlay.read_text(encoding="utf-8")
+    finally:
+        await db.close()
+
+
+async def test_migration_skips_when_vault_locked(tmp_path) -> None:
+    """A locked vault is a graceful no-op (can't enumerate names) — never
+    raises during startup."""
+    kernel, db = await _kernel_with_audit(tmp_path, [_legacy_alpaca_cfg(True)])
+    try:
+        assert kernel.vault.unlocked is False
+        result = await kernel._migrate_legacy_alpaca_credential()
+        assert result is None
+    finally:
+        await db.close()

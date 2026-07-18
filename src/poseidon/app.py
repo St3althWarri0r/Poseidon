@@ -72,6 +72,13 @@ from .updater import UpdateService
 
 log = structlog.get_logger(__name__)
 
+_OVERLAY_HEADER = (
+    "# Managed by the Poseidon dashboard (Account view).\n"
+    "# Broker connections chosen in the UI persist here and are merged over\n"
+    "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
+    "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
+)
+
 
 def _env_credential(entry: dict[str, object], paper: bool) -> str:
     """Vault credential name for a broker's paper/live environment.
@@ -156,6 +163,11 @@ class ApplicationKernel:
                 f"audit chain verification FAILED at seq {bad_seq} — the audit log has been "
                 "tampered with or corrupted; refusing to start (see docs/troubleshooting.md)"
             )
+
+        migrated_to = await self._migrate_legacy_alpaca_credential()
+        if migrated_to is not None:
+            log.info("migrated legacy alpaca_keys to env-scoped credential",
+                     credential=migrated_to)
 
         self.router = self._build_router()
         self.broker = await self._build_broker()
@@ -603,18 +615,91 @@ class ApplicationKernel:
                                   "priority": 10, "enabled": True})
             data["providers"] = providers
             existing["data"] = data
-        header = (
-            "# Managed by the Poseidon dashboard (Account view).\n"
-            "# Broker connections chosen in the UI persist here and are merged over\n"
-            "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
-            "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
-        )
+        self._save_overlay(overlay_file, existing)
+
+    @staticmethod
+    def _save_overlay(overlay_file: Path, existing: dict[str, object]) -> None:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must not leave a truncated overlay that
         # bricks the next startup.
         tmp = overlay_file.with_name(overlay_file.name + ".tmp")
-        tmp.write_text(header + yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+        tmp.write_text(_OVERLAY_HEADER + yaml.safe_dump(existing, sort_keys=False),
+                       encoding="utf-8")
         tmp.replace(overlay_file)
+
+    async def _migrate_legacy_alpaca_credential(self) -> str | None:
+        """One-time, idempotent migration of the pre-toggle single
+        ``alpaca_keys`` vault credential to the env-scoped
+        ``alpaca_paper_keys`` / ``alpaca_live_keys`` names the paper/live toggle
+        resolves.
+
+        Fires only when the alpaca BROKER is still configured on the legacy
+        ``alpaca_keys`` name and neither env name exists yet; the credential is
+        COPIED (never moved) into the current-env name and the broker config +
+        overlay are repointed. ``alpaca_keys`` is RETAINED because the Alpaca
+        *data provider* references it as its ``ProviderConfig.credential`` —
+        deleting it would break market data. Returns the new credential name
+        when a migration ran, else ``None`` (nothing to do / already migrated).
+        """
+        if not self.vault.unlocked:
+            return None  # locked vault: can't enumerate names — graceful no-op
+        # Anchor on the alpaca broker still carrying the legacy name; a
+        # data-provider-only ``alpaca_keys`` (no alpaca broker) is NOT migrated,
+        # and an already env-scoped broker is left alone. This is also what tells
+        # us which env (paper/live) the legacy account was, and which overlay
+        # entry to repoint.
+        legacy = next((b for b in self.config.brokers
+                       if b.name == "alpaca" and b.credential == "alpaca_keys"), None)
+        if legacy is None:
+            return None
+        names = set(self.vault.names())
+        if "alpaca_keys" not in names:
+            return None  # nothing to copy from
+        if "alpaca_paper_keys" in names or "alpaca_live_keys" in names:
+            return None  # already env-scoped — idempotent skip
+        target = "alpaca_paper_keys" if legacy.paper else "alpaca_live_keys"
+        # Copy within the vault (secret value never leaves it); legacy retained.
+        await asyncio.to_thread(self.vault.set, target, self.vault.get("alpaca_keys"))
+        migrated = legacy.model_copy(update={"credential": target})
+        self.config.brokers = [migrated if b is legacy else b
+                               for b in self.config.brokers]
+        await asyncio.to_thread(self._persist_migrated_broker_credential, migrated)
+        await self.audit.append("system", "broker.credential_migrated", {
+            "broker": "alpaca", "from": "alpaca_keys", "to": target,
+            "paper": legacy.paper,
+        })
+        return target
+
+    def _persist_migrated_broker_credential(self, cfg: BrokerConfig) -> None:
+        """Repoint the alpaca broker overlay entry's credential NAME, preserving
+        its primary/enabled/paper/options. Unlike ``_write_broker_overlay`` this
+        does NOT force the entry primary — the migration must never change which
+        broker trades. Secrets never land here (only the vault name)."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        brokers_raw = existing.get("brokers")
+        brokers = [dict(b) for b in brokers_raw if isinstance(b, dict)] \
+            if isinstance(brokers_raw, list) else []
+        others = [b for b in brokers if b.get("name") != cfg.name]
+        if cfg.primary:
+            others = [{**b, "primary": False} for b in others]
+        entry: dict[str, object] = {"name": cfg.name, "enabled": cfg.enabled,
+                                    "primary": cfg.primary, "paper": cfg.paper,
+                                    "credential": cfg.credential}
+        if cfg.options:
+            entry["options"] = dict(cfg.options)
+        existing["brokers"] = [*others, entry]
+        self._save_overlay(overlay_file, existing)
 
     # ------------------------------------------------------------------- chat
 
