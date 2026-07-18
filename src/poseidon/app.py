@@ -43,7 +43,14 @@ from .core.config import (
 )
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
-from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError, VaultError
+from .core.errors import (
+    AgentError,
+    AgentRefusedError,
+    BackendUnreachableError,
+    ConfigError,
+    DataError,
+    VaultError,
+)
 from .core.events import EventBus, Topics
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
@@ -783,6 +790,24 @@ class ApplicationKernel:
                 await self._record_ai_usage(
                     self.agent.last_cycle_usage(), "refused",
                     cycle_id=f"refused-{uuid.uuid4().hex[:8]}")
+                return
+            except BackendUnreachableError as exc:
+                # Connect-phase failure: the model backend is down, not erroring.
+                # Degrade exactly like the generic branch below (meter usage, publish,
+                # return — never re-raise) but emit a tailored, actionable hint under a
+                # distinct component so the operator knows the fix. Must precede the
+                # generic branch because BackendUnreachableError subclasses AgentError.
+                log.error("model backend unreachable", error=str(exc))
+                await self._record_ai_usage(
+                    self.agent.last_cycle_usage(), "failed",
+                    cycle_id=f"failed-{uuid.uuid4().hex[:8]}")
+                if self.config.ai.backend == "openai_compatible":
+                    hint = (f"Model backend unreachable at {self.config.ai.base_url} — "
+                            "is LM Studio (or your model server) running?")
+                else:
+                    hint = "Cannot reach the Anthropic API — check your network."
+                await self.bus.publish(Topics.SYSTEM_ERROR,
+                                       {"component": "model_backend", "error": hint})
                 return
             except (AgentError, DataError) as exc:
                 log.error("review cycle failed", error=str(exc))

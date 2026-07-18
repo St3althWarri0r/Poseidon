@@ -522,3 +522,126 @@ async def test_refused_cycle_still_meters_ai_usage(tmp_path) -> None:
     assert str(rows[0][0]).startswith("refused-")
     assert rows[0][1] == 1234 and rows[0][2] == 3  # the real billed tokens, not zero
     await db.close()
+
+
+# ---------- backend-unreachable review cycle: tailored notification (Task 4) ----------
+# When the model backend is unreachable (connect-phase failure), run_review_cycle must
+# degrade exactly like the generic AgentError branch — meter usage, publish a system.error,
+# return cleanly (never re-raise) — BUT publish a tailored, actionable hint under
+# component="model_backend" (distinct from the generic "review_cycle" component), so the
+# operator sees "is LM Studio running?" instead of the raw connect string. Because
+# BackendUnreachableError subclasses AgentError, the new branch must precede the generic
+# one or the tailored notification is never emitted.
+
+
+async def _build_cycle_kernel(tmp_path, agent, *, ai=None):
+    """Minimal ApplicationKernel wired just enough to drive run_review_cycle."""
+    from types import SimpleNamespace
+
+    from poseidon.app import ApplicationKernel
+    from poseidon.core.config import AppConfig
+    from poseidon.core.enums import TradingMode
+    from poseidon.security.vault import Vault
+    from poseidon.storage.db import Database
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    cfg = AppConfig(data_dir=data_dir) if ai is None else AppConfig(data_dir=data_dir, ai=ai)
+    kernel = ApplicationKernel(cfg, Vault(tmp_path / "v.bin"))
+    db = Database(tmp_path / "t.db")
+    await db.open()
+    kernel.db = db
+
+    class _NoStrategies:
+        enabled_names: list[str] = []
+
+        async def scan_all(self, router: object, portfolio: object) -> list[object]:
+            return []
+
+    async def _not_over() -> bool:
+        return False
+
+    async def _no_regime() -> None:
+        return None
+
+    kernel.agent = agent  # type: ignore[assignment]
+    kernel.strategies = _NoStrategies()  # type: ignore[assignment]
+    kernel.risk = SimpleNamespace(set_cycle_attribution=lambda *_: None)  # type: ignore[assignment]
+    kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
+    kernel.router = None  # type: ignore[assignment]
+    kernel._over_ai_budget = _not_over  # type: ignore[method-assign]
+    kernel._regime_line = _no_regime  # type: ignore[method-assign]
+    return kernel, db
+
+
+def _stub_agent(exc: Exception):
+    class _Agent:
+        async def run_cycle(self, **kw: object) -> object:
+            raise exc
+
+        def last_cycle_usage(self) -> dict[str, int]:
+            return {"input_tokens": 10, "output_tokens": 0, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0, "api_calls": 1}
+
+    return _Agent()
+
+
+async def _collect_system_errors(kernel):
+    import asyncio
+
+    from poseidon.core.events import Topics
+
+    errors: list[object] = []
+
+    async def _capture(topic: str, payload: object) -> None:
+        errors.append(payload)
+
+    kernel.bus.subscribe(Topics.SYSTEM_ERROR, _capture)
+    await kernel.run_review_cycle()  # must return cleanly, never re-raise
+    for _ in range(3):  # let the fire-and-forget publish task(s) run to completion
+        await asyncio.sleep(0)
+    return errors
+
+
+async def test_backend_unreachable_cycle_notifies_model_backend(tmp_path) -> None:
+    from poseidon.core.config import AIConfig
+    from poseidon.core.errors import BackendUnreachableError
+
+    base = "http://127.0.0.1:1234/v1"
+    kernel, db = await _build_cycle_kernel(
+        tmp_path,
+        _stub_agent(BackendUnreachableError("model backend unreachable")),
+        ai=AIConfig(backend="openai_compatible", base_url=base),
+    )
+    errors = await _collect_system_errors(kernel)
+
+    # (a) usage still metered, under a "failed-" cycle id (degrade intact)
+    rows = await db.fetch_all("SELECT cycle_id, input_tokens, api_calls FROM ai_usage")
+    assert len(rows) == 1
+    assert str(rows[0][0]).startswith("failed-")
+    assert rows[0][1] == 10 and rows[0][2] == 1
+
+    # (b) tailored notification: component == model_backend, hint names base_url + LM Studio
+    assert len(errors) == 1
+    payload = errors[0]
+    assert isinstance(payload, dict)
+    assert payload["component"] == "model_backend"
+    assert base in str(payload["error"])
+    assert "LM Studio" in str(payload["error"])
+    await db.close()
+
+
+async def test_generic_agent_error_still_uses_review_cycle_component(tmp_path) -> None:
+    # Regression: a non-connect failure must keep publishing under "review_cycle" —
+    # the new BackendUnreachableError branch must not steal the generic path.
+    from poseidon.core.errors import AgentError
+
+    kernel, db = await _build_cycle_kernel(tmp_path, _stub_agent(AgentError("schema boom")))
+    errors = await _collect_system_errors(kernel)
+
+    assert len(errors) == 1
+    payload = errors[0]
+    assert isinstance(payload, dict)
+    assert payload["component"] == "review_cycle"
+    assert "schema boom" in str(payload["error"])
+    await db.close()
