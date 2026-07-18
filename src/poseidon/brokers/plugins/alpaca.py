@@ -54,6 +54,11 @@ _SIDE_MAP = {
     OrderSide.SELL_TO_OPEN: "sell", OrderSide.SELL_TO_CLOSE: "sell",
 }
 
+# Alpaca crypto accepts only these time-in-force values; the equity TIFs
+# (day/opg/cls) are rejected with HTTP 422 42210000 "invalid crypto
+# time_in_force". A valid crypto TIF is preserved; the rest are remapped to gtc.
+_CRYPTO_TIF = frozenset({TimeInForce.GTC, TimeInForce.IOC, TimeInForce.FOK})
+
 
 def _parse_ts(value: str | None) -> datetime:
     if not value:
@@ -139,13 +144,22 @@ class AlpacaBroker(Broker):
         return result
 
     async def submit_order(self, order: Order) -> Order:
+        # Crypto rejects the equity order fields: the day/opg/cls TIFs return
+        # HTTP 422 42210000, and extended_hours is equity-only. Remap a
+        # non-crypto TIF to gtc and drop extended_hours; equities are unchanged.
+        is_crypto = order.asset_class is AssetClass.CRYPTO
+        if is_crypto and order.time_in_force not in _CRYPTO_TIF:
+            time_in_force = "gtc"
+        else:
+            time_in_force = order.time_in_force.value
         body: dict[str, Any] = {
             "symbol": order.symbol.upper(),
             "side": _SIDE_MAP[order.side],
-            "time_in_force": order.time_in_force.value,
+            "time_in_force": time_in_force,
             "client_order_id": order.client_order_id,
-            "extended_hours": order.extended_hours,
         }
+        if not is_crypto:
+            body["extended_hours"] = order.extended_hours
         # Alpaca uses "trailing_stop" / "stop_limit" verbatim; map enum values.
         body["type"] = {
             OrderType.MARKET: "market", OrderType.LIMIT: "limit", OrderType.STOP: "stop",
