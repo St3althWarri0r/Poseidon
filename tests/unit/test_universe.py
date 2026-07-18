@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from poseidon.core.errors import ConfigError
+from poseidon.core.symbols import is_crypto_symbol
 from poseidon.data.universe import load_universe
 
 
@@ -42,6 +43,18 @@ def test_screener_universe_matches_research_copy() -> None:
     live = (files("poseidon.data") / "universe" / "sp500.txt").read_text(encoding="utf-8")
     research = (files("poseidon.research") / "data" / "sp500.txt").read_text(encoding="utf-8")
     assert live == research
+
+
+def test_load_crypto_base_usd_pairs() -> None:
+    """``crypto`` universe: upcased BASE/USD pairs, de-duped, ``/`` preserved, all crypto."""
+    symbols = load_universe("crypto")
+    assert len(symbols) >= 40  # ~40 canonical liquid Coinbase USD pairs
+    assert len(set(symbols)) == len(symbols)  # de-duped
+    assert all(s == s.upper() for s in symbols)  # uppercased
+    assert all("/" in s for s in symbols)  # slash preserved
+    assert all(s.endswith("/USD") for s in symbols)  # BASE/USD only
+    assert all(is_crypto_symbol(s) for s in symbols)  # every entry routes as crypto
+    assert symbols[0] == "BTC/USD"  # order-stable: first pair in the file
 
 
 def test_load_universe_has_no_research_import() -> None:

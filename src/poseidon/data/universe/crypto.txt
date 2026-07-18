@@ -1,0 +1,44 @@
+# Bundled screener universe: top liquid Coinbase USD spot pairs (curated snapshot).
+# source: Coinbase Exchange product list, ranked by USD volume. as_of: 2026-07
+# WARNING: curated point-in-time snapshot — refresh as listings/liquidity change.
+# Coinbase-listed BASE/USD spot pairs only (one canonical pair per line).
+BTC/USD
+ETH/USD
+SOL/USD
+XRP/USD
+DOGE/USD
+ADA/USD
+AVAX/USD
+LINK/USD
+DOT/USD
+LTC/USD
+BCH/USD
+XLM/USD
+UNI/USD
+AAVE/USD
+ATOM/USD
+ETC/USD
+FIL/USD
+APT/USD
+ARB/USD
+OP/USD
+NEAR/USD
+ICP/USD
+INJ/USD
+SUI/USD
+LDO/USD
+MKR/USD
+RNDR/USD
+GRT/USD
+ALGO/USD
+SAND/USD
+MANA/USD
+AXS/USD
+SHIB/USD
+CRV/USD
+SNX/USD
+COMP/USD
+FET/USD
+DYDX/USD
+IMX/USD
+APE/USD
