@@ -223,6 +223,69 @@ async def test_swap_awaits_a_held_cycle_lock(tmp_path, monkeypatch) -> None:
     assert kernel._backend is p1
 
 
+async def test_persist_failure_after_build_leaves_no_half_switch(tmp_path, monkeypatch) -> None:
+    """A filesystem fault in the persist step (disk full / read-only fs /
+    permissions -> OSError from the atomic overlay write) must NOT leave the
+    brain live-swapped while the caller is told it failed. Mirrors
+    ``switch_broker``: build -> persist -> THEN swap, so a persist fault drops
+    the freshly built backends and raises with the old backend still live."""
+    p0 = ClosableFake("big")
+    p1 = ClosableFake("small")                       # untiered: same object as utility
+    start = AIConfig(backend="openai_compatible", base_url="http://x/v1", model="big")
+    kernel = _make_kernel(tmp_path, monkeypatch, start_ai=start,
+                          build_pairs=[(p0, p0), (p1, p1)], vault_names=[])
+
+    def boom(cfg, *, clear_utility=False):
+        raise OSError("[Errno 30] Read-only file system")
+    monkeypatch.setattr(kernel, "_write_ai_overlay", boom)
+
+    # OSError is not a PoseidonError, so it is wrapped -> ConfigError -> 422
+    # (never an unhandled 500 on the route).
+    with pytest.raises(ConfigError, match="could not persist"):
+        await kernel.apply_ai_config(backend="openai_compatible", model="small")
+
+    # Nothing switched: brain, agent, chat, and config are all unchanged.
+    assert kernel._backend is p0
+    assert kernel.agent.backend is p0
+    assert kernel.chat._backend is p0
+    assert kernel.config.ai.model == "big"
+    assert kernel.config.ai.backend == "openai_compatible"
+    # The proven-but-uncommitted new backend was closed exactly once (de-duped);
+    # the live old backend was left open.
+    assert p1.closed == 1
+    assert p0.closed == 0
+    # No audit row, no notify, no persisted overlay — the failure is truthful.
+    assert not any(a == "ai.backend_changed" for _, a, _ in kernel.audit.rows)
+    assert Topics.NOTIFY not in [t for t, _ in kernel.bus.published]
+    assert not (tmp_path / "poseidon.local.yaml").exists()
+
+
+async def test_persist_config_error_propagates_no_half_switch(tmp_path, monkeypatch) -> None:
+    """An unparseable hand-edited overlay makes ``_write_ai_overlay`` raise
+    ConfigError; its message is preserved (not re-wrapped) and, as above, no
+    half-switch happens."""
+    p0 = ClosableFake("local")
+    p1 = ClosableFake("opus")
+    start = AIConfig(backend="openai_compatible", base_url="http://x/v1", model="local")
+    kernel = _make_kernel(tmp_path, monkeypatch, start_ai=start,
+                          build_pairs=[(p0, p0), (p1, p1)],
+                          vault_names=["anthropic_api_key"])
+
+    def boom(cfg, *, clear_utility=False):
+        raise ConfigError("cannot parse poseidon.local.yaml: ...")
+    monkeypatch.setattr(kernel, "_write_ai_overlay", boom)
+
+    with pytest.raises(ConfigError, match="cannot parse"):
+        await kernel.apply_ai_config(backend="anthropic", model="claude-opus-4-8")
+
+    assert kernel._backend is p0                      # old (local) brain still live
+    assert kernel.config.ai.backend == "openai_compatible"
+    assert p1.closed == 1                             # uncommitted anthropic backend closed
+    assert p0.closed == 0
+    assert not any(a == "ai.backend_changed" for _, a, _ in kernel.audit.rows)
+    assert Topics.NOTIFY not in [t for t, _ in kernel.bus.published]
+
+
 async def test_audit_and_notify_and_mode_unchanged(tmp_path, monkeypatch) -> None:
     p0 = ClosableFake("opus")
     p1 = ClosableFake("local")

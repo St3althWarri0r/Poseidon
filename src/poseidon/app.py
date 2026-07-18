@@ -799,16 +799,42 @@ class ApplicationKernel:
                 )
 
         paid = backend == "anthropic"
-        # -- The swap, guarded so it can never land mid-cycle.
+        # -- The swap, guarded so it can never land mid-cycle. Ordering mirrors
+        #    ``switch_broker``: PROVE (build) -> PERSIST -> only THEN swap the
+        #    in-memory brain. If the persist raises (an unparseable hand-edited
+        #    overlay -> ConfigError, or a filesystem fault in ``_save_overlay``
+        #    -> OSError: disk full / read-only fs / permissions), the freshly
+        #    built but uncommitted backends are closed and a clean error is
+        #    raised with the OLD backend still live — so the caller's 422 never
+        #    lies about a switch that silently happened (which, into the paid
+        #    Claude API, would bill while the UI reported failure). Only after a
+        #    durable persist do we rebind, audit, and — past the lock — notify.
         async with self._cycle_lock:
             new_primary, new_utility = build_backends(target, self.vault.get)
+            try:
+                await asyncio.to_thread(self._write_ai_overlay, target,
+                                        clear_utility=backend_changed)
+            except Exception as exc:
+                # Persist failed: nothing is swapped. Drop the proven-but-
+                # uncommitted backends (de-duped for the untiered shared-object
+                # case) and surface an actionable error; ConfigError/VaultError
+                # keep their message, any other fault (OSError from the atomic
+                # write) is wrapped so the route maps it to 422, not a 500.
+                closed_fail: set[int] = set()
+                for b in (new_primary, new_utility):
+                    if id(b) in closed_fail:
+                        continue
+                    closed_fail.add(id(b))
+                    with contextlib.suppress(Exception):
+                        await b.aclose()
+                if isinstance(exc, ConfigError | VaultError):
+                    raise
+                raise ConfigError(f"could not persist the AI config: {exc}") from exc
             self._backend = new_primary
             agent.rebind_backend(new_primary)
             self._utility_backend = new_utility
             chat.rebind_backend(new_utility)
             self.config.ai = target
-            await asyncio.to_thread(self._write_ai_overlay, target,
-                                    clear_utility=backend_changed)
             await self.audit.append("human", "ai.backend_changed",
                                     {"backend": backend, "model": model, "paid": paid})
 
