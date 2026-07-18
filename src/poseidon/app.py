@@ -23,6 +23,7 @@ from .ai.agent import ClaudeAgent
 from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
+from .ai.hardware import DEFAULT_LM_STUDIO_URL, probe_local_models
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
@@ -737,6 +738,100 @@ class ApplicationKernel:
             entry["options"] = dict(cfg.options)
         existing["brokers"] = [*others, entry]
         self._save_overlay(overlay_file, existing)
+
+    async def apply_ai_config(self, *, backend: str, model: str) -> dict[str, object]:
+        """Live-swap the portfolio-manager brain between the Claude API and a
+        local LM Studio backend (and/or change the model within one). Config-only:
+        touches ``ai.*``, the overlay, and the backend objects — never the order
+        path, the operating mode, or any secret.
+
+        Ordering mirrors ``switch_broker`` — PROVE the target is usable before
+        touching anything, then commit: switching TO the Claude API requires the
+        anthropic key to already be in the vault, and switching TO local requires
+        the endpoint to be reachable; a bad request raises here with the old
+        backend still live, never half-switching into a dead brain. The swap
+        itself runs under ``_cycle_lock`` so a decision already in flight (a
+        multi-round tool loop holds the lock for its whole duration) finishes
+        entirely on its original backend/model and the swap can never land
+        mid-cycle. The two frozen refs (agent, chat) are rebound via their
+        setters — ``_wire_ai`` is deliberately NOT re-run (it double-subscribes
+        reflection); the reviewer, reflection, and analysis roles auto-follow
+        (they read ``self._backend`` fresh / resolve ``self._utility_backend``
+        via a lambda at call time)."""
+        if self.agent is None or self.chat is None \
+                or self._backend is None or self._utility_backend is None:
+            raise ConfigError("AI is not configured")
+        agent, chat = self.agent, self.chat
+        old_primary: ChatBackend = self._backend
+        old_utility: ChatBackend = self._utility_backend
+
+        base = self.config.ai
+        backend_changed = backend != base.backend
+        base_url = (base.base_url or DEFAULT_LM_STUDIO_URL) \
+            if backend == "openai_compatible" else base.base_url
+        update: dict[str, object | None] = {
+            "backend": backend, "model": model, "base_url": base_url,
+        }
+        if backend_changed:
+            # A stale cross-backend utility id would break the new backend, so
+            # utility follows the primary until the operator re-tiers in YAML.
+            update["utility_model"] = None
+        # Constructing the target runs the AIConfig validator early — a bad
+        # base_url / missing credential name surfaces here, before any swap.
+        target = base.model_copy(update=update)
+
+        # -- Preconditions: prove, THEN commit. This runs BEFORE build_backends
+        #    (which would otherwise raise a raw VaultError from vault.get) and
+        #    before any rebind, so a failure leaves the running backend intact.
+        if backend == "anthropic":
+            if base.api_key_credential not in self.vault.names():
+                raise ConfigError(
+                    "Set your Anthropic API key in the vault first (Account view / "
+                    "poseidon vault set anthropic_api_key) before switching to the "
+                    "Claude API."
+                )
+        else:
+            reachable, _ = await probe_local_models(base_url or DEFAULT_LM_STUDIO_URL)
+            if not reachable:
+                raise ConfigError(
+                    f"LM Studio not reachable at {base_url} — start it and load a "
+                    "model, then retry."
+                )
+
+        paid = backend == "anthropic"
+        # -- The swap, guarded so it can never land mid-cycle.
+        async with self._cycle_lock:
+            new_primary, new_utility = build_backends(target, self.vault.get)
+            self._backend = new_primary
+            agent.rebind_backend(new_primary)
+            self._utility_backend = new_utility
+            chat.rebind_backend(new_utility)
+            self.config.ai = target
+            await asyncio.to_thread(self._write_ai_overlay, target,
+                                    clear_utility=backend_changed)
+            await self.audit.append("human", "ai.backend_changed",
+                                    {"backend": backend, "model": model, "paid": paid})
+
+        # -- Close the displaced backends AFTER releasing the lock (mirrors
+        #    shutdown). Skip any object reused as a new backend, and de-dupe the
+        #    untiered shared-object case so it is never closed twice.
+        closed: set[int] = set()
+        for b in (old_primary, old_utility):
+            if b is new_primary or b is new_utility or id(b) in closed:
+                continue
+            closed.add(id(b))
+            with contextlib.suppress(Exception):
+                await b.aclose()
+
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "warning" if paid else "info",
+            "title": f"AI brain: {'Claude API' if paid else 'Local'} · {model}",
+            "body": (("Trading decisions now run on the paid Claude API — billed per token."
+                      if paid else
+                      "Trading decisions now run on the free local model.")
+                     + " Switching the AI brain does not change your operating mode."),
+        })
+        return {"backend": backend, "model": model, "base_url": base_url, "paid": paid}
 
     # ------------------------------------------------------------------- chat
 
