@@ -64,6 +64,7 @@
       <span class="pill" id="pill-regime" title="Market regime (benchmark)">regime —</span>
       <span class="pill" id="pill-health" title="System health">health —</span>
       <span class="pill" id="pill-circuit" title="Circuit breaker">circuit —</span>
+      <span class="pill" id="pill-broker" title="Active brokerage account">broker —</span>
     </div>
     <div class="topbar-actions">
       <div class="segmented" id="mode-seg" role="radiogroup" aria-label="Operating mode">
@@ -208,13 +209,18 @@
     <div class="grid">
       <div class="card span-5">
         <div class="card-head"><h2>Active broker</h2><span class="hint" id="acct-sync-hint"></span></div>
+        <div class="form-row" id="acct-account-row" hidden>
+          <label class="wide">Active account
+            <select id="acct-account-select"></select>
+            <small id="acct-account-hint"></small></label></div>
         <div id="acct-current" class="stack"></div>
         <div class="ticket-actions">
           <button type="button" class="btn" id="acct-sync">Sync now</button>
         </div>
         <div class="meter-note">Poseidon is non-custodial: your money stays at your brokerage and
-          trades execute there through its official API. Switching brokers never changes the
-          operating mode — a live account in research mode still cannot trade.</div>
+          trades execute there through its official API. Activating a LIVE account while the mode
+          is Autonomous drops it to Approval so a mis-click can't auto-trade real money; otherwise
+          the operating mode is unchanged — a live account in research mode still cannot trade.</div>
       </div>
       <div class="card span-7">
         <div class="card-head"><h2>Connect a brokerage</h2>
@@ -249,8 +255,9 @@
             <button type="button" class="btn btn-ghost" id="bf-cancel">Cancel</button>
           </div>
           <div class="meter-note warn-note" id="bf-live-warning" hidden>LIVE account — real money.
-            Poseidon starts every connection in your current operating mode; orders can only happen
-            in approval or autonomous mode, and every one passes the full risk engine.</div>
+            Activating a live account while the mode is Autonomous drops it to Approval; otherwise
+            the mode is unchanged. Orders can only happen in approval or autonomous mode, and every
+            one passes the full risk engine.</div>
         </form>
       </div>
     </div>
@@ -426,6 +433,7 @@
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script src="/static/debug.js?v=__V__"></script>
+<script src="/static/broker_toggle.js?v=__V__"></script>
 <script src="/static/app.js?v=__V__"></script>
 </body>
 </html>
