@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from poseidon.brokers.plugins.paper import PaperBroker
-from poseidon.core.enums import OrderSide, OrderStatus, OrderType
+from poseidon.core.enums import BrokerCapability, OrderSide, OrderStatus, OrderType
 from poseidon.core.errors import BrokerError
 from poseidon.core.models import Order
 
@@ -98,3 +98,40 @@ async def test_no_quote_source_refuses_to_trade() -> None:
     await broker.connect()
     with pytest.raises(BrokerError, match="refusing to invent prices"):
         await broker.submit_order(buy("1", None))
+
+
+def crypto_broker_with_price(price: str) -> PaperBroker:
+    async def quote_fn(symbol: str):
+        # Wide-enough cash for a fractional BTC buy; preserve full precision.
+        return make_quote(symbol, price, spread="1.00")
+
+    options: dict[str, object] = {"quote_fn": quote_fn, "starting_cash": "100000"}
+    return PaperBroker(credentials={}, options=options)
+
+
+def test_capabilities_include_crypto() -> None:
+    broker = PaperBroker(credentials={}, options={})
+    assert BrokerCapability.CRYPTO in broker.capabilities()
+
+
+async def test_crypto_fractional_buy_fills_from_crypto_quote() -> None:
+    # Crypto price carries many decimals; the fill must stay exact Decimal.
+    broker = crypto_broker_with_price("60123.45678901")
+    await broker.connect()
+    order = Order(symbol="BTC/USD", side=OrderSide.BUY, order_type=OrderType.MARKET,
+                  quantity=Decimal("0.05"))
+    filled = await broker.submit_order(order)
+    assert filled.status is OrderStatus.FILLED
+    # Market buy fills at the ask (mid + half of the 1.00 spread).
+    assert filled.avg_fill_price == Decimal("60123.95678901")
+    assert isinstance(filled.avg_fill_price, Decimal)
+
+    positions = await broker.positions()
+    assert len(positions) == 1
+    assert positions[0].symbol == "BTC/USD"
+    assert positions[0].quantity == Decimal("0.05")
+    assert isinstance(positions[0].quantity, Decimal)
+
+    fills = await broker.recent_fills()
+    assert fills and fills[0].price == Decimal("60123.95678901")
+    assert isinstance(fills[0].price, Decimal)

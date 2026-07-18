@@ -91,6 +91,7 @@ class PaperBroker(Broker):
         return frozenset(
             {
                 BrokerCapability.EQUITIES,
+                BrokerCapability.CRYPTO,
                 BrokerCapability.FRACTIONAL_SHARES,
                 BrokerCapability.EXTENDED_HOURS,
                 BrokerCapability.PAPER_TRADING,
