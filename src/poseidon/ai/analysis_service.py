@@ -15,7 +15,7 @@ from typing import Any
 
 import structlog
 
-from ..core.config import AnalysisConfig
+from ..core.config import AnalysisConfig, SnapshotConfig
 from ..core.models import AnalysisPacket
 from ..storage.db import Database
 from .analysis.analysts import run_analysts
@@ -36,11 +36,13 @@ class AnalysisService:
                  audit_append: Callable[[str, str, dict[str, Any]], Awaitable[Any]],
                  scan: Callable[[str], str] | None = None,
                  record_usage: Callable[[dict[str, int]], Awaitable[None]] | None = None,
-                 over_budget: Callable[[], Awaitable[bool]] | None = None) -> None:
+                 over_budget: Callable[[], Awaitable[bool]] | None = None,
+                 snapshot_config: SnapshotConfig | None = None) -> None:
         self._db = db
         self._router = router
         self._config = config
         self._model = model
+        self._snapshot_config = snapshot_config or SnapshotConfig()
         self._get_backend = get_backend
         self._watchlist = watchlist
         self._audit_append = audit_append
@@ -117,7 +119,7 @@ class AnalysisService:
             backend = self._get_backend()
             if backend is None:
                 return
-            snap = await build_snapshot(self._router, symbol)
+            snap = await build_snapshot(self._router, symbol, config=self._snapshot_config)
             if snap is None:
                 return
             reports = await run_analysts(backend, snap, context="", scan=self._scan,

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -29,7 +30,15 @@ from pydantic import ValidationError
 
 from ..analytics.execution import slippage_bps
 from ..brokers.base import Broker
-from ..core.enums import AssetClass, BrokerCapability, OrderStatus, TimeInForce, TradingMode
+from ..core.enums import (
+    AssetClass,
+    BrokerCapability,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+    TradingMode,
+)
 from ..core.errors import (
     BrokerError,
     CircuitBreakerOpen,
@@ -39,7 +48,7 @@ from ..core.errors import (
     RiskViolation,
 )
 from ..core.events import EventBus, Topics
-from ..core.models import Decision, Order, ProposedTrade
+from ..core.models import Decision, Order, Position, ProposedTrade
 from ..risk.engine import RiskEngine
 from ..risk.rules import reduce_only_breach
 from ..security.audit import AuditLog
@@ -57,6 +66,61 @@ _POLL_INTERVAL_MAX = 300.0  # long-lived GTC polls back off to every 5 min
 # longer, resume_open_orders() re-attaches a fresh poller on the next restart.
 _POLL_TIMEOUT_DAY = 8 * 60 * 60
 _POLL_TIMEOUT_GTC = 5 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class HaltCleanupSummary:
+    """The immutable outcome of ``cancel_all_open`` (control-hardening spec §3.2).
+
+    ``kernel.halt()`` consumes this to (a) decide which symbols still carry a
+    live order and must be EXCLUDED from any opt-in flatten (a resting order
+    must never fill against a closing trade), and (b) drive the single loud
+    summary notification. All three fields are records, never retried actions:
+
+      * ``canceled`` — order ids the active broker confirmed canceled.
+      * ``failed``   — ``{order_id, symbol, error}`` per cancel that raised;
+                       attempted exactly once, recorded here, never retried.
+      * ``skipped``  — order ids left untouched (cross-broker rows, or a
+                       broker-switch abort) — never canceled against the wrong
+                       brokerage, surfaced so the operator knows they survived.
+    """
+
+    canceled: list[str] = field(default_factory=list)
+    failed: list[dict[str, str]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+
+# An order that reached the broker (accepted, resting, or already filled) — the
+# statuses ``flatten_all`` counts as a submitted exit, versus a rejection/error.
+_FLATTEN_LIVE_STATUSES = frozenset({
+    OrderStatus.SUBMITTED, OrderStatus.ACCEPTED,
+    OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
+})
+
+# The live-at-broker statuses ``cancel_all_open`` sweeps, derived from the single
+# source of truth ``OrderStatus.is_open_at_broker`` so the cancel query and the
+# enum predicate can never drift (control-hardening spec §3.2).
+_OPEN_AT_BROKER_STATUSES: tuple[str, ...] = tuple(
+    s.value for s in OrderStatus if s.is_open_at_broker
+)
+
+
+@dataclass(frozen=True)
+class FlattenSummary:
+    """The immutable outcome of ``flatten_all`` (control-hardening spec §3.2/§3.3).
+
+    ``kernel.halt()`` consumes this for the single loud summary notification
+    (flattened k / refused j). Both fields are records, never retried actions:
+
+      * ``submitted`` — order ids for reduce-only exits that reached the broker.
+      * ``refused``   — ``{symbol[, order_id], reason}`` per position NOT flattened:
+                        a surviving open order on the symbol (never raced), a rule
+                        denial (full chain runs — reduce-only never exempted), or a
+                        submit-time rejection. Recorded here, audited, never retried.
+    """
+
+    submitted: list[str] = field(default_factory=list)
+    refused: list[dict[str, str]] = field(default_factory=list)
 
 
 class OrderManager:
@@ -312,7 +376,13 @@ class OrderManager:
 
     # -- submission ------------------------------------------------------------------
 
-    async def _submit(self, order: Order) -> Order:
+    async def _submit(self, order: Order, *, halt_token: object | None = None) -> Order:
+        # ``halt_token`` is the halt-flatten carve-out (§3.4): ONLY
+        # kernel.halt() -> flatten_all presents one (an engine-minted, identity-
+        # checked object()). Every other caller — execute_decision, submit_manual
+        # — passes nothing, so the pre-submit breaker re-check below rejects them
+        # while the breaker is open. The token never rides on the Order model, a
+        # schema, the DB, or any /api/chat payload; it cannot be forged or replayed.
         # Pin the broker for this submission AND its lifecycle poller: even
         # if a hot swap lands later, this order stays with the brokerage that
         # actually holds it.
@@ -343,7 +413,15 @@ class OrderManager:
             # failures, or a long approval wait). validate_order checked it, but
             # that was before the approval gate and the guard/preflight
             # round-trips — the HALT must block a real order right up to submit.
-            if self._risk.circuit.is_open:
+            # The ONLY exception is the halt-flatten carve-out (§3.4): a live,
+            # engine-minted token for a leg-free risk-reducing exit. The
+            # ``halt_token is not None`` short-circuit runs first, so every
+            # default-arg caller keeps the unconditional reject (no forged/None
+            # token ever consults the window). ReduceOnlyRule and the live
+            # _guard_reduce_only backstop below still run — never exempted.
+            if self._risk.circuit.is_open and not (
+                    halt_token is not None
+                    and self._risk.halt_exit_permitted(order, halt_token)):
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = f"halted before submit: {self._risk.circuit.reason}"
                 self._risk.release_validated(order.id)  # (F021)
@@ -704,6 +782,166 @@ class OrderManager:
                 await self._persist(order)
                 log.warning("ambiguous order not live at broker; flagged", order_id=order.id)
         return count
+
+    async def cancel_all_open(self, *, reason: str) -> HaltCleanupSummary:
+        """Cancel every order the broker may still hold live — the first cleanup
+        phase of ``kernel.halt()`` (control-hardening spec §3.2). Deterministic,
+        no LLM, no risk-rule involvement: it only cancels resting orders so none
+        can fill mid-halt.
+
+        Each live order (``SUBMITTED``/``ACCEPTED``/``PARTIALLY_FILLED``) is
+        canceled **exactly once**: success → persist + audit
+        (``human``/``halt.order_canceled``); any exception → audit
+        (``system``/``halt.cancel_failed``) + append to ``failed`` and CONTINUE
+        the loop — never retried, so one wedged order cannot stall the halt or
+        hammer the broker. Cross-broker rows are skipped and recorded (mirroring
+        ``cancel()``'s guard — never cancel against the wrong brokerage). A
+        ``PARTIALLY_FILLED`` cancel kills only the resting remainder; the filled
+        portion is a live position handled by flatten sizing (spec §3.3).
+
+        If a broker swap is in flight the book's broker is indeterminate, so the
+        whole pass aborts (recorded) rather than risk a cross-broker cancel."""
+        summary = HaltCleanupSummary()
+        if self._switching:
+            await self._audit.append("system", "halt.cleanup_failed",
+                                     {"phase": "cancel_all_open",
+                                      "error": "broker switch in progress — cleanup aborted"})
+            return summary
+        placeholders = ", ".join("?" * len(_OPEN_AT_BROKER_STATUSES))
+        rows = await self._db.fetch_all(
+            f"SELECT payload FROM orders WHERE status IN ({placeholders})",
+            _OPEN_AT_BROKER_STATUSES,
+        )
+        for (payload,) in rows:
+            order = Order.model_validate(json.loads(payload))
+            # Never cancel an order that belongs to another brokerage: its ids
+            # mean nothing here and a cancel could misfire (mirrors cancel()).
+            if order.broker and order.broker != self._broker.name:
+                summary.skipped.append(order.id)
+                continue
+            try:
+                canceled = await self._broker.cancel_order(order)
+            except Exception as exc:  # noqa: BLE001 — ANY failure is recorded, never
+                # retried: a retry loop could double-cancel, hammer a struggling
+                # broker, or wedge the halt. The halt latch already stands.
+                summary.failed.append({"order_id": order.id, "symbol": order.symbol,
+                                       "error": str(exc)})
+                await self._audit.append("system", "halt.cancel_failed",
+                                         {"order_id": order.id, "symbol": order.symbol,
+                                          "error": str(exc)})
+                continue
+            await self._persist(canceled)
+            summary.canceled.append(order.id)
+            await self._audit.append("human", "halt.order_canceled",
+                                     {"order_id": order.id, "symbol": order.symbol,
+                                      "reason": reason})
+        return summary
+
+    def _build_flatten_exit(self, position: Position) -> Order:
+        """One reduce-only MARKET DAY exit sized to the whole live position
+        (spec §3.3): a long equity/ETF/crypto SELLs; a short BUYs_TO_CLOSE; a long
+        option SELLs_TO_CLOSE, a short option BUYs_TO_CLOSE. Always leg-free and
+        risk-reducing — the exact shape ``halt_exit_permitted`` admits — and never
+        multi-leg. ``quantity`` is ``abs`` (a short's live quantity is negative)."""
+        is_long = position.quantity > 0
+        if position.asset_class is AssetClass.OPTION:
+            side = OrderSide.SELL_TO_CLOSE if is_long else OrderSide.BUY_TO_CLOSE
+        else:
+            side = OrderSide.SELL if is_long else OrderSide.BUY_TO_CLOSE
+        return Order(
+            symbol=position.symbol.upper(),
+            asset_class=position.asset_class,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=abs(position.quantity),
+            time_in_force=TimeInForce.DAY,
+            strategy="halt_flatten",
+            created_at=datetime.now(UTC),
+        )
+
+    async def flatten_all(self, token: object, *, reason: str) -> FlattenSummary:
+        """Opt-in second halt-cleanup phase (control-hardening spec §3.2/§3.3):
+        close every live position with a reduce-only MARKET exit, through the FULL
+        risk chain. ``token`` is the engine-minted, identity-checked halt-flatten
+        capability — the ONLY thing that carries a leg-free reduce-only exit past
+        the tripped breaker (``validate_order``'s gate + ``_submit``'s pre-submit
+        re-check). No rule is exempted by it: ``ReduceOnlyRule`` (in
+        ``validate_order``) and the live ``_guard_reduce_only`` submit backstop
+        (F022) both still run, so an oversized or otherwise-denied exit is rejected,
+        not forced. The approval queue is NEVER consulted — the operator's halt IS
+        the human consent (submissions audit as ``human``/``halt.flatten_submitted``).
+
+        Ordering guarantee: a position whose symbol still carries an open order at
+        the broker (a cancel that failed / is pending / is cross-broker) is EXCLUDED
+        and recorded — a resting order must never fill against a closing trade. If
+        the live book/positions cannot be read, nothing is flattened (cannot verify
+        → do not trade). Every denial is recorded and audited; nothing is retried.
+        """
+        summary = FlattenSummary()
+        if self._mode is TradingMode.RESEARCH:
+            # Research means no orders, from anyone — refuse before any broker read.
+            await self._audit.append("system", "halt.flatten_refused",
+                                     {"reason": "research mode: orders are never submitted"})
+            return summary
+        try:
+            positions = await self._broker.positions()
+            open_orders = await self._broker.open_orders()
+        except Exception as exc:  # noqa: BLE001 — cannot verify the live book/positions:
+            # a resting order might survive or a position size be unknown, so do NOT
+            # trade blind. Recorded; kernel.halt() raises the critical notification.
+            await self._audit.append("system", "halt.flatten_refused",
+                                     {"reason": f"cannot verify live book to flatten safely: {exc}"})
+            return summary
+        surviving = {o.symbol.upper() for o in open_orders}
+        for position in positions:
+            if position.quantity == 0:
+                continue
+            symbol = position.symbol.upper()
+            if symbol in surviving:
+                # A resting order on this symbol survived the cancel pass — excluding
+                # it is the guarantee that a resting order cannot fill against a
+                # closing trade. Never flattened, always recorded.
+                summary.refused.append({"symbol": symbol, "reason": "open_order_survives"})
+                await self._audit.append("system", "halt.flatten_refused",
+                                         {"symbol": symbol, "reason": "open_order_survives"})
+                continue
+            order = self._build_flatten_exit(position)
+            await self._persist(order)
+            try:
+                await self._risk.validate_order(order, halt_token=token)
+            except (RiskViolation, CircuitBreakerOpen, DataError) as exc:
+                # A rule denied the exit (reduce-only, slippage, session, daily
+                # budget, …). Recorded + audited, NEVER retried — a best-effort
+                # flatten leaves loud partials, it never forces an order past a rule.
+                order.status = OrderStatus.REJECTED_RISK
+                order.status_reason = str(exc)
+                await self._persist(order)
+                summary.refused.append({"order_id": order.id, "symbol": symbol,
+                                        "reason": str(exc)})
+                await self._audit.append("risk", "halt.flatten_refused",
+                                         {"order_id": order.id, "symbol": symbol,
+                                          "reason": str(exc)})
+                continue
+            order.status = OrderStatus.APPROVED
+            await self._persist(order)
+            # The token rides into _submit's pre-submit breaker re-check AND the
+            # live _guard_reduce_only backstop still runs there — the full chain.
+            result = await self._submit(order, halt_token=token)
+            if result.status in _FLATTEN_LIVE_STATUSES:
+                summary.submitted.append(result.id)
+                await self._audit.append("human", "halt.flatten_submitted",
+                                         {"order_id": result.id, "symbol": symbol,
+                                          "side": result.side, "qty": str(result.quantity),
+                                          "reason": reason})
+            else:
+                # _submit already persisted + audited the rejection reason; record
+                # it as a flatten refusal too so the halt summary is complete.
+                summary.refused.append({"order_id": result.id, "symbol": symbol,
+                                        "reason": result.status_reason or "rejected at submit"})
+                await self._audit.append("risk", "halt.flatten_refused",
+                                         {"order_id": result.id, "symbol": symbol,
+                                          "reason": result.status_reason or "rejected at submit"})
+        return summary
 
     async def cancel(self, order_id: str) -> Order:
         row = await self._db.fetch_one("SELECT payload FROM orders WHERE id = ?", (order_id,))

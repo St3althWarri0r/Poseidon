@@ -12,7 +12,7 @@ import contextlib
 import json
 import signal
 import uuid
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import structlog
@@ -49,7 +49,7 @@ from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
 from .execution.approvals import ApprovalQueue
 from .execution.guardian import PositionGuardian
-from .execution.manager import OrderManager
+from .execution.manager import FlattenSummary, HaltCleanupSummary, OrderManager
 from .health.monitor import HealthMonitor
 from .notifications.service import NotificationService
 from .portfolio.state import PortfolioState
@@ -109,6 +109,10 @@ class ApplicationKernel:
         self.dashboard: DashboardServer
         self.updates: UpdateService
         self._cycle_lock = asyncio.Lock()
+        # Serializes halt() and resume() so a resume can never interleave with a
+        # halt's cancel-all/flatten cleanup (and vice versa) — the breaker latch
+        # and the order-cleanup phases must move as one atomic operator action.
+        self._halt_lock = asyncio.Lock()
         self._shutdown = asyncio.Event()
 
     # ------------------------------------------------------------------ wiring
@@ -186,6 +190,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -197,6 +202,7 @@ class ApplicationKernel:
             benchmark_symbol=cfg.risk.benchmark_symbol,
             risk_config=cfg.risk,
             workshop=self.workshop,
+            snapshot_config=cfg.ai.snapshot,
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -221,6 +227,11 @@ class ApplicationKernel:
         await self.audit.append("system", "startup", {"version": __version__, "mode": cfg.mode.value})
         await self.sync.start()
         await self.order_manager.resume_open_orders()
+        # Consent-bound handling: honor/stamp the autonomous-expiry latch and
+        # revert immediately if a boot re-armed AUTONOMOUS past an expired bound
+        # (spec §5.4 site 1). After the notifier is constructed so the critical
+        # revert notification is delivered; before the scheduler runs any cycle.
+        await self._init_autonomy_expiry()
         self.scheduler.start(self._effective_schedules())
         await self.health.start()
         await self.updates.start()
@@ -267,7 +278,8 @@ class ApplicationKernel:
             # news/fundamentals retrieval fast-follow lands.
             scan=None,
             record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
-            over_budget=self._over_ai_budget)
+            over_budget=self._over_ai_budget,
+            snapshot_config=ai_cfg.snapshot)
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
@@ -639,6 +651,8 @@ class ApplicationKernel:
         self.scheduler.register_job("position_guardian", self.guardian.check_all)
         self.scheduler.register_job("daily_report", self.send_daily_report)
         self.scheduler.register_job("risk_metrics", self._risk_metrics_job)
+        # Consent-bound expiry: fires overnight, no AI needed (spec §5.4 site 2).
+        self.scheduler.register_job("autonomy_expiry", self._autonomy_expiry_job)
         if self.analysis is not None:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
         if self.strategy_health is not None:
@@ -682,6 +696,13 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="risk-metrics", job="risk_metrics",
                                every_seconds=900, only_market_hours=True)
+            )
+        if not any(s.job == "autonomy_expiry" and s.enabled for s in schedules):
+            # Unconditional + NOT market-hours gated: an autonomy grant that
+            # lapses overnight must still revert (spec §5.4 site 2).
+            schedules.append(
+                ScheduleConfig(name="autonomy-expiry", job="autonomy_expiry",
+                               every_seconds=60, only_market_hours=False)
             )
         if self.config.ai.analysis.enabled and not any(
             s.job == "analysis_sweep" and s.enabled for s in schedules
@@ -743,6 +764,10 @@ class ApplicationKernel:
             log.info("review cycle already running; skipping")
             return
         async with self._cycle_lock:
+            # First statement under the lock (spec §5.4 site 3): a lapsed autonomy
+            # grant reverts AUTONOMOUS -> APPROVAL BEFORE the agent runs, so the
+            # cycle prompt (and every order it produces) sees the reverted mode.
+            await self._check_autonomy_expiry()
             if await self._over_ai_budget():
                 log.warning("monthly AI budget reached; skipping review cycle")
                 await self.bus.publish(Topics.NOTIFY, {
@@ -764,6 +789,8 @@ class ApplicationKernel:
                 packets = (await self.analysis.relevant_packets(
                     self.config.all_watchlist_symbols())
                     if self.analysis is not None else [])
+                identities = await self._instrument_identities(
+                    self.config.all_watchlist_symbols())
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
                     watchlist=self.config.all_watchlist_symbols(),
@@ -773,6 +800,7 @@ class ApplicationKernel:
                     market_regime=await self._regime_line(),
                     trade_lessons=lessons,
                     analysis_packets=packets,
+                    instrument_identities=identities,
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))
@@ -831,6 +859,24 @@ class ApplicationKernel:
 
     async def _risk_metrics_job(self) -> None:
         await self.refresh_risk_metrics()
+
+    async def _instrument_identities(self, symbols: list[str]) -> dict[str, str]:
+        """Resolved identity lines for the cycle prompt (design §3.5). Fails
+        open per symbol — an unresolved/erroring profile is simply omitted, so
+        this can never block or fail a review cycle. The router's weekly cache
+        makes it ≤1 HTTP call per symbol on the first cycle, free after."""
+        if not self.config.ai.snapshot.identity:
+            return {}
+        identities: dict[str, str] = {}
+        for sym in symbols:
+            try:
+                prof = await self.router.profile(sym)
+            except Exception:
+                continue
+            if prof is None:
+                continue
+            identities[sym] = f"{prof.name} ({prof.exchange}, {prof.asset_type})"
+        return identities
 
     async def _regime_line(self) -> str | None:
         """Regime summary for the cycle prompt. Uses the cached metrics when
@@ -1142,12 +1188,103 @@ class ApplicationKernel:
 
     # ---------------------------------------------------------------- control
 
-    async def set_mode(self, mode: TradingMode) -> None:
+    async def set_mode(self, mode: TradingMode, *,
+                       expires_at: datetime | None = None) -> None:
+        """Operator mode change. Granting AUTONOMOUS also (re)writes the durable
+        consent bound ``mode.autonomous_expires_at`` (control-hardening spec §5.2):
+        an explicit ``expires_at`` wins; else a configured ``risk.autonomous_ttl_
+        hours`` stamps now+ttl; else the grant is unbounded (the key is cleared).
+        Leaving AUTONOMOUS clears the bound — the grant is consumed. The key always
+        gets rewritten on a grant so a stale bound from a prior grant can never leak
+        into a new one."""
         previous = self.order_manager.mode
         self.order_manager.set_mode(mode)
         await self.audit.append("human", "mode.changed",
                                 {"from": previous.value, "to": mode.value})
+        if mode is TradingMode.AUTONOMOUS:
+            if expires_at is not None:
+                bound = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+                stamped = bound.astimezone(UTC).isoformat()
+            elif self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+            else:
+                stamped = ""  # unbounded grant (status quo); "" clears the latch
+            await self.db.kv_set("mode.autonomous_expires_at", stamped)
+            await self.audit.append("human", "mode.autonomy_granted",
+                                    {"expires_at": stamped})
+        else:
+            # Leaving AUTONOMOUS consumes the grant — never leave a stale bound.
+            await self.db.kv_set("mode.autonomous_expires_at", "")
         log.info("operating mode changed", was=previous.value, now=mode.value)
+
+    async def _check_autonomy_expiry(self) -> bool:
+        """Revert AUTONOMOUS -> APPROVAL when the durable consent bound has lapsed
+        (control-hardening spec §5.3). Idempotent: a no-op unless the manager is
+        actually AUTONOMOUS with an expired/absent-but-set bound, so a second call
+        (or a scheduler tick after an already-handled expiry) never double-reverts
+        or double-notifies. The revert goes through ``order_manager.set_mode``
+        DIRECTLY — NOT ``kernel.set_mode`` — so the kv latch is preserved: a
+        crash-restart loop that re-arms AUTONOMOUS from config must re-observe the
+        expiry and revert again, never silently re-grant. An unparseable bound is
+        fail-safe treated as expired (a corrupt bound must not grant unbounded
+        autonomy). Returns True iff it reverted. No LLM; the expiry is audited."""
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
+        raw = await self.db.kv_get("mode.autonomous_expires_at")
+        if not raw:  # absent or "" (unbounded/cleared) — no expiry to enforce
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+            expires_at = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            if datetime.now(UTC) < expires_at:
+                return False
+        except (ValueError, TypeError):
+            pass  # unparseable -> expired (fail-safe), fall through to revert
+        # Re-assert AUTONOMOUS after the kv_get await: the scheduler job and the
+        # cycle-start hook can BOTH pass the top guard, both await kv_get, and both
+        # reach here — without this a second caller reverts again and publishes a
+        # DUPLICATE critical NOTIFY. This check and the synchronous set_mode below
+        # run with no await between them, so only the first caller mutates; any
+        # concurrent caller now observes APPROVAL and bails. The revert stays
+        # idempotent; mode still always ends APPROVAL.
+        if self.order_manager.mode is not TradingMode.AUTONOMOUS:
+            return False
+        # Direct set_mode: leave the kv latch in place (see docstring).
+        self.order_manager.set_mode(TradingMode.APPROVAL)
+        await self.audit.append("system", "mode.autonomy_expired", {"expires_at": raw})
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical",
+            "title": "Autonomous mode expired",
+            "body": "Autonomous mode expired — reverted to approval mode.",
+        })
+        log.warning("autonomous mode expired; reverted to approval", expires_at=raw)
+        return True
+
+    async def _autonomy_expiry_job(self) -> None:
+        """Scheduler entry point for the consent-bound expiry check (spec §5.4
+        site 2). A thin ``-> None`` wrapper so the scheduler's ``Job`` type is
+        satisfied; the bool return of the checker is irrelevant to a tick."""
+        await self._check_autonomy_expiry()
+
+    async def _init_autonomy_expiry(self) -> None:
+        """Startup consent-bound handling (control-hardening spec §5.2 startup +
+        §5.4 site 1). When config boots AUTONOMOUS: an existing bound is honored
+        AS-IS (never extended — future kept, past reverted below); an absent bound
+        with a configured ttl stamps now+ttl; an absent bound with no ttl stays
+        unbounded (status quo). Then run the expiry checker so a boot with a stale
+        past bound reverts immediately. A crash-restart loop therefore can NEVER
+        re-arm expired autonomy — the stale key latches until an explicit operator
+        re-grant."""
+        if self.order_manager.mode is TradingMode.AUTONOMOUS:
+            existing = await self.db.kv_get("mode.autonomous_expires_at")
+            if not existing and self.config.risk.autonomous_ttl_hours > 0:
+                stamped = (datetime.now(UTC) + timedelta(
+                    hours=self.config.risk.autonomous_ttl_hours)).isoformat()
+                await self.db.kv_set("mode.autonomous_expires_at", stamped)
+                await self.audit.append("system", "mode.autonomy_granted",
+                                        {"expires_at": stamped, "source": "startup"})
+        await self._check_autonomy_expiry()
 
     def _halt_file(self) -> Path:
         return self.config.data_dir / "HALT"
@@ -1157,23 +1294,106 @@ class ApplicationKernel:
         survives a restart, a DB loss, and an unreachable dashboard: the
         in-memory breaker latch, a DB kv marker, and a filesystem HALT sentinel
         the breaker reads directly. With systemd Restart=always a crash/reboot
-        in autonomous mode would otherwise silently re-arm trading."""
-        self.risk.circuit.force_open(reason)
-        with contextlib.suppress(OSError):
-            self._halt_file().write_text(reason, encoding="utf-8")
-        await self.db.kv_set("circuit.manual_halt", reason)
-        await self.audit.append("human", "trading.halted", {"reason": reason})
-        log.warning("trading halted by operator", reason=reason)
+        in autonomous mode would otherwise silently re-arm trading.
+
+        After the latch, halt drives two deterministic order-cleanup phases
+        (control-hardening spec §3.2): (2) cancel EVERY resting broker order —
+        always, so none can fill mid-halt; (3) opt-in (``risk.flatten_on_halt``,
+        default off, never in RESEARCH), mint the engine's identity-checked
+        flatten token, close every live position with a reduce-only MARKET exit
+        through the FULL risk chain, and close the window in ``finally``.
+        Cancel-all completes (and ``flatten_all``'s quiet-book check runs) before
+        any flatten submit, so a resting order can never fill against a closing
+        trade. ANY exception in phases 2-3 is caught here — the halt latch ALWAYS
+        stands (a failed cleanup must never un-halt trading). Serialized with
+        ``resume()`` via ``_halt_lock``. No LLM anywhere; every action audited."""
+        async with self._halt_lock:
+            # Phase 1 — latch first, always. Synchronous breaker trip: trading is
+            # dead before any broker/DB I/O below (order unchanged from the
+            # original halt(); mirrors /api/halt force_open-before-audit).
+            self.risk.circuit.force_open(reason)
+            with contextlib.suppress(OSError):
+                self._halt_file().write_text(reason, encoding="utf-8")
+            await self.db.kv_set("circuit.manual_halt", reason)
+            await self.audit.append("human", "trading.halted", {"reason": reason})
+            log.warning("trading halted by operator", reason=reason)
+            # Phases 2-3 — best-effort cleanup. Any exception is caught so the
+            # latch above always stands (spec §3.2.4).
+            try:
+                cancel_summary = await self.order_manager.cancel_all_open(reason=reason)
+                flatten_summary = None
+                if (self.config.risk.flatten_on_halt
+                        and self.order_manager.mode is not TradingMode.RESEARCH):
+                    # The ONLY caller of open_halt_flatten_window(): the token is
+                    # minted here and handed only to flatten_all. Closed in
+                    # finally so a crashed flatten cannot leave the window ajar.
+                    token = self.risk.open_halt_flatten_window()
+                    try:
+                        flatten_summary = await self.order_manager.flatten_all(
+                            token, reason=reason)
+                    finally:
+                        self.risk.close_halt_flatten_window()
+            except Exception as exc:  # noqa: BLE001 — cleanup is best-effort; latch stands.
+                await self.audit.append("system", "halt.cleanup_failed",
+                                        {"reason": reason, "error": str(exc)})
+                await self.bus.publish(Topics.NOTIFY, {
+                    "level": "critical", "title": "Halt cleanup failed",
+                    "body": (f"Trading is halted, but order cleanup errored: {exc}. "
+                             "Verify open orders and positions at the brokerage."),
+                })
+                log.error("halt cleanup failed", reason=reason, error=str(exc))
+                return
+            await self._notify_halt_summary(reason, cancel_summary, flatten_summary)
+
+    async def _notify_halt_summary(
+        self, reason: str, cancel_summary: HaltCleanupSummary,
+        flatten_summary: FlattenSummary | None,
+    ) -> None:
+        """One loud critical summary after a halt's cleanup (spec §3.2.4): what
+        was canceled, what failed, what was flattened/refused, and — because
+        cancel-all removes resting guardian protective stops too (§3.3) — an
+        explicit note when the book is left unprotected."""
+        lines = [
+            f"Trading halted: {reason}",
+            f"Orders canceled: {len(cancel_summary.canceled)}",
+        ]
+        if cancel_summary.failed:
+            lines.append(
+                f"Cancel FAILED ({len(cancel_summary.failed)}) — verify at the brokerage: "
+                + ", ".join(f"{f['symbol']} ({f['error']})" for f in cancel_summary.failed)
+            )
+        if cancel_summary.skipped:
+            lines.append(f"Cross-broker orders skipped (survive the halt): "
+                         f"{len(cancel_summary.skipped)}")
+        if flatten_summary is None:
+            lines.append(
+                "Positions NOT flattened (flatten_on_halt off). Resting protective "
+                "stops were canceled — the book is unprotected until resume."
+            )
+        else:
+            lines.append(f"Positions flattened: {len(flatten_summary.submitted)}")
+            if flatten_summary.refused:
+                lines.append(
+                    f"Flatten REFUSED ({len(flatten_summary.refused)}): "
+                    + ", ".join(f"{r.get('symbol', '?')} ({r.get('reason', '')})"
+                                for r in flatten_summary.refused)
+                )
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "critical", "title": "Trading halted — cleanup summary",
+            "body": "\n".join(lines),
+        })
 
     async def resume(self) -> None:
         """Clear an operator halt (dashboard Resume): the breaker latch, the DB
-        marker, and the filesystem sentinel."""
-        self.risk.circuit.force_close()
-        with contextlib.suppress(OSError):
-            self._halt_file().unlink(missing_ok=True)
-        await self.db.kv_set("circuit.manual_halt", "")
-        await self.audit.append("human", "trading.resumed", {})
-        log.warning("trading resumed by operator")
+        marker, and the filesystem sentinel. Serialized with ``halt()`` via
+        ``_halt_lock`` so a resume never interleaves with a halt's cleanup."""
+        async with self._halt_lock:
+            self.risk.circuit.force_close()
+            with contextlib.suppress(OSError):
+                self._halt_file().unlink(missing_ok=True)
+            await self.db.kv_set("circuit.manual_halt", "")
+            await self.audit.append("human", "trading.resumed", {})
+            log.warning("trading resumed by operator")
 
     async def _restore_manual_halt(self) -> None:
         """Rehydrate an operator HALT that was active before a restart. Called

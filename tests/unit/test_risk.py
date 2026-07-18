@@ -4,16 +4,27 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
-from poseidon.core.clock import MarketClock
+from poseidon.core.clock import FreshnessPolicy, MarketClock, MarketSession
 from poseidon.core.config import RiskConfig
-from poseidon.core.enums import OrderSide, OrderType
-from poseidon.core.errors import RiskViolation
-from poseidon.core.models import AccountSnapshot, Bar, EconomicEvent, Order, Position
+from poseidon.core.enums import AssetClass, OrderSide, OrderType
+from poseidon.core.errors import CircuitBreakerOpen, RiskViolation
+from poseidon.core.events import EventBus
+from poseidon.core.models import (
+    AccountSnapshot,
+    Bar,
+    EconomicEvent,
+    OptionLeg,
+    Order,
+    Position,
+)
+from poseidon.data.router import DataRouter
 from poseidon.portfolio.state import PortfolioState
 from poseidon.risk.circuit import CircuitBreaker, TradeCooldowns
+from poseidon.risk.engine import RiskEngine
 from poseidon.risk.rules import (
     BuyingPowerRule,
     CooldownRule,
@@ -27,10 +38,11 @@ from poseidon.risk.rules import (
     SectorConcentrationRule,
     SlippageProtectionRule,
     SpreadRule,
+    UniverseRule,
     VolumeRule,
 )
 
-from ..conftest import make_quote
+from ..conftest import FakeProvider, make_quote
 
 
 def portfolio_with(equity: str = "100000", cash: str = "50000") -> PortfolioState:
@@ -287,6 +299,172 @@ class TestPortfolioVaRRule:
         state.risk_metrics_at = datetime.now(UTC) - timedelta(hours=3)
         with pytest.raises(RiskViolation, match="fresh"):
             PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
+
+
+class TestUniverseRule:
+    """A deterministic universe gate: opens outside the configured universe are
+    denied by underlying; risk-reducing exits always pass so a position can never
+    be trapped outside the universe."""
+
+    def _buy(self, symbol: str = "AAPL") -> Order:
+        return Order(symbol=symbol, side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100.00"))
+
+    def _sell(self, symbol: str = "AAPL") -> Order:
+        return Order(symbol=symbol, side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100.00"))
+
+    def _option_open(self, symbol: str) -> Order:
+        return Order(symbol=symbol, asset_class=AssetClass.OPTION,
+                     side=OrderSide.BUY_TO_OPEN, order_type=OrderType.LIMIT,
+                     quantity=Decimal("1"), limit_price=Decimal("1.00"))
+
+    def test_open_denied_on_exclude(self) -> None:
+        cfg = RiskConfig(universe_exclude_symbols=["TSLA"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._buy("AAPL"), config=cfg))  # not excluded, no allowlist
+
+    def test_open_denied_off_allowlist(self) -> None:
+        cfg = RiskConfig(universe_allow_symbols=["AAPL", "MSFT"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._buy("AAPL"), config=cfg))  # on allowlist
+
+    def test_exit_passes_even_when_excluded(self) -> None:
+        # A denylisted (and off-allowlist) symbol can always be closed.
+        cfg = RiskConfig(universe_exclude_symbols=["TSLA"], universe_allow_symbols=["AAPL"])
+        UniverseRule().check(ctx(self._sell("TSLA"), config=cfg))
+
+    def test_option_open_denied_by_underlying(self) -> None:
+        # An excluded equity cannot be re-entered via its options: denial by
+        # underlying, stripping the OCC tail.
+        cfg = RiskConfig(universe_exclude_symbols=["AAPL"])
+        with pytest.raises(RiskViolation, match="AAPL"):
+            UniverseRule().check(ctx(self._option_open("AAPL240621C00190000"), config=cfg))
+        # A different underlying's option is unaffected.
+        UniverseRule().check(ctx(self._option_open("MSFT240621C00300000"), config=cfg))
+
+    def test_case_insensitive(self) -> None:
+        # Config normalizes to uppercase; a lowercase order symbol still matches.
+        cfg = RiskConfig(universe_exclude_symbols=["tsla"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("tsla"), config=cfg))
+
+    def test_empty_config_is_noop(self) -> None:
+        cfg = RiskConfig()  # both lists empty: rule passes everything
+        UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._sell("ANYTHING"), config=cfg))
+
+
+class TestHaltFlattenWindow:
+    """The circuit-breaker carve-out (§3.4). A tripped breaker rejects every
+    normal order; ONLY kernel.halt()'s reduce-only flatten — carrying an
+    identity-checked, unforgeable capability token issued by
+    ``open_halt_flatten_window`` while the window is open and before its
+    deadline — may pass the breaker, and only for a leg-free risk-reducing exit."""
+
+    NOW = datetime.now(UTC)
+
+    def _engine(self) -> RiskEngine:
+        bus = EventBus()
+        router = DataRouter([(FakeProvider(name="feed", price="100"), 10)], FreshnessPolicy())
+        portfolio = PortfolioState()
+        portfolio.account = AccountSnapshot(
+            broker="paper", account_id="t", equity=Decimal("100000"),
+            cash=Decimal("100000"), buying_power=Decimal("500000"), as_of=self.NOW,
+        )
+        # A long position so a reduce-only SELL passes ReduceOnlyRule.
+        portfolio.positions = [Position(symbol="HELD", quantity=Decimal("1500"),
+                                        avg_entry_price=Decimal("100"), as_of=self.NOW)]
+        portfolio.synced_at = self.NOW
+        config = RiskConfig(news_blackout_minutes_before_econ=0)
+        return RiskEngine(config, portfolio, router, MarketClock(), bus)
+
+    def _sell(self) -> Order:
+        return Order(symbol="HELD", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100"))
+
+    def _buy(self) -> Order:
+        return Order(symbol="HELD", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100"))
+
+    async def test_forged_token_rejected(self) -> None:
+        # A fresh bare object() minted by anyone but the engine is NOT the live
+        # capability: identity check fails, the tripped breaker still rejects.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._sell(), halt_token=object())
+
+    async def test_closed_window_rejects_real_token(self) -> None:
+        # Even the genuinely-issued token is dead once the window is closed
+        # (kernel.halt() closes it in a finally): the reference no longer
+        # identity-matches the (now None) live token.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window()
+        risk.close_halt_flatten_window()
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._sell(), halt_token=token)
+
+    async def test_deadline_expires_token(self) -> None:
+        # A crashed flatten cannot leave the carve-out open forever: past the
+        # monotonic deadline the token no longer permits, even while open.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window(ttl_seconds=0.0)
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._sell(), halt_token=token)
+
+    async def test_valid_token_never_admits_opening_order(self) -> None:
+        # The permit is reduce-only: a live token on a BUY (opening exposure)
+        # still hits the breaker. A stolen token cannot open new risk.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window()
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._buy(), halt_token=token)
+
+    async def test_valid_token_admits_reduce_only_exit(self) -> None:
+        # The one sanctioned path: live token + open window + before deadline +
+        # leg-free risk-reducing exit passes the breaker and runs the FULL rule
+        # chain (returns the fresh quote, no CircuitBreakerOpen, no RiskViolation).
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window()
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            quote = await risk.validate_order(self._sell(), halt_token=token)
+        assert quote is not None
+
+    async def test_open_breaker_rejects_normal_order(self) -> None:
+        # The single load-bearing invariant, pinned directly (elsewhere only
+        # transitively covered): a tripped breaker rejects EVERY order that
+        # presents no halt token — even a risk-reducing exit, the exact shape the
+        # carve-out admits WITH a live token. Passing nothing (halt_token defaults
+        # None) short-circuits the window entirely, so the breaker gate stands.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(self._sell())
+
+    async def test_valid_token_never_admits_multi_leg(self) -> None:
+        # A live token on a risk-reducing exit that carries legs is STILL rejected:
+        # halt_exit_permitted's ``and not order.legs`` clause bars any multi-leg
+        # order from the carve-out. Identical to the admitted reduce-only exit above
+        # but for the legs, so this isolates that clause — a stolen token can never
+        # smuggle a multi-leg (e.g. spread-opening) order past a tripped breaker.
+        risk = self._engine()
+        risk.circuit.force_open("halt")
+        token = risk.open_halt_flatten_window()
+        multi_leg = Order(
+            symbol="HELD", side=OrderSide.SELL, order_type=OrderType.LIMIT,
+            quantity=Decimal("10"), limit_price=Decimal("100"),
+            legs=[OptionLeg(contract_symbol="HELD_C1",
+                            side=OrderSide.SELL_TO_CLOSE, quantity=1)],
+        )
+        with pytest.raises(CircuitBreakerOpen):
+            await risk.validate_order(multi_leg, halt_token=token)
 
 
 class TestCircuitBreaker:

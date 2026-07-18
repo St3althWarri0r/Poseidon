@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 from ...core.errors import ProviderError
-from ...core.models import EarningsEvent, EconomicEvent, NewsArticle, Quote
+from ...core.models import EarningsEvent, EconomicEvent, InstrumentProfile, NewsArticle, Quote
 from ..base import DataCapability, MarketDataProvider
 
 _BASE = "https://finnhub.io/api/v1"
@@ -28,6 +28,7 @@ class FinnhubProvider(MarketDataProvider):
                 DataCapability.EARNINGS,
                 DataCapability.ECONOMIC_CALENDAR,
                 DataCapability.SECTOR,
+                DataCapability.PROFILE,
             }
         )
 
@@ -47,6 +48,26 @@ class FinnhubProvider(MarketDataProvider):
             symbol=symbol,
             last=Decimal(str(current)),
             as_of=as_of,
+            source=self.name,
+        )
+
+    async def profile(self, symbol: str) -> InstrumentProfile:
+        """Instrument identity from the company profile (free tier). profile2
+        has no security-type field and only resolves listed companies (ETFs/
+        crypto/indices return {}), so asset_type="equity" when resolved is a
+        fact; anything else raises non-retryable rather than guessing."""
+        payload = await self._get("/stock/profile2", symbol=symbol.upper())
+        name = (payload or {}).get("name")
+        if not name:
+            raise ProviderError(self.name, f"no company profile for {symbol}",
+                                retryable=False)
+        return InstrumentProfile(
+            symbol=symbol,
+            name=str(name),
+            exchange=(payload.get("exchange") or None),
+            currency=(payload.get("currency") or None),
+            asset_type="equity",
+            as_of=self._now(),
             source=self.name,
         )
 

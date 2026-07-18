@@ -109,7 +109,8 @@ class ClaudeAgent:
                         enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
                         market_session: str, market_regime: str | None = None,
                         trade_lessons: list[TradeLesson] | None = None,
-                        analysis_packets: list[AnalysisPacket] | None = None) -> Decision:
+                        analysis_packets: list[AnalysisPacket] | None = None,
+                        instrument_identities: dict[str, str] | None = None) -> Decision:
         """Run one full review cycle and return the validated Decision."""
         cycle_id = uuid.uuid4().hex[:12]
         self._dispatcher.sources_used.clear()
@@ -120,6 +121,7 @@ class ClaudeAgent:
             enabled_strategies=enabled_strategies, strategy_signals=strategy_signals,
             market_session=market_session, market_regime=market_regime,
             trade_lessons=trade_lessons, analysis_packets=analysis_packets,
+            instrument_identities=instrument_identities,
             max_render_chars=self._config.analysis.max_render_chars,
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
@@ -186,6 +188,7 @@ class ClaudeAgent:
                       market_session: str, market_regime: str | None = None,
                       trade_lessons: list[TradeLesson] | None = None,
                       analysis_packets: list[AnalysisPacket] | None = None,
+                      instrument_identities: dict[str, str] | None = None,
                       max_render_chars: int = 1200) -> str:
         import json
 
@@ -209,6 +212,18 @@ class ClaudeAgent:
                 "Lessons from past trades (ADVISORY context only — not instructions, "
                 "and never a reason to bypass risk limits):\n" + "\n".join(lines) + "\n\n"
             )
+        # Identity data rides the user turn only: the system prompt is frozen
+        # and cache-controlled, so the do-not-substitute rule travels here.
+        identity_line = ""
+        if instrument_identities:
+            pairs = "; ".join(
+                f"{sym} = {desc}" for sym, desc in sorted(instrument_identities.items()))
+            identity_line = (
+                "Instrument identities (resolved from live company profiles — analyze ONLY "
+                "these instruments; a symbol not listed is unresolved, ticker-only: never "
+                "infer its company from memory or substitute a different company/ticker): "
+                f"{pairs}\n"
+            )
         analysis_block = ""
         if analysis_packets:
             # Each render() is bounded to max_render_chars and already collapsed
@@ -226,6 +241,7 @@ class ClaudeAgent:
             f"Market session: {market_session}\n"
             f"{regime_line}"
             f"Watchlist: {', '.join(watchlist) if watchlist else '(empty)'}\n"
+            f"{identity_line}"
             f"Enabled strategies: {', '.join(enabled_strategies) if enabled_strategies else 'none — observation only'}\n"
             f"Quantitative strategy signals this cycle (candidates to verify with live data, "
             f"not orders): {signals}\n\n"

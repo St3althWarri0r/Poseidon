@@ -22,7 +22,15 @@ from typing import Any
 import httpx
 
 from ..core.errors import ProviderAuthError, ProviderError, ProviderRateLimitError
-from ..core.models import Bar, EarningsEvent, EconomicEvent, NewsArticle, OptionChain, Quote
+from ..core.models import (
+    Bar,
+    EarningsEvent,
+    EconomicEvent,
+    InstrumentProfile,
+    NewsArticle,
+    OptionChain,
+    Quote,
+)
 
 _BAR_DURATIONS: dict[str, timedelta] = {
     "1m": timedelta(minutes=1),
@@ -48,6 +56,7 @@ class DataCapability(StrEnum):
     EARNINGS = "earnings"
     ECONOMIC_CALENDAR = "economic_calendar"
     SECTOR = "sector"  # company sector/industry taxonomy
+    PROFILE = "profile"  # instrument identity (company name/exchange/currency)
 
 
 class MarketDataProvider(abc.ABC):
@@ -83,6 +92,11 @@ class MarketDataProvider(abc.ABC):
         raise NotImplementedError
 
     async def economic_calendar(self, *, days_ahead: int = 7) -> list[EconomicEvent]:
+        raise NotImplementedError
+
+    async def profile(self, symbol: str) -> InstrumentProfile:
+        """Resolved instrument identity. Raise ProviderError when the
+        provider cannot resolve the symbol to a listed instrument."""
         raise NotImplementedError
 
     async def sector(self, symbol: str) -> str:

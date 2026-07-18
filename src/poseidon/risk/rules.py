@@ -25,6 +25,24 @@ MAX_STATE_AGE_SECONDS = 120.0
 
 _OCC_STRIKE_RE = re.compile(r"[CP](\d{8})$")
 
+# OCC contract tail: 6-digit expiry date + C/P + 8-digit strike. Stripping it
+# from an option symbol yields the underlying (e.g. AAPL240621C00190000 -> AAPL).
+_OCC_TAIL_RE = re.compile(r"\d{6}[CP]\d{8}$")
+
+
+def _underlying(order: Order) -> str:
+    """The underlying symbol an order trades, uppercased. Multi-leg option
+    parents already carry the underlying in ``order.symbol`` (see
+    ``reduce_only_breach`` below); a single-leg OPTION order carries an OCC
+    contract symbol whose trailing tail is stripped; everything else is the
+    order symbol itself."""
+    symbol = order.symbol.strip().upper()
+    if order.legs:
+        return symbol
+    if order.asset_class is AssetClass.OPTION:
+        return _OCC_TAIL_RE.sub("", symbol)
+    return symbol
+
 
 def _option_strike(occ_symbol: str) -> Decimal | None:
     """Strike from an OCC option symbol (e.g. AAPL240621C00190000 -> 190).
@@ -154,6 +172,32 @@ class MarketOpenRule(RiskRule):
         if ctx.order.extended_hours and session in (MarketSession.PRE_MARKET, MarketSession.AFTER_HOURS):
             return
         raise RiskViolation(self.name, f"market session is {session}, order not eligible")
+
+
+class UniverseRule(RiskRule):
+    """Deterministic trading-universe gate. Opens outside the configured
+    universe are denied by underlying (an excluded equity cannot be re-entered
+    via its options); risk-reducing exits ALWAYS pass so a position can never be
+    trapped outside the universe. Exclude wins over allow. Both lists empty ships
+    as a no-op (conservative default = no behavior change). Purely sync and
+    config-driven: no data fetch, no LLM."""
+
+    name = "universe"
+
+    def check(self, ctx: RiskContext) -> None:
+        # Risk-reducing exits always pass — but a multi-leg order whose parent
+        # side reads reducing while a leg OPENS is still an open and is gated.
+        if ctx.order.side.is_risk_reducing and not any(
+            leg.side in (OrderSide.BUY_TO_OPEN, OrderSide.SELL_TO_OPEN)
+            for leg in ctx.order.legs
+        ):
+            return
+        symbol = _underlying(ctx.order)
+        if symbol in set(ctx.config.universe_exclude_symbols):
+            raise RiskViolation(self.name, f"{symbol} is on universe_exclude_symbols")
+        allow = ctx.config.universe_allow_symbols
+        if allow and symbol not in set(allow):
+            raise RiskViolation(self.name, f"{symbol} is not on universe_allow_symbols")
 
 
 class BuyingPowerRule(RiskRule):
@@ -626,6 +670,7 @@ class ReduceOnlyRule(RiskRule):
 ALL_RULES: list[RiskRule] = [
     FreshPortfolioRule(),
     MarketOpenRule(),
+    UniverseRule(),
     ReduceOnlyRule(),
     DailyLossRule(),
     WeeklyLossRule(),

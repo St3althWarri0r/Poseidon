@@ -90,6 +90,20 @@ class AnalysisConfig(StrictModel):
     max_symbols_per_sweep: int = Field(default=8, ge=1)
 
 
+class SnapshotConfig(StrictModel):
+    """Deterministic snapshot enrichment + identity grounding (advisory text only).
+
+    ON by default — deliberate exception to ship-OFF: zero LLM cost, enriches
+    existing prompt surfaces (no new AI surface), every failure degrades to
+    explicit N/A/unresolved, and it only REMOVES hallucination room. The one new
+    tool is deterministic, read-only, on the same router as get_quote/get_bars.
+    """
+
+    bars_limit: int = Field(default=250, ge=50, le=500)  # daily bars (SMA200 needs 200)
+    closes_n: int = Field(default=20, ge=5, le=120)  # last-N closes listed verbatim
+    identity: bool = True  # resolve + inject instrument identity
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -113,6 +127,8 @@ class AIConfig(StrictModel):
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     # Advisory analyst-firm → debate packet (advisory; see AnalysisConfig).
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
+    # Deterministic snapshot enrichment + identity grounding (see SnapshotConfig).
+    snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses
@@ -183,6 +199,26 @@ class RiskConfig(StrictModel):
     # equity (0.005 = a position sized so one typical day moves it by
     # ~0.5% of account equity). Advisory input to the AI's sizing tool.
     position_risk_budget_pct: float = Field(default=0.005, gt=0, le=0.1)
+    # Deterministic trading universe (UniverseRule). Denial is by underlying and
+    # applies only to opens — risk-reducing exits always pass so a position can
+    # never be trapped outside the universe. Both empty = allow everything.
+    universe_exclude_symbols: list[str] = Field(default_factory=list)  # denylist
+    universe_allow_symbols: list[str] = Field(default_factory=list)  # allowlist; empty = all
+    # Opt-in reduce-only flatten after halt cancel-all (control-hardening spec §3.2).
+    # OFF by default: halt always cancels resting orders, but only flattens
+    # positions when explicitly enabled. When off, protective stops are canceled
+    # and the book sits unprotected until resume (called out in the halt summary).
+    flatten_on_halt: bool = False
+    # Default TTL for an autonomous-mode consent grant, in hours. 0 = the grant
+    # never expires (current behaviour). When > 0, granting AUTONOMOUS stamps a
+    # durable ``mode.autonomous_expires_at`` bound that auto-reverts to APPROVAL
+    # when it lapses (control-hardening spec §5).
+    autonomous_ttl_hours: float = Field(default=0, ge=0)
+
+    @field_validator("universe_exclude_symbols", "universe_allow_symbols")
+    @classmethod
+    def _upper_universe(cls, v: list[str]) -> list[str]:
+        return [s.strip().upper() for s in v if s.strip()]
 
 
 class GuardianConfig(StrictModel):
@@ -266,6 +302,14 @@ class ResearchConfig(StrictModel):
     horizons: list[int] = Field(default_factory=lambda: [1, 5, 10, 20])  # IC-decay profile
     min_cross: int = Field(default=5, ge=1)  # minimum cross-sectional names per sample date
     lookback_days: int = Field(default=400, ge=1)  # default history window when unset by --days
+    # Random-control null + honest-verdict knobs (design §4.7). Seeds/threshold/groups are
+    # config-only (no CLI flag); train_frac is also settable per-run via --train-frac.
+    null_seeds: int = Field(default=5, ge=1)  # within-date score permutations per date
+    null_base_seed: int = 42  # explicit seed base — never wall-clock; runs stay byte-identical
+    train_frac: float = Field(default=0.0, ge=0, lt=1)  # 0 disables the chronological OOS split
+    alpha_t_threshold: float = Field(default=2.0, gt=0)  # HLZ: prefer 3.5 for whole-library scans
+    verdict_min_n_eff: int = Field(default=10, ge=2)  # below this -> verdict "insufficient_data"
+    n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
 class AppConfig(StrictModel):
