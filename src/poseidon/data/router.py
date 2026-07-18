@@ -194,7 +194,8 @@ class DataRouter:
         return bars
 
     async def bars_multi(self, symbols: list[str], *, timeframe: str = "1d",
-                         limit: int = 90) -> dict[str, list[Bar]]:
+                         limit: int = 90, require: DataCapability | None = None,
+                         concurrency: int | None = None) -> dict[str, list[Bar]]:
         """Batched daily bars for many symbols — the screener's throughput core.
 
         Selects the first BARS-capable provider that implements the batch path;
@@ -204,6 +205,14 @@ class DataRouter:
         bounded-concurrency single-symbol ``bars`` fan-out so the screener still
         works against a non-batch stack.
 
+        ``require`` is an extra capability a provider must ALSO advertise to be
+        eligible (mirrors :meth:`_route`): a crypto screen passes
+        ``require=CRYPTO`` so a ``/USD`` batch can never reach an equity-only
+        provider (Alpaca's ``bars_multi`` silently filters crypto symbols and
+        returns ``{}`` SUCCESSFULLY, which would starve the screen). Equity
+        passes ``require=None`` and the capable set is byte-for-byte unchanged.
+        ``concurrency`` bounds the single-symbol degrade fan-out (default 16).
+
         NEVER raises — a symbol that cannot be served is simply absent; the same
         boundary hygiene as :meth:`bars` is applied (drop structurally-unsound
         bars, drop a symbol whose newest bar is older than ``_MAX_BAR_AGE`` — a
@@ -212,7 +221,11 @@ class DataRouter:
         """
         if not symbols:
             return {}
-        capable = [s for s in self._slots if DataCapability.BARS in s.provider.capabilities()]
+        capable = [
+            s for s in self._slots
+            if DataCapability.BARS in s.provider.capabilities()
+            and (require is None or require in s.provider.capabilities())
+        ]
         if not capable:
             return {}
         was_available = {id(s): s.available for s in capable}
@@ -243,7 +256,9 @@ class DataRouter:
                 return self._sanitize_bars_multi(raw, timeframe)
         # No provider implements bars_multi (all NotImplementedError) or every
         # capable provider is down — degrade to bounded single-symbol fetches.
-        return await self._bars_multi_via_single(symbols, timeframe=timeframe, limit=limit)
+        return await self._bars_multi_via_single(
+            symbols, timeframe=timeframe, limit=limit, concurrency=concurrency
+        )
 
     def _sanitize_bars_multi(self, raw: dict[str, list[Bar]],
                              timeframe: str) -> dict[str, list[Bar]]:
@@ -266,12 +281,15 @@ class DataRouter:
         return out
 
     async def _bars_multi_via_single(self, symbols: list[str], *, timeframe: str,
-                                     limit: int) -> dict[str, list[Bar]]:
+                                     limit: int, concurrency: int | None = None,
+                                     ) -> dict[str, list[Bar]]:
         """Degrade path: bounded-concurrency single-symbol :meth:`bars` (which
         already applies sound + frozen hygiene and raises on a frozen/failed
         symbol). Per-symbol errors are swallowed so one bad name never aborts
-        the screen; absent symbols are simply omitted."""
-        sem = asyncio.Semaphore(16)
+        the screen; absent symbols are simply omitted. ``concurrency`` caps the
+        fan-out (default 16) — a crypto screen passes a small bound to stay
+        inside Coinbase's per-IP rate limit."""
+        sem = asyncio.Semaphore(concurrency or 16)
 
         async def _one(sym: str) -> tuple[str, list[Bar] | None]:
             async with sem:
