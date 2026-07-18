@@ -312,7 +312,13 @@ class OrderManager:
 
     # -- submission ------------------------------------------------------------------
 
-    async def _submit(self, order: Order) -> Order:
+    async def _submit(self, order: Order, *, halt_token: object | None = None) -> Order:
+        # ``halt_token`` is the halt-flatten carve-out (§3.4): ONLY
+        # kernel.halt() -> flatten_all presents one (an engine-minted, identity-
+        # checked object()). Every other caller — execute_decision, submit_manual
+        # — passes nothing, so the pre-submit breaker re-check below rejects them
+        # while the breaker is open. The token never rides on the Order model, a
+        # schema, the DB, or any /api/chat payload; it cannot be forged or replayed.
         # Pin the broker for this submission AND its lifecycle poller: even
         # if a hot swap lands later, this order stays with the brokerage that
         # actually holds it.
@@ -343,7 +349,15 @@ class OrderManager:
             # failures, or a long approval wait). validate_order checked it, but
             # that was before the approval gate and the guard/preflight
             # round-trips — the HALT must block a real order right up to submit.
-            if self._risk.circuit.is_open:
+            # The ONLY exception is the halt-flatten carve-out (§3.4): a live,
+            # engine-minted token for a leg-free risk-reducing exit. The
+            # ``halt_token is not None`` short-circuit runs first, so every
+            # default-arg caller keeps the unconditional reject (no forged/None
+            # token ever consults the window). ReduceOnlyRule and the live
+            # _guard_reduce_only backstop below still run — never exempted.
+            if self._risk.circuit.is_open and not (
+                    halt_token is not None
+                    and self._risk.halt_exit_permitted(order, halt_token)):
                 order.status = OrderStatus.REJECTED_RISK
                 order.status_reason = f"halted before submit: {self._risk.circuit.reason}"
                 self._risk.release_validated(order.id)  # (F021)
