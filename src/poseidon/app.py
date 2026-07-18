@@ -73,6 +73,17 @@ from .updater import UpdateService
 log = structlog.get_logger(__name__)
 
 
+def _env_credential(entry: dict[str, object], paper: bool) -> str:
+    """Vault credential name for a broker's paper/live environment.
+
+    Alpaca is the only broker whose paper and live accounts are distinct with
+    their own API keys; its catalog entry carries ``credential_paper`` and
+    ``credential_live``. When those are absent (every other broker) this falls
+    back to the single ``credential`` name — unchanged behaviour."""
+    env_key = "credential_paper" if paper else "credential_live"
+    return str(entry.get(env_key) or entry.get("credential", ""))
+
+
 class ApplicationKernel:
     def __init__(self, config: AppConfig, vault: Vault) -> None:
         self.config = config
@@ -374,8 +385,15 @@ class ApplicationKernel:
         # name) — the dashboard switch must not silently discard them. Form
         # options (paper starting_cash, reset) layer on top.
         existing = next((b for b in self.config.brokers if b.name == name), None)
-        credential = (existing.credential if existing and existing.credential
-                      else str(entry.get("credential", "")))
+        # Credential is ENV-scoped: a matching-env config entry (name + paper +
+        # a saved credential) wins so an operator's custom vault name is kept;
+        # otherwise resolve the catalog's per-env name. Matching by name ALONE
+        # would hand a live switch the paper credential (or vice-versa) whenever
+        # the config holds only the opposite-env entry — a real-money hazard.
+        existing_env = next((b for b in self.config.brokers
+                             if b.name == name and b.paper == paper and b.credential), None)
+        credential = (existing_env.credential if existing_env
+                      else _env_credential(entry, paper))
         merged_options: dict[str, object] = dict(existing.options) if existing else {}
         merged_options.update(options or {})
         return BrokerConfig(name=name, enabled=True, primary=True,
