@@ -21,7 +21,7 @@ class FakeProvider(MarketDataProvider):
 
     def __init__(self, *, name: str = "fake", price: str = "100.00", fail: bool = False,
                  stale: bool = False, bars_count: int = 60, volume: int = 500_000,
-                 frozen_days: int = 0) -> None:
+                 frozen_days: int = 0, crypto: bool = False) -> None:
         super().__init__(api_key="test")
         self.name = name
         self._price = Decimal(price)
@@ -30,11 +30,15 @@ class FakeProvider(MarketDataProvider):
         self._bars_count = bars_count
         self._volume = volume
         self._frozen_days = frozen_days  # shift all bars this many days into the past
+        self._crypto = crypto  # also advertise DataCapability.CRYPTO
         self.calls = 0
 
     def capabilities(self) -> frozenset[DataCapability]:
-        return frozenset({DataCapability.QUOTES, DataCapability.BARS,
-                          DataCapability.ECONOMIC_CALENDAR})
+        caps = {DataCapability.QUOTES, DataCapability.BARS,
+                DataCapability.ECONOMIC_CALENDAR}
+        if self._crypto:
+            caps.add(DataCapability.CRYPTO)
+        return frozenset(caps)
 
     async def quote(self, symbol: str) -> Quote:
         self.calls += 1

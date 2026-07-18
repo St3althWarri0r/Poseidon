@@ -48,6 +48,7 @@ class DataCapability(StrEnum):
     EARNINGS = "earnings"
     ECONOMIC_CALENDAR = "economic_calendar"
     SECTOR = "sector"  # company sector/industry taxonomy
+    CRYPTO = "crypto"  # spot crypto pairs (BASE/USD); gates crypto quote/bars routing
 
 
 class MarketDataProvider(abc.ABC):
