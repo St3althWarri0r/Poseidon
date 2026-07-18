@@ -34,6 +34,9 @@ class _DisabledScreener:
     async def select_candidates(self) -> list[str]:
         return []
 
+    async def ranked_candidates(self) -> list[object]:
+        return []
+
 
 # ---------------------------------------------------------------- RCE sandbox (finding 1)
 
@@ -516,6 +519,7 @@ async def test_refused_cycle_still_meters_ai_usage(tmp_path) -> None:
     kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
     kernel.router = None  # type: ignore[assignment]
     kernel.screener = _DisabledScreener()  # type: ignore[assignment]
+    kernel.crypto_screener = _DisabledScreener()  # type: ignore[assignment]
 
     async def _not_over() -> bool:
         return False
@@ -582,6 +586,7 @@ async def _build_cycle_kernel(tmp_path, agent, *, ai=None):
     kernel.order_manager = SimpleNamespace(mode=TradingMode.RESEARCH)  # type: ignore[assignment]
     kernel.router = None  # type: ignore[assignment]
     kernel.screener = _DisabledScreener()  # type: ignore[assignment]
+    kernel.crypto_screener = _DisabledScreener()  # type: ignore[assignment]
     kernel._over_ai_budget = _not_over  # type: ignore[method-assign]
     kernel._regime_line = _no_regime  # type: ignore[method-assign]
     return kernel, db
