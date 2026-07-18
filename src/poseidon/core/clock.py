@@ -67,21 +67,31 @@ def calendar_covers(day: date) -> bool:
 
 @dataclass(frozen=True)
 class FreshnessPolicy:
-    """Thresholds (seconds) for grading data age. Configurable per deployment."""
+    """Thresholds (seconds) for grading data age. Configurable per deployment.
+
+    Crypto trades 24/7 and its quotes arrive over a public REST cadence looser
+    than a co-located equity feed, so crypto has its OWN real-time window
+    (``crypto_real_time_max_age``, default 60s) selected via ``grade(...,
+    is_crypto=True)``. Equities keep the strict default window — this is a
+    real-money safety mechanism and is never weakened for the equity path.
+    """
 
     real_time_max_age: float = 5.0
+    crypto_real_time_max_age: float = 60.0  # looser 24/7 REST-cadence window for crypto
     delayed_max_age: float = 900.0  # 15 minutes — typical delayed-feed window
 
-    def grade(self, as_of: datetime, *, now: datetime | None = None) -> DataFreshness:
+    def grade(self, as_of: datetime, *, is_crypto: bool = False,
+              now: datetime | None = None) -> DataFreshness:
         now = now or utc_now()
         if as_of.tzinfo is None:
             # Naive timestamps are untrustworthy: treat as stale, never assume.
             return DataFreshness.STALE
+        real_time_max = self.crypto_real_time_max_age if is_crypto else self.real_time_max_age
         age = (now - as_of).total_seconds()
         if age < 0:
             # Clock skew from a provider; small negative ages are tolerated.
             return DataFreshness.REAL_TIME if age > -5 else DataFreshness.STALE
-        if age <= self.real_time_max_age:
+        if age <= real_time_max:
             return DataFreshness.REAL_TIME
         if age <= self.delayed_max_age:
             return DataFreshness.DELAYED

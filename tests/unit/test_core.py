@@ -67,6 +67,37 @@ class TestFreshness:
         assert self.policy.grade(datetime.now()) is DataFreshness.STALE  # noqa: DTZ005
 
 
+class TestCryptoFreshness:
+    # Crypto trades 24/7 and quotes over a public REST endpoint arrive with a
+    # looser cadence than a co-located equity feed, so crypto gets its OWN
+    # real-time window (default 60s). Equities stay strict at 5s.
+    policy = FreshnessPolicy(
+        real_time_max_age=5, crypto_real_time_max_age=60, delayed_max_age=900
+    )
+
+    def test_crypto_30s_is_real_time_but_equity_30s_is_delayed(self) -> None:
+        # The headline invariant: at the SAME 30s age, a crypto quote passes the
+        # order gate (REAL_TIME) while an equity quote is rejected (DELAYED).
+        now = datetime.now(UTC)
+        at_30s = now - timedelta(seconds=30)
+        assert self.policy.grade(at_30s, is_crypto=True) is DataFreshness.REAL_TIME
+        assert self.policy.grade(at_30s, is_crypto=False) is DataFreshness.DELAYED
+
+    def test_equities_default_is_strict(self) -> None:
+        # is_crypto defaults to False — equity callers are unchanged and strict.
+        now = datetime.now(UTC)
+        assert self.policy.grade(now - timedelta(seconds=6)) is DataFreshness.DELAYED
+
+    def test_crypto_beyond_its_window_is_delayed_then_stale(self) -> None:
+        now = datetime.now(UTC)
+        assert self.policy.grade(now - timedelta(seconds=90), is_crypto=True) is DataFreshness.DELAYED
+        assert self.policy.grade(now - timedelta(hours=1), is_crypto=True) is DataFreshness.STALE
+
+    def test_crypto_naive_timestamp_still_stale(self) -> None:
+        # The naive-timestamp safety rule is not weakened for crypto.
+        assert self.policy.grade(datetime.now(), is_crypto=True) is DataFreshness.STALE  # noqa: DTZ005
+
+
 class TestModels:
     def test_quote_mid_and_spread(self) -> None:
         q = Quote(symbol="aapl", bid=Decimal("99.95"), ask=Decimal("100.05"),
@@ -90,6 +121,16 @@ class TestConfig:
         config = AppConfig()
         assert config.mode is TradingMode.RESEARCH
         assert config.risk.max_daily_loss_pct == 0.03
+
+    def test_data_freshness_defaults(self) -> None:
+        # Equities stay strict at 5s; crypto gets its own looser real-time window.
+        config = AppConfig()
+        assert config.data.real_time_max_age_seconds == 5.0
+        assert config.data.crypto_real_time_max_age_seconds == 60.0
+
+    def test_crypto_freshness_must_be_positive(self) -> None:
+        with pytest.raises(ValueError):
+            AppConfig.model_validate({"data": {"crypto_real_time_max_age_seconds": 0}})
 
     def test_two_primary_brokers_rejected(self) -> None:
         with pytest.raises(ValueError):

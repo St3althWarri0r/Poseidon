@@ -346,6 +346,7 @@ class ApplicationKernel:
             providers,
             FreshnessPolicy(
                 real_time_max_age=self.config.data.real_time_max_age_seconds,
+                crypto_real_time_max_age=self.config.data.crypto_real_time_max_age_seconds,
                 delayed_max_age=self.config.data.delayed_max_age_seconds,
             ),
         )

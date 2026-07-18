@@ -141,10 +141,11 @@ class DataRouter:
     # -- public API -------------------------------------------------------------
 
     async def quote(self, symbol: str, *, allow_delayed: bool = False) -> Quote:
-        req = DataCapability.CRYPTO if is_crypto_symbol(symbol) else None
+        is_crypto = is_crypto_symbol(symbol)
+        req = DataCapability.CRYPTO if is_crypto else None
         quote = await self._route(DataCapability.QUOTES, lambda p: p.quote(symbol), require=req)
         as_of = quote.as_of
-        grade = self._freshness.grade(as_of)
+        grade = self._freshness.grade(as_of, is_crypto=is_crypto)
         if grade is DataFreshness.STALE or (grade is DataFreshness.DELAYED and not allow_delayed):
             raise StaleDataError(
                 f"quote for {symbol} from {quote.source} is {grade} (as_of={as_of.isoformat()}) — refusing to use it"
@@ -162,7 +163,7 @@ class DataRouter:
         engine's validate_order fetches its own strictly-graded quote.
         """
         quote = await self._route(DataCapability.QUOTES, lambda p: p.quote(symbol))
-        quote.freshness = self._freshness.grade(quote.as_of)
+        quote.freshness = self._freshness.grade(quote.as_of, is_crypto=is_crypto_symbol(symbol))
         return quote
 
     async def bars(self, symbol: str, *, timeframe: str = "1d", limit: int = 100) -> list[Bar]:
@@ -198,7 +199,7 @@ class DataRouter:
         chain = await self._route(
             DataCapability.OPTIONS, lambda p: p.option_chain(underlying, expiration=expiration)
         )
-        grade = self._freshness.grade(chain.as_of)
+        grade = self._freshness.grade(chain.as_of, is_crypto=is_crypto_symbol(underlying))
         if grade is DataFreshness.STALE or (grade is DataFreshness.DELAYED and not allow_delayed):
             raise StaleDataError(
                 f"option chain for {underlying} from {chain.source} is {grade} — refusing to use it"

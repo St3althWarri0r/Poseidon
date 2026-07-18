@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 
 from poseidon.core.clock import FreshnessPolicy
+from poseidon.core.enums import DataFreshness
 from poseidon.core.errors import (
     AllProvidersFailedError,
     DataUnavailableError,
@@ -148,6 +149,30 @@ async def test_all_crypto_providers_fail_raises(policy: FreshnessPolicy) -> None
     router = DataRouter([(FakeProvider(name="crypto", crypto=True, fail=True), 10)], policy)
     with pytest.raises(AllProvidersFailedError):
         await router.quote("BTC/USD")
+
+
+# -- crypto-aware freshness at the router gate --------------------------------
+
+
+async def test_crypto_quote_30s_old_passes_order_gate() -> None:
+    # A 30s-old crypto quote is REAL_TIME under the crypto window (default 60s)
+    # and so passes the strict order gate (allow_delayed=False).
+    policy = FreshnessPolicy(real_time_max_age=5.0, crypto_real_time_max_age=60.0)
+    crypto = FakeProvider(name="crypto", crypto=True, age_seconds=30)
+    router = DataRouter([(crypto, 10)], policy)
+    quote = await router.quote("BTC/USD")
+    assert quote.source == "crypto"
+    assert quote.freshness is DataFreshness.REAL_TIME
+
+
+async def test_equity_quote_30s_old_rejected_by_strict_gate() -> None:
+    # Same 30s age, but an equity stays strict (5s real-time window): it grades
+    # DELAYED and the order gate rejects it. Proves equities are unaffected.
+    policy = FreshnessPolicy(real_time_max_age=5.0, crypto_real_time_max_age=60.0)
+    equity = FakeProvider(name="equity", age_seconds=30)
+    router = DataRouter([(equity, 10)], policy)
+    with pytest.raises(StaleDataError):
+        await router.quote("AAPL")
 
 
 # -- profile routing (DataCapability.PROFILE + caching) -----------------------

@@ -71,7 +71,8 @@ ai:
   #   output_price_per_mtok: 0
 
 data:
-  real_time_max_age_seconds: 5
+  real_time_max_age_seconds: 5          # equities: strict REAL_TIME gate
+  crypto_real_time_max_age_seconds: 60  # crypto trades 24/7 over a looser REST cadence
   delayed_max_age_seconds: 900
   allow_delayed_for_research: true   # delayed data OK for research; orders always require fresh quotes
   providers:
