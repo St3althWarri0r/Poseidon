@@ -384,15 +384,30 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         from decimal import Decimal, InvalidOperation
 
         from ..core.enums import AssetClass, OrderSide, OrderType, TimeInForce
+        from ..core.errors import UnsupportedSymbolError
         from ..core.models import Order
+        from ..core.symbols import (
+            asset_class_for_symbol,
+            is_crypto_symbol,
+            normalize_crypto_symbol,
+        )
 
         extended_hours = body.get("extended_hours", False)
         if not isinstance(extended_hours, bool):
             raise HTTPException(status_code=422, detail="extended_hours must be a JSON boolean")
         try:
+            symbol = str(body["symbol"]).upper().strip()
+            # A slash-form symbol is a crypto pair: canonicalize it (and reject
+            # unsupported quotes like BTC/USDT with a clean 422, not a 404 later).
+            if is_crypto_symbol(symbol):
+                symbol = normalize_crypto_symbol(symbol)
+            # Auto-detect the asset class from the symbol shape when the operator
+            # did not send one; an explicit asset_class is always honored.
+            asset_class = (AssetClass(str(body["asset_class"])) if "asset_class" in body
+                           else asset_class_for_symbol(symbol))
             order = Order(
-                symbol=str(body["symbol"]).upper().strip(),
-                asset_class=AssetClass(str(body.get("asset_class", "equity"))),
+                symbol=symbol,
+                asset_class=asset_class,
                 side=OrderSide(str(body["side"])),
                 order_type=OrderType(str(body.get("order_type", "limit"))),
                 quantity=Decimal(str(body["quantity"])),
@@ -402,6 +417,8 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 extended_hours=extended_hours,
                 strategy="manual",
             )
+        except UnsupportedSymbolError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except (KeyError, ValueError, InvalidOperation) as exc:
             raise HTTPException(status_code=422, detail=f"invalid order: {exc}") from exc
         if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and order.limit_price is None:

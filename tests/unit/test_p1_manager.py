@@ -23,6 +23,7 @@ from poseidon.brokers.plugins.paper import PaperBroker
 from poseidon.core.clock import FreshnessPolicy, MarketClock
 from poseidon.core.config import RiskConfig
 from poseidon.core.enums import (
+    AssetClass,
     DecisionAction,
     MarketSession,
     OrderSide,
@@ -210,3 +211,45 @@ async def test_f017_circuit_open_before_submit_blocks_broker(stack) -> None:
     # Tooth: the order is a halt rejection, not a fill (pre-fix it reaches + fills).
     assert result.status is OrderStatus.REJECTED_RISK
     assert "halted before submit" in (result.status_reason or "")
+
+
+# --- Task 6: crypto asset-class tagging on the AI proposal path ---------------
+# A ProposedTrade whose symbol is a slash-form crypto pair (BTC/USD) must be
+# tagged CRYPTO even though the field defaults to EQUITY — no equity ticker
+# contains '/', so the shape is unambiguous. This keeps the AI/manual/API paths
+# consistent through the one shared `asset_class_for_symbol` helper.
+def test_proposed_trade_tags_crypto_symbol() -> None:
+    trade = ProposedTrade(symbol="BTC/USD", side=OrderSide.BUY,
+                          order_type=OrderType.MARKET, quantity=Decimal("0.05"),
+                          strategy="momentum")
+    assert trade.asset_class is AssetClass.CRYPTO
+
+
+# A plain equity ticker keeps the EQUITY default — no regression on the equity
+# path the AI watchlist actually trades today.
+def test_proposed_trade_leaves_equity_symbol_untagged() -> None:
+    trade = ProposedTrade(symbol="AAPL", side=OrderSide.BUY,
+                          order_type=OrderType.MARKET, quantity=Decimal("10"),
+                          strategy="momentum")
+    assert trade.asset_class is AssetClass.EQUITY
+
+
+# _trade_to_order must carry the CRYPTO tag from the ProposedTrade onto the
+# Order that reaches the risk engine + broker (the 24/7 exemptions key off it).
+async def test_trade_to_order_carries_crypto_asset_class(stack) -> None:
+    manager = stack["manager"]
+    decision = Decision(
+        action=DecisionAction.BUY,
+        trades=[ProposedTrade(symbol="BTC/USD", side=OrderSide.BUY,
+                              order_type=OrderType.MARKET, quantity=Decimal("0.05"),
+                              strategy="momentum")],
+        rationale=TradeRationale(
+            thesis="t", timing="now", expected_edge="e", risk="r", reward="w",
+            confidence=0.8, portfolio_impact="small", exit_plan=ExitPlan(),
+            max_expected_loss="$100",
+        ),
+        cycle_id="cryptotest", created_at=datetime.now(UTC),
+    )
+    order = manager._trade_to_order(decision.trades[0], decision)
+    assert order.asset_class is AssetClass.CRYPTO
+    assert order.symbol == "BTC/USD"

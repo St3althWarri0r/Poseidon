@@ -28,6 +28,7 @@ from .enums import (
     OrderType,
     TimeInForce,
 )
+from .symbols import is_crypto_symbol
 
 Money = Annotated[Decimal, Field(allow_inf_nan=False)]
 
@@ -334,6 +335,18 @@ class ProposedTrade(PoseidonModel):
     # never arms one symbol's stop against another's price.
     stop_loss: Money | None = None
     take_profit: Money | None = None
+
+    @model_validator(mode="after")
+    def _tag_crypto_asset_class(self) -> ProposedTrade:
+        # A slash-form symbol (BTC/USD) is unambiguously a crypto pair — no
+        # equity ticker contains '/'. Tag it CRYPTO so a symbol-only AI proposal
+        # routes through the crypto data path and the 24/7 risk exemptions,
+        # keeping manual/API/AI classification consistent via the one shared
+        # helper. The guard makes the validate_assignment re-run a no-op (the
+        # second pass sees CRYPTO and reassigns nothing), so this terminates.
+        if is_crypto_symbol(self.symbol) and self.asset_class is not AssetClass.CRYPTO:
+            self.asset_class = AssetClass.CRYPTO
+        return self
 
     @model_validator(mode="after")
     def _require_prices_for_type(self) -> ProposedTrade:
