@@ -43,7 +43,7 @@ from .core.config import (
     local_overlay_path,
 )
 from .core.container import Container
-from .core.enums import HealthState, TradingMode
+from .core.enums import HealthState, MarketSession, TradingMode
 from .core.errors import (
     AgentError,
     AgentRefusedError,
@@ -53,6 +53,7 @@ from .core.errors import (
     VaultError,
 )
 from .core.events import EventBus, Topics
+from .data.base import DataCapability
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
 from .execution.approvals import ApprovalQueue
@@ -68,7 +69,7 @@ from .security.audit import AuditLog
 from .security.vault import Vault
 from .storage.db import Database
 from .strategy.engine import StrategyEngine
-from .strategy.screener import MarketScreener
+from .strategy.screener import MarketScreener, ScoredCandidate
 from .strategy.workshop import AlgorithmWorkshop
 from .updater import UpdateService
 
@@ -114,6 +115,39 @@ def _union(watchlist: list[str], candidates: list[str]) -> list[str]:
     return out
 
 
+def _dedup_ranked(ranked: list[ScoredCandidate]) -> list[ScoredCandidate]:
+    """Merge ranked candidates from both screeners, dropping case-insensitive
+    duplicates and keeping the first (higher-priority) occurrence — order-stable.
+
+    Equity and crypto universes are disjoint (``AAPL`` vs ``BTC/USD``), so this is
+    a defensive de-dup: if a symbol ever appeared in both lists the earlier screener
+    (equity, appended first) wins and the PM never sees it twice."""
+    seen: set[str] = set()
+    out: list[ScoredCandidate] = []
+    for cand in ranked:
+        upper = cand.symbol.upper()
+        if upper not in seen:
+            seen.add(upper)
+            out.append(cand)
+    return out
+
+
+def _fmt_dollars(value: float) -> str:
+    """Compact human dollar volume (``1.2B``/``8.0M``/``950``) for the candidate
+    line — keeps the ranked block to ~one short line per candidate."""
+    for suffix, magnitude in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(value) >= magnitude:
+            return f"{value / magnitude:.1f}{suffix}"
+    return f"{value:.0f}"
+
+
+def _candidate_line(cand: ScoredCandidate) -> str:
+    """One compact per-candidate rationale line for the PM prompt: symbol plus the
+    blended-momentum screen metrics (never money that reaches an order)."""
+    return (f"{cand.symbol} score={cand.score:+.2f} r1m={cand.r_1m:+.2f} "
+            f"r3m={cand.r_3m:+.2f} adv$={_fmt_dollars(cand.dollar_volume)}")
+
+
 class ApplicationKernel:
     def __init__(self, config: AppConfig, vault: Vault) -> None:
         self.config = config
@@ -154,6 +188,10 @@ class ApplicationKernel:
         # disabled, select_candidates() returns [] and the cycle is byte-identical
         # to today. Built in start() (needs the router).
         self.screener: MarketScreener
+        # Crypto twin of the screener — 24/7 over the bundled Coinbase BASE/USD
+        # universe, routing gated to CRYPTO providers. Same advisory contract; OFF
+        # by default. Built in start() alongside the equity screener.
+        self.crypto_screener: MarketScreener
         self.workshop: AlgorithmWorkshop
         self.scheduler: Scheduler
         self.health: HealthMonitor
@@ -233,6 +271,13 @@ class ApplicationKernel:
         # returns []). Its own severed S&P 500 universe copy under data/ (never
         # research/); every candidate still flows AI -> RiskEngine -> broker.
         self.screener = MarketScreener(cfg.screener, self.router)
+        # Crypto screener: gated to CRYPTO providers so a BASE/USD batch can never
+        # reach an equity provider; bounded per-symbol fan-out via concurrency. OFF
+        # by default — select_candidates()/ranked_candidates() early-return [] until
+        # the user opts in.
+        self.crypto_screener = MarketScreener(
+            cfg.crypto_screener, self.router,
+            require=DataCapability.CRYPTO, concurrency=cfg.crypto_screener.concurrency)
         self.workshop = AlgorithmWorkshop(
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
@@ -253,6 +298,7 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
+            budget=cfg.ai.budget,
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -265,6 +311,7 @@ class ApplicationKernel:
             risk_config=cfg.risk,
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
+            budget=cfg.ai.budget,
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -1094,14 +1141,21 @@ class ApplicationKernel:
                 return
             started = datetime.now(UTC)
             try:
-                # Widen the universe with the screener's top-N ranked candidates.
-                # candidates == [] when the screener is disabled OR a screen failed
-                # (it degrades to [] and never raises), so `symbols == watchlist`
-                # and `extra_symbols == []` ⇒ the cycle is byte-identical to today.
-                # The screener only picks WHICH symbols the AI evaluates — every
+                # Widen the universe with BOTH screeners' top-N ranked candidates:
+                # equity ONLY while the market is open (equities do not trade
+                # overnight/weekends), crypto UNCONDITIONALLY (24/7). Each screener
+                # degrades to [] when disabled OR a screen fails (never raises), so
+                # with both off `candidates == []`, `symbols == watchlist` and
+                # `extra_symbols == []` ⇒ the cycle is byte-identical to today.
+                # Screeners pick only WHICH symbols the AI evaluates — every
                 # candidate still flows AI -> RiskEngine -> broker unchanged.
                 watchlist = self.config.all_watchlist_symbols()
-                candidates = await self.screener.select_candidates()
+                market_open = self.clock.session() is not MarketSession.CLOSED
+                equity_ranked = (
+                    await self.screener.ranked_candidates() if market_open else [])
+                crypto_ranked = await self.crypto_screener.ranked_candidates()
+                ranked = _dedup_ranked(equity_ranked + crypto_ranked)
+                candidates = [c.symbol for c in ranked]
                 symbols = _union(watchlist, candidates)
                 signals = await self.strategies.scan_all(
                     self.router, self.portfolio, extra_symbols=candidates)
@@ -1126,6 +1180,7 @@ class ApplicationKernel:
                     trade_lessons=lessons,
                     analysis_packets=packets,
                     instrument_identities=identities,
+                    screener_candidates=[_candidate_line(c) for c in ranked],
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))

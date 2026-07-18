@@ -104,6 +104,31 @@ class SnapshotConfig(StrictModel):
     identity: bool = True  # resolve + inject instrument identity
 
 
+class CycleBudgetConfig(StrictModel):
+    """Per-cycle token bounds for the PM's user turn and tool loop.
+
+    The window is finite (gpt-oss-20b: 32k); an unbounded ``strategy_signals``
+    block, an unbounded ``get_bars``/``get_news`` result, or accumulated tool
+    output can overflow it. These caps bound the COUNT of items (signals, bars,
+    articles) and the SIZE of serialized blocks — never truncating a price
+    mid-value. Defaults keep a 25-candidate cycle well under ~20k tokens.
+
+    Anti-starvation: the per-candidate ranked block the PM decides on is always
+    fully included; these caps only bound how much EXTRA raw data accumulates,
+    and every omission is made explicit to the model (never a silent gap).
+    """
+
+    max_signal_entries: int = Field(default=40, ge=1)  # top-K signals kept (strength desc)
+    max_signals_chars: int = Field(default=8000, ge=200)  # hard cap on the signals block
+    max_prompt_chars: int = Field(default=16000, ge=1000)  # assembled user-turn backstop
+    max_bars_returned: int = Field(default=120, ge=10)  # get_bars: newest bars handed over
+    max_news_articles: int = Field(default=10, ge=1)  # get_news: article count
+    max_news_summary_chars: int = Field(default=500, ge=50)  # get_news: per-summary length
+    max_tool_result_chars: int = Field(default=12000, ge=1000)  # per-result hard cap
+    soft_cycle_tool_chars: int = Field(default=40000, ge=1000)  # cumulative -> converge nudge
+    hard_cycle_tool_chars: int = Field(default=64000, ge=2000)  # cumulative last-resort backstop
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -129,6 +154,8 @@ class AIConfig(StrictModel):
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     # Deterministic snapshot enrichment + identity grounding (see SnapshotConfig).
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
+    # Per-cycle token bounds for the user turn + tool loop (see CycleBudgetConfig).
+    budget: CycleBudgetConfig = Field(default_factory=CycleBudgetConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses
@@ -316,19 +343,45 @@ class ResearchConfig(StrictModel):
     n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
-class ScreenerConfig(StrictModel):
-    """Market screener: widen the trading universe by pre-screening a broad index each cycle and
-    handing the AI the top-N ranked candidates to deep-analyze. Advisory selection only — it picks
-    WHAT to evaluate; every candidate still passes the full AI → RiskEngine → broker chain. OFF by
-    default: zero behavior change until deliberately enabled."""
+class ScreenerConfigBase(StrictModel):
+    """Fields shared by every screener (equity + crypto). The :class:`MarketScreener`
+    types against this base and is reused verbatim for both universes — the only
+    differences (batch vs. per-symbol routing, the ``universe`` literal) live in the
+    subclasses below and in the screener's ``require`` / ``concurrency`` ctor kwargs.
+
+    Advisory selection only — a screener picks WHAT the AI evaluates; every candidate
+    still passes the full AI → RiskEngine → broker chain. OFF by default in code: zero
+    behavior change until a user deliberately enables it in their own config."""
 
     enabled: bool = False
-    universe: Literal["sp500"] = "sp500"
-    top_n: int = Field(default=15, ge=1, le=100)
-    min_dollar_volume: Decimal = Field(default=Decimal("20000000"))  # $20M median 20d ADV floor
+    universe: str  # bundled universe name; each subclass narrows it to a Literal
+    top_n: int = Field(default=15, ge=1, le=100)  # candidates handed to the AI
+    min_dollar_volume: Decimal = Field(default=Decimal("20000000"))  # median 20d ADV$ floor
     refresh_minutes: int = Field(default=15, ge=1)  # cache TTL for the ranked list
     bars_limit: int = Field(default=90, ge=64, le=250)  # daily bars/symbol for ranking
+
+
+class ScreenerConfig(ScreenerConfigBase):
+    """Equity screener over the bundled S&P 500 universe (batched daily bars via
+    Alpaca). OFF by default."""
+
+    universe: Literal["sp500"] = "sp500"
     max_batch_symbols: int = Field(default=200, ge=1, le=500)  # symbols per Alpaca batch request
+
+
+class CryptoScreenerConfig(ScreenerConfigBase):
+    """Crypto screener over the bundled ~40 Coinbase ``BASE/USD`` universe. Coinbase
+    has no batch bars endpoint, so the router degrades to a bounded per-symbol
+    ``bars`` fan-out capped by ``concurrency``; routing is gated to CRYPTO providers.
+    OFF by default in code — the user opts in via their own config (safety invariant)."""
+
+    enabled: bool = False
+    universe: Literal["crypto"] = "crypto"
+    top_n: int = Field(default=10, ge=1, le=100)
+    min_dollar_volume: Decimal = Field(default=Decimal("10000000"))  # $10M median 20d ADV$
+    refresh_minutes: int = Field(default=15, ge=1)
+    bars_limit: int = Field(default=90, ge=64, le=250)  # Coinbase daily candles
+    concurrency: int = Field(default=6, ge=1, le=20)  # bounded Coinbase per-symbol fan-out
 
 
 class AppConfig(StrictModel):
@@ -354,6 +407,7 @@ class AppConfig(StrictModel):
     research: ResearchConfig = Field(default_factory=ResearchConfig)
     strategy_health: StrategyHealthConfig = Field(default_factory=StrategyHealthConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
+    crypto_screener: CryptoScreenerConfig = Field(default_factory=CryptoScreenerConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:

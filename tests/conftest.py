@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -107,7 +108,8 @@ class FakeBatchProvider(MarketDataProvider):
                  fail: bool = False, fail_nonretryable: bool = False,
                  bars_count: int = 90, volume: int = 1_000_000,
                  price: str = "100.00", absent: tuple[str, ...] = (),
-                 frozen: tuple[str, ...] = (), unsound: tuple[str, ...] = ()) -> None:
+                 frozen: tuple[str, ...] = (), unsound: tuple[str, ...] = (),
+                 crypto: bool = False, single_delay: float = 0.0) -> None:
         super().__init__(api_key="test")
         self.name = name
         self._unimplemented = unimplemented
@@ -119,11 +121,18 @@ class FakeBatchProvider(MarketDataProvider):
         self._absent = {s.upper() for s in absent}
         self._frozen = {s.upper() for s in frozen}
         self._unsound = {s.upper() for s in unsound}
+        self._crypto = crypto
+        self._single_delay = single_delay
         self.multi_calls = 0
         self.single_calls = 0
+        self.single_active = 0  # in-flight single-symbol calls (concurrency probe)
+        self.max_single_active = 0  # peak concurrency observed on the degrade path
 
     def capabilities(self) -> frozenset[DataCapability]:
-        return frozenset({DataCapability.QUOTES, DataCapability.BARS})
+        caps = {DataCapability.QUOTES, DataCapability.BARS}
+        if self._crypto:
+            caps.add(DataCapability.CRYPTO)
+        return frozenset(caps)
 
     def _bars_for(self, symbol: str, limit: int) -> list[Bar]:
         sym = symbol.upper()
@@ -167,9 +176,16 @@ class FakeBatchProvider(MarketDataProvider):
 
     async def bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
         self.single_calls += 1
-        if self._fail or symbol.upper() in self._absent:
-            raise ProviderError(self.name, f"simulated failure for {symbol}")
-        return self._bars_for(symbol, limit)
+        self.single_active += 1
+        self.max_single_active = max(self.max_single_active, self.single_active)
+        try:
+            if self._single_delay:
+                await asyncio.sleep(self._single_delay)
+            if self._fail or symbol.upper() in self._absent:
+                raise ProviderError(self.name, f"simulated failure for {symbol}")
+            return self._bars_for(symbol, limit)
+        finally:
+            self.single_active -= 1
 
 
 @pytest.fixture

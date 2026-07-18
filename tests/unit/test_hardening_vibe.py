@@ -11,6 +11,7 @@ from decimal import Decimal
 import pytest
 
 from poseidon.ai.tools import ToolDispatcher, _scan_injection
+from poseidon.core.config import CycleBudgetConfig
 from poseidon.core.models import Bar, NewsArticle
 from poseidon.data.router import _bar_is_sound
 from poseidon.risk.circuit import CircuitBreaker
@@ -91,6 +92,7 @@ async def test_get_news_annotates_injection_attempts() -> None:
     disp = ToolDispatcher.__new__(ToolDispatcher)
     disp._router = _FakeRouter()  # type: ignore[assignment]
     disp.sources_used = set()
+    disp._budget = CycleBudgetConfig()  # _tool_get_news reads its news caps
     result = await disp._tool_get_news([], 10)
     articles = result["articles"]
     assert "injection_warning" not in articles[0]

@@ -17,7 +17,7 @@ from typing import Any
 
 import structlog
 
-from ..core.config import AIConfig
+from ..core.config import AIConfig, CycleBudgetConfig
 from ..core.enums import AssetClass, DecisionAction, OrderSide, OrderType, TimeInForce, TradingMode
 from ..core.errors import AgentRefusedError
 from ..core.models import (
@@ -117,10 +117,12 @@ class ClaudeAgent:
                         market_session: str, market_regime: str | None = None,
                         trade_lessons: list[TradeLesson] | None = None,
                         analysis_packets: list[AnalysisPacket] | None = None,
-                        instrument_identities: dict[str, str] | None = None) -> Decision:
+                        instrument_identities: dict[str, str] | None = None,
+                        screener_candidates: list[str] | None = None) -> Decision:
         """Run one full review cycle and return the validated Decision."""
         cycle_id = uuid.uuid4().hex[:12]
         self._dispatcher.sources_used.clear()
+        self._dispatcher.reset_cycle_budget()  # per-cycle tool-output ceiling starts fresh
         self._cycle_usage = {"input_tokens": 0, "output_tokens": 0,
                              "cache_read_tokens": 0, "cache_write_tokens": 0, "api_calls": 0}
         user_prompt = self._cycle_prompt(
@@ -129,7 +131,9 @@ class ClaudeAgent:
             market_session=market_session, market_regime=market_regime,
             trade_lessons=trade_lessons, analysis_packets=analysis_packets,
             instrument_identities=instrument_identities,
+            screener_candidates=screener_candidates,
             max_render_chars=self._config.analysis.max_render_chars,
+            budget=self._config.budget,
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         decision_input: dict[str, Any] | None = None
@@ -190,16 +194,82 @@ class ClaudeAgent:
     # -- prompt & parsing -------------------------------------------------------
 
     @staticmethod
+    def _signal_strength(sig: dict[str, Any]) -> float:
+        """Sort key for signal ranking — a missing/non-numeric strength sorts as
+        the weakest (0.0) rather than crashing the prompt build."""
+        try:
+            return float(sig.get("strength", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _compact_signal(sig: dict[str, Any]) -> dict[str, Any]:
+        """Render one signal down to the fields the PM needs to triage it —
+        strategy, symbol, direction, strength, and ONLY scalar/short evidence.
+        Nested (dict/list) and long-string evidence is dropped so a fat evidence
+        payload can never balloon the prompt."""
+        out: dict[str, Any] = {}
+        for key in ("strategy", "symbol", "direction", "strength"):
+            if key in sig:
+                out[key] = sig[key]
+        evidence = sig.get("evidence")
+        if isinstance(evidence, dict):
+            compact: dict[str, Any] = {}
+            for k, v in evidence.items():
+                # Keep scalars (bool is an int subclass, so it is covered).
+                # Drop nested dict/list structures and long strings — those are
+                # the balloon risk. Numbers are values, never truncated.
+                if isinstance(v, (int, float)) or (isinstance(v, str) and len(v) <= 40):
+                    compact[k] = v
+            if compact:
+                out["evidence"] = compact
+        return out
+
+    @staticmethod
+    def _bounded_signals(signals: list[dict[str, Any]], cfg: CycleBudgetConfig) -> str:
+        """Serialize the strategy-signal block under a hard char budget without
+        starving the PM of its highest-conviction candidates.
+
+        Keep the top ``max_signal_entries`` by ``strength`` (desc), compact each
+        (drop nested/long evidence), then accumulate whole entries until the
+        serialized array would exceed ``max_signals_chars`` — reserving room for
+        an explicit omission marker. The strongest signals (most likely to become
+        trades) always survive; any dropped signals are announced, never silent.
+        """
+        import json
+
+        if not signals:
+            return "none"
+        ranked = sorted(signals, key=ClaudeAgent._signal_strength, reverse=True)
+        candidates = [ClaudeAgent._compact_signal(s) for s in ranked[:cfg.max_signal_entries]]
+        # Worst-case marker width (every signal omitted) is reserved up front so
+        # the returned block — body + marker — never exceeds the char budget.
+        marker_reserve = len(f" (… {len(signals)} lower-strength signals omitted)")
+        body_budget = max(cfg.max_signals_chars - marker_reserve, 2)
+        kept: list[dict[str, Any]] = []
+        for entry in candidates:
+            trial = json.dumps(kept + [entry], default=str)
+            if len(trial) > body_budget:
+                break
+            kept.append(entry)
+        body = json.dumps(kept, default=str)
+        omitted = len(signals) - len(kept)
+        if omitted > 0:
+            body += f" (… {omitted} lower-strength signals omitted)"
+        return body
+
+    @staticmethod
     def _cycle_prompt(*, cycle_id: str, mode: TradingMode, watchlist: list[str],
                       enabled_strategies: list[str], strategy_signals: list[dict[str, Any]],
                       market_session: str, market_regime: str | None = None,
                       trade_lessons: list[TradeLesson] | None = None,
                       analysis_packets: list[AnalysisPacket] | None = None,
                       instrument_identities: dict[str, str] | None = None,
-                      max_render_chars: int = 1200) -> str:
-        import json
-
-        signals = json.dumps(strategy_signals, default=str) if strategy_signals else "none"
+                      screener_candidates: list[str] | None = None,
+                      max_render_chars: int = 1200,
+                      budget: CycleBudgetConfig | None = None) -> str:
+        signals = ClaudeAgent._bounded_signals(
+            strategy_signals, budget if budget is not None else CycleBudgetConfig())
         regime_line = (
             f"Market regime (computed from live benchmark history; use it for posture "
             f"and sizing, not as a trade signal): {market_regime}\n"
@@ -231,6 +301,19 @@ class ClaudeAgent:
                 "infer its company from memory or substitute a different company/ticker): "
                 f"{pairs}\n"
             )
+        # Screener candidate block — WHY each symbol is in scope this cycle (its
+        # blended-momentum screen metrics). Pre-rendered upstream to compact,
+        # bounded lines (~1 short line/candidate); ALWAYS included in full — it is
+        # never subject to the signal / tool-output caps, so the PM can never be
+        # blind to a candidate it is being asked to evaluate (anti-starvation).
+        candidate_block = ""
+        if screener_candidates:
+            candidate_block = (
+                "Screener candidates this cycle (ranked by blended momentum — WHY "
+                "each symbol is in scope; verify with live data before trading, "
+                "these are not orders):\n"
+                + "\n".join(f"- {line}" for line in screener_candidates) + "\n\n"
+            )
         analysis_block = ""
         if analysis_packets:
             # Each render() is bounded to max_render_chars and already collapsed
@@ -252,6 +335,7 @@ class ClaudeAgent:
             f"Enabled strategies: {', '.join(enabled_strategies) if enabled_strategies else 'none — observation only'}\n"
             f"Quantitative strategy signals this cycle (candidates to verify with live data, "
             f"not orders): {signals}\n\n"
+            f"{candidate_block}"
             f"{lessons_block}"
             f"{analysis_block}"
             "Begin your review. Gather the live data you need with tools, then call "

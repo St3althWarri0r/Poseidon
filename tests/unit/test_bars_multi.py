@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from poseidon.core.clock import FreshnessPolicy
+from poseidon.data.base import DataCapability
 from poseidon.data.providers.alpaca_data import AlpacaDataProvider
 from poseidon.data.router import DataRouter
 
@@ -121,6 +122,88 @@ async def test_retryable_error_penalizes_and_fails_over(policy: FreshnessPolicy)
     primary_slot = next(s for s in router._slots if s.provider is primary)
     assert primary_slot.consecutive_failures == 1  # penalized
     assert primary_slot.available is False
+
+
+async def test_require_crypto_routes_only_to_crypto_provider(policy: FreshnessPolicy) -> None:
+    # An equity-only batch provider (BARS, no CRYPTO) and a crypto batch provider
+    # (BARS+CRYPTO) are both configured. A require=CRYPTO batch must select ONLY
+    # the crypto provider — an equity provider silently drops /USD symbols and
+    # would return {} SUCCESSFULLY, starving the screen.
+    equity = FakeBatchProvider(name="equity", bars_count=90)
+    crypto = FakeBatchProvider(name="coinbase", bars_count=90, crypto=True)
+    router = DataRouter([(equity, 10), (crypto, 20)], policy)
+
+    result = await router.bars_multi(
+        ["BTC/USD", "ETH/USD"], timeframe="1d", limit=90,
+        require=DataCapability.CRYPTO,
+    )
+
+    assert set(result) == {"BTC/USD", "ETH/USD"}
+    assert crypto.multi_calls == 1
+    assert equity.multi_calls == 0  # equity provider never consulted for crypto
+
+
+async def test_require_crypto_no_capable_provider_returns_empty(policy: FreshnessPolicy) -> None:
+    # No CRYPTO-capable provider configured → capable set empty → {} (never an
+    # equity provider serving a /USD pair, never a crash).
+    equity = FakeBatchProvider(name="equity", bars_count=90)
+    router = DataRouter([(equity, 10)], policy)
+
+    result = await router.bars_multi(
+        ["BTC/USD", "ETH/USD"], timeframe="1d", limit=90,
+        require=DataCapability.CRYPTO,
+    )
+
+    assert result == {}
+    assert equity.multi_calls == 0
+
+
+async def test_require_none_equity_path_unchanged(policy: FreshnessPolicy) -> None:
+    # require=None (the equity/default path) keeps the capable set byte-identical
+    # to today: an equity-only provider still serves the batch.
+    equity = FakeBatchProvider(name="equity", bars_count=90)
+    router = DataRouter([(equity, 10)], policy)
+
+    result = await router.bars_multi(["AAPL", "MSFT"], timeframe="1d", limit=90)
+
+    assert set(result) == {"AAPL", "MSFT"}
+    assert equity.multi_calls == 1
+
+
+async def test_concurrency_bounds_single_symbol_degrade(policy: FreshnessPolicy) -> None:
+    # Coinbase has no batch endpoint → NotImplementedError → single-symbol degrade.
+    # concurrency=2 must cap the in-flight fan-out; a small per-call delay forces
+    # overlap so peak concurrency is observable.
+    provider = FakeBatchProvider(
+        name="coinbase", bars_count=90, crypto=True,
+        unimplemented=True, single_delay=0.02,
+    )
+    router = DataRouter([(provider, 10)], policy)
+
+    symbols = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "ADA/USD"]
+    result = await router.bars_multi(
+        symbols, timeframe="1d", limit=90,
+        require=DataCapability.CRYPTO, concurrency=2,
+    )
+
+    assert set(result) == set(symbols)
+    assert provider.single_calls == len(symbols)
+    assert provider.max_single_active <= 2  # semaphore honored the concurrency cap
+
+
+async def test_concurrency_default_when_unset(policy: FreshnessPolicy) -> None:
+    # concurrency=None keeps the existing default (16): a small fan-out runs fully
+    # parallel, unchanged from today.
+    provider = FakeBatchProvider(
+        name="batch", bars_count=90, unimplemented=True, single_delay=0.02,
+    )
+    router = DataRouter([(provider, 10)], policy)
+
+    symbols = ["AAPL", "MSFT", "NVDA", "AMZN"]
+    result = await router.bars_multi(symbols, timeframe="1d", limit=90)
+
+    assert set(result) == set(symbols)
+    assert provider.max_single_active == 4  # all four ran concurrently (< default 16)
 
 
 def _alpaca(handler: Callable[[httpx.Request], httpx.Response]) -> AlpacaDataProvider:

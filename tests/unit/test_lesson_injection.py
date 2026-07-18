@@ -15,6 +15,9 @@ class _Disp:
     def __init__(self) -> None:
         self.sources_used: set[str] = set()
 
+    def reset_cycle_budget(self) -> None:
+        pass
+
     async def dispatch(self, name, args):
         return ("{}", False)
 

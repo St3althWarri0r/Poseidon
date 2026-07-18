@@ -71,7 +71,9 @@ class FakeRouter:
         self.calls = 0
 
     async def bars_multi(self, symbols: list[str], *, timeframe: str = "1d",
-                         limit: int = 90) -> dict[str, list[Bar]]:
+                         limit: int = 90, **_: object) -> dict[str, list[Bar]]:
+        # ``**_`` absorbs the ``require=`` / ``concurrency=`` kwargs the screener
+        # now threads through (equity passes require=None ⇒ same routing as before).
         self.calls += 1
         if self.fail:
             raise ProviderError("fake", "simulated screen failure")

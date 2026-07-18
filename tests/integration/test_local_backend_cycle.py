@@ -20,6 +20,9 @@ class _Dispatcher:
     def __init__(self) -> None:
         self.sources_used: set[str] = set()
 
+    def reset_cycle_budget(self) -> None:
+        pass
+
     async def dispatch(self, name: str, args: dict) -> tuple[str, bool]:
         self.sources_used.add("alpaca")
         return (json.dumps({"cash": "42000000", "positions": []}), False)
