@@ -86,6 +86,10 @@ data:
     # - name: public_data
     #   credential: public_api_secret
     #   priority: 10
+    - name: coinbase             # FREE real-time spot crypto (BASE/USD); no key,
+      priority: 8                # no account — public Coinbase Exchange endpoint.
+                                 # Crypto-only, so it never serves equity requests;
+                                 # priority 8 = tried before alpaca for crypto.
     - name: finnhub              # free tier: real-time US quotes, news, earnings
       credential: finnhub_api_key
       priority: 20

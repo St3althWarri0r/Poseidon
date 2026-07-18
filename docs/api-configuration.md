@@ -178,6 +178,7 @@ shifts to the next one.
 | `twelvedata` | quotes, bars | twelvedata.com | plain API key |
 | `alphavantage` | EOD quotes, news+sentiment (bars not offered: free series is split-unadjusted) | alphavantage.co | plain API key |
 | `alpaca` | quotes, bars, option chains, news, **crypto** (spot `BASE/USD`) | alpaca.markets | `{"key_id": "...", "secret_key": "..."}` |
+| `coinbase` | **crypto** quotes + bars (spot `BASE/USD`), crypto-only | none — public Coinbase Exchange endpoint | *(no credential; free)* |
 | `tradier_data` | quotes, daily bars, option chains + greeks | tradier.com | access token (options: `{sandbox: true}`) |
 
 ### Running on $0 of API subscriptions
@@ -194,6 +195,10 @@ The platform is designed so the only thing you pay for is Claude:
   split-unadjusted and would change the price basis on failover).
 - **`alpaca`** (IEX feed) and **`tradier_data`** (sandbox) are also free
   with their respective accounts.
+- **`coinbase`** is free with *no account or key at all* — it hits the public
+  Coinbase Exchange REST API for real-time spot crypto (`BASE/USD`) quotes and
+  bars. It is enabled by default in the sample config at priority 8 (crypto-only,
+  so it never touches equity requests) and is the recommended crypto source.
 
 Recommended free stack: `public_data` (priority 10) for quotes/options/
 bars + `finnhub` (priority 20) for news and both calendars, with
@@ -210,13 +215,17 @@ Notes:
 - **Crypto quotes (`BASE/USD`).** Spot crypto pairs — written with a slash,
   e.g. `BTC/USD`, `ETH/USD` — are routed to whichever configured provider
   advertises the `crypto` capability, and *never* to an equity-only provider.
-  `alpaca` serves crypto free on the same `alpaca_keys` credential (no extra
-  entitlement), so enabling the `alpaca` data provider is all it takes to quote
-  crypto. Only `BASE/USD` pairs are supported — stablecoin-quoted pairs such as
-  `BTC/USDT` are rejected with a clear error, never a 404. If no crypto-capable
-  provider is configured, a crypto quote fails cleanly (`no data, no trade`)
-  rather than falling back to a stocks endpoint. Crypto trading is **paper-only**
-  today; see docs/broker-setup.md for the live follow-on.
+  `coinbase` is enabled by default and serves crypto free with no key at all, so
+  crypto quotes work out of the box; `alpaca` also serves crypto free on the same
+  `alpaca_keys` credential (no extra entitlement) as a failover. Only `BASE/USD`
+  pairs are supported — stablecoin-quoted pairs such as `BTC/USDT` are rejected
+  with a clear error, never a 404. If no crypto-capable provider is configured, a
+  crypto quote fails cleanly (`no data, no trade`) rather than falling back to a
+  stocks endpoint. Because crypto trades 24/7 over a looser REST cadence, its
+  real-time freshness gate is its own knob — `data.crypto_real_time_max_age_seconds`
+  (default 60s) — while equities stay strict at `data.real_time_max_age_seconds`
+  (default 5s). Crypto trading is **paper-only** today; see docs/broker-setup.md
+  for the live follow-on.
 - Alpha Vantage quotes are end-of-day: the freshness policy grades them
   DELAYED/STALE, so they can inform research but never orders — that is by
   design, not a bug.
