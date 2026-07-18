@@ -68,6 +68,7 @@ from .security.audit import AuditLog
 from .security.vault import Vault
 from .storage.db import Database
 from .strategy.engine import StrategyEngine
+from .strategy.screener import MarketScreener
 from .strategy.workshop import AlgorithmWorkshop
 from .updater import UpdateService
 
@@ -90,6 +91,27 @@ def _env_credential(entry: dict[str, object], paper: bool) -> str:
     back to the single ``credential`` name — unchanged behaviour."""
     env_key = "credential_paper" if paper else "credential_live"
     return str(entry.get(env_key) or entry.get("credential", ""))
+
+
+def _union(watchlist: list[str], candidates: list[str]) -> list[str]:
+    """Watchlist plus any screener-supplied candidates it does not already
+    contain — watchlist first, order-stable, case-insensitively de-duplicated.
+
+    When ``candidates`` is empty (the screener is disabled or a screen failed and
+    degraded to ``[]``) the watchlist is returned UNCHANGED — the cycle is then
+    byte-identical to the pre-screener behaviour. Otherwise the new candidates
+    (already uppercased by the universe loader) are appended in order, so the
+    watchlist entries the AI sees are never reordered or recased."""
+    if not candidates:
+        return watchlist
+    seen = {s.upper() for s in watchlist}
+    out = list(watchlist)
+    for candidate in candidates:
+        upper = candidate.upper()
+        if upper not in seen:
+            seen.add(upper)
+            out.append(upper)
+    return out
 
 
 class ApplicationKernel:
@@ -127,6 +149,11 @@ class ApplicationKernel:
         self._utility_backend: ChatBackend | None = None
         self.chat: ChatService | None = None
         self.strategies: StrategyEngine
+        # Advisory market screener: ranks a broad index each cycle and hands the
+        # AI the top-N candidates to deep-analyze. OFF by default — when
+        # disabled, select_candidates() returns [] and the cycle is byte-identical
+        # to today. Built in start() (needs the router).
+        self.screener: MarketScreener
         self.workshop: AlgorithmWorkshop
         self.scheduler: Scheduler
         self.health: HealthMonitor
@@ -202,6 +229,10 @@ class ApplicationKernel:
         self.bus.subscribe(Topics.ORDER_UPDATED, self.guardian.on_order_update)
         self.bus.subscribe(Topics.CIRCUIT_OPENED, self._on_circuit_opened)
         self.strategies = StrategyEngine(cfg.strategies, cfg.all_watchlist_symbols())
+        # Always constructed — harmless when disabled (select_candidates() early-
+        # returns []). Its own severed S&P 500 universe copy under data/ (never
+        # research/); every candidate still flows AI -> RiskEngine -> broker.
+        self.screener = MarketScreener(cfg.screener, self.router)
         self.workshop = AlgorithmWorkshop(
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
@@ -1063,21 +1094,31 @@ class ApplicationKernel:
                 return
             started = datetime.now(UTC)
             try:
-                signals = await self.strategies.scan_all(self.router, self.portfolio)
+                # Widen the universe with the screener's top-N ranked candidates.
+                # candidates == [] when the screener is disabled OR a screen failed
+                # (it degrades to [] and never raises), so `symbols == watchlist`
+                # and `extra_symbols == []` ⇒ the cycle is byte-identical to today.
+                # The screener only picks WHICH symbols the AI evaluates — every
+                # candidate still flows AI -> RiskEngine -> broker unchanged.
+                watchlist = self.config.all_watchlist_symbols()
+                candidates = await self.screener.select_candidates()
+                symbols = _union(watchlist, candidates)
+                signals = await self.strategies.scan_all(
+                    self.router, self.portfolio, extra_symbols=candidates)
                 # Trusted attribution for sleeve caps: only symbols a sleeved
                 # strategy actually signalled this cycle get its cap.
                 self.risk.set_cycle_attribution(list(signals))
-                lessons = (await self.reflection.relevant_lessons(
-                    self.config.all_watchlist_symbols())
+                # Advisory grounding follows the union (cheap: router-cached
+                # identities, DB lessons) so the AI is grounded on candidates too;
+                # analysis packets stay watchlist-scoped (call-heavy, off by default).
+                lessons = (await self.reflection.relevant_lessons(symbols)
                     if self.reflection is not None else None)
-                packets = (await self.analysis.relevant_packets(
-                    self.config.all_watchlist_symbols())
+                packets = (await self.analysis.relevant_packets(watchlist)
                     if self.analysis is not None else [])
-                identities = await self._instrument_identities(
-                    self.config.all_watchlist_symbols())
+                identities = await self._instrument_identities(symbols)
                 decision = await self.agent.run_cycle(
                     mode=self.order_manager.mode,
-                    watchlist=self.config.all_watchlist_symbols(),
+                    watchlist=symbols,
                     enabled_strategies=self.strategies.enabled_names,
                     strategy_signals=[s.as_dict() for s in signals],
                     market_session=self.clock.session().value,
