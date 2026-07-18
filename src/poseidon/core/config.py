@@ -199,6 +199,16 @@ class RiskConfig(StrictModel):
     # equity (0.005 = a position sized so one typical day moves it by
     # ~0.5% of account equity). Advisory input to the AI's sizing tool.
     position_risk_budget_pct: float = Field(default=0.005, gt=0, le=0.1)
+    # Deterministic trading universe (UniverseRule). Denial is by underlying and
+    # applies only to opens — risk-reducing exits always pass so a position can
+    # never be trapped outside the universe. Both empty = allow everything.
+    universe_exclude_symbols: list[str] = Field(default_factory=list)  # denylist
+    universe_allow_symbols: list[str] = Field(default_factory=list)  # allowlist; empty = all
+
+    @field_validator("universe_exclude_symbols", "universe_allow_symbols")
+    @classmethod
+    def _upper_universe(cls, v: list[str]) -> list[str]:
+        return [s.strip().upper() for s in v if s.strip()]
 
 
 class GuardianConfig(StrictModel):

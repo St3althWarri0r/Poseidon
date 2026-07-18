@@ -9,7 +9,7 @@ import pytest
 
 from poseidon.core.clock import MarketClock
 from poseidon.core.config import RiskConfig
-from poseidon.core.enums import OrderSide, OrderType
+from poseidon.core.enums import AssetClass, OrderSide, OrderType
 from poseidon.core.errors import RiskViolation
 from poseidon.core.models import AccountSnapshot, Bar, EconomicEvent, Order, Position
 from poseidon.portfolio.state import PortfolioState
@@ -27,6 +27,7 @@ from poseidon.risk.rules import (
     SectorConcentrationRule,
     SlippageProtectionRule,
     SpreadRule,
+    UniverseRule,
     VolumeRule,
 )
 
@@ -287,6 +288,62 @@ class TestPortfolioVaRRule:
         state.risk_metrics_at = datetime.now(UTC) - timedelta(hours=3)
         with pytest.raises(RiskViolation, match="fresh"):
             PortfolioVaRRule().check(ctx(buy(), portfolio=state, config=self._config(0.05)))
+
+
+class TestUniverseRule:
+    """A deterministic universe gate: opens outside the configured universe are
+    denied by underlying; risk-reducing exits always pass so a position can never
+    be trapped outside the universe."""
+
+    def _buy(self, symbol: str = "AAPL") -> Order:
+        return Order(symbol=symbol, side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100.00"))
+
+    def _sell(self, symbol: str = "AAPL") -> Order:
+        return Order(symbol=symbol, side=OrderSide.SELL, order_type=OrderType.LIMIT,
+                     quantity=Decimal("10"), limit_price=Decimal("100.00"))
+
+    def _option_open(self, symbol: str) -> Order:
+        return Order(symbol=symbol, asset_class=AssetClass.OPTION,
+                     side=OrderSide.BUY_TO_OPEN, order_type=OrderType.LIMIT,
+                     quantity=Decimal("1"), limit_price=Decimal("1.00"))
+
+    def test_open_denied_on_exclude(self) -> None:
+        cfg = RiskConfig(universe_exclude_symbols=["TSLA"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._buy("AAPL"), config=cfg))  # not excluded, no allowlist
+
+    def test_open_denied_off_allowlist(self) -> None:
+        cfg = RiskConfig(universe_allow_symbols=["AAPL", "MSFT"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._buy("AAPL"), config=cfg))  # on allowlist
+
+    def test_exit_passes_even_when_excluded(self) -> None:
+        # A denylisted (and off-allowlist) symbol can always be closed.
+        cfg = RiskConfig(universe_exclude_symbols=["TSLA"], universe_allow_symbols=["AAPL"])
+        UniverseRule().check(ctx(self._sell("TSLA"), config=cfg))
+
+    def test_option_open_denied_by_underlying(self) -> None:
+        # An excluded equity cannot be re-entered via its options: denial by
+        # underlying, stripping the OCC tail.
+        cfg = RiskConfig(universe_exclude_symbols=["AAPL"])
+        with pytest.raises(RiskViolation, match="AAPL"):
+            UniverseRule().check(ctx(self._option_open("AAPL240621C00190000"), config=cfg))
+        # A different underlying's option is unaffected.
+        UniverseRule().check(ctx(self._option_open("MSFT240621C00300000"), config=cfg))
+
+    def test_case_insensitive(self) -> None:
+        # Config normalizes to uppercase; a lowercase order symbol still matches.
+        cfg = RiskConfig(universe_exclude_symbols=["tsla"])
+        with pytest.raises(RiskViolation, match="universe"):
+            UniverseRule().check(ctx(self._buy("tsla"), config=cfg))
+
+    def test_empty_config_is_noop(self) -> None:
+        cfg = RiskConfig()  # both lists empty: rule passes everything
+        UniverseRule().check(ctx(self._buy("TSLA"), config=cfg))
+        UniverseRule().check(ctx(self._sell("ANYTHING"), config=cfg))
 
 
 class TestCircuitBreaker:
