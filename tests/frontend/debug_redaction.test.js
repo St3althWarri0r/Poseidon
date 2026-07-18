@@ -15,7 +15,7 @@ const path = require("node:path");
 const debug = require(
   path.join(__dirname, "..", "..", "src", "poseidon", "api", "static", "debug.js")
 );
-const { redactUrl, redactBody } = debug;
+const { redactUrl, redactBody, summarize } = debug;
 
 /* ---- redactBody: request/response object bodies ---- */
 
@@ -81,5 +81,51 @@ assert.equal(
 assert.equal(redactUrl("/api/cycle"), "/api/cycle", "no query → unchanged");
 // fragment is preserved after a redacted query
 assert.equal(redactUrl("/p?secret=s#frag"), "/p?secret=REDACTED#frag");
+// OAuth redirect params (code/session/bare key) are redacted, not just the
+// SECRET_KEY-named ones — these are the ones an authorization callback carries.
+assert.equal(
+  redactUrl("https://127.0.0.1/cb?code=AUTHCODE&session=SESS&key=K&keep=x"),
+  "https://127.0.0.1/cb?code=REDACTED&session=REDACTED&key=REDACTED&keep=x"
+);
 
-console.log("debug redaction: all assertions passed");
+/* ---- redactBody: a STRING VALUE that is itself a secret-bearing URL ---- */
+
+// Schwab's exchange request carries the whole callback URL in `redirect_response`
+// — a field name SECRET_KEY does not match — so its ?code=/&session= query would
+// otherwise leak. The body walk must route string values through redactUrl.
+const redirectBody = redactBody(JSON.stringify({
+  broker: "schwab",
+  app_key: "AK_pub_ok",
+  app_secret: "AS_SECRET_zzz",
+  refresh_token: "RT_SECRET_qqq",
+  redirect_response: "https://127.0.0.1/?code=AUTHCODE_SECRET&session=SESS_SECRET",
+}));
+assert.equal(redirectBody.app_secret, "REDACTED", "app_secret key still redacts");
+assert.equal(redirectBody.refresh_token, "REDACTED", "refresh_token key still redacts");
+assert.equal(
+  redirectBody.redirect_response,
+  "https://127.0.0.1/?code=REDACTED&session=REDACTED",
+  "URL-valued field's code/session query params must be redacted"
+);
+const redirectStr = JSON.stringify(redirectBody);
+for (const leak of ["AS_SECRET_zzz", "RT_SECRET_qqq", "AUTHCODE_SECRET", "SESS_SECRET"]) {
+  assert.ok(!redirectStr.includes(leak), `secret "${leak}" leaked from URL-valued field`);
+}
+
+/* ---- summarize: a NON-JSON response body is size-only, never raw ---- */
+
+function fakeResponse(text) {           // minimal Response for summarize()
+  return { clone() { return { async text() { return text; } }; } };
+}
+(async () => {
+  const nonJson = await summarize(fakeResponse("refresh_token=LEAKME"));
+  assert.equal(nonJson, "[body 20 bytes]",
+    "non-JSON response must be a size placeholder, never raw-echoed");
+  assert.ok(!nonJson.includes("LEAKME"), "non-JSON response body must not raw-echo secrets");
+  // the JSON path still runs the redaction walk unchanged
+  const jsonSummary = await summarize(fakeResponse(JSON.stringify({ refresh_token: "RT_x", ok: 1 })));
+  assert.ok(!jsonSummary.includes("RT_x"), "JSON response secret must still redact");
+  assert.ok(jsonSummary.includes("REDACTED"), "JSON response redaction walk still runs");
+
+  console.log("debug redaction: all assertions passed");
+})();

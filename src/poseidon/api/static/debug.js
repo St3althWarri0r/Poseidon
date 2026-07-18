@@ -15,6 +15,14 @@
   const SECRET_KEY =
     /(token|secret|passphrase|password|api[_-]?key|app[_-]?key|app[_-]?secret|refresh[_-]?token|credential|authorization)/i;
 
+  // Query-param NAMES whose VALUE is a secret when carried inside a URL string.
+  // Broader than SECRET_KEY: an OAuth redirect (e.g. Schwab's redirect_response
+  // field) carries ?code=<authcode>&session=<...>&state=… — names that are not
+  // object-secret names but whose query VALUES are still secret. Applied only to
+  // URL query params (never to object keys), so widening it can't hide a field.
+  const URL_SECRET_PARAM =
+    /(token|secret|passphrase|password|api[_-]?key|app[_-]?key|app[_-]?secret|refresh[_-]?token|credential|authorization|code|session|key)/i;
+
   const DBG = { on: false, buf: [], seq: 0 };
 
   /* ---- redaction (pure, top-level, unit-testable) ---- */
@@ -43,6 +51,11 @@
       }
       return out;
     }
+    // A string VALUE can itself carry a URL with secret query params (e.g.
+    // Schwab's redirect_response holds ?code=…&session=…). Key-name redaction
+    // misses those, so route every string value through redactUrl (a no-op for
+    // strings without a secret-bearing query).
+    if (typeof obj === "string") return redactUrl(obj);
     return obj;
   }
 
@@ -77,7 +90,7 @@
     const parts = tail.split("&").map((pair) => {
       const eq = pair.indexOf("=");
       const key = eq === -1 ? pair : pair.slice(0, eq);
-      if (eq !== -1 && SECRET_KEY.test(key)) return key + "=REDACTED";
+      if (eq !== -1 && URL_SECRET_PARAM.test(key)) return key + "=REDACTED";
       return pair;
     });
     return s.slice(0, qi) + "?" + parts.join("&") + hash;
@@ -86,7 +99,9 @@
   // Bounded, redacted summary of a fetch response. Reads a clone so the app
   // still consumes the original body normally. Parses the FULL text for
   // redaction (so a secret can never survive via a truncated-but-unparseable
-  // slice) and only then bounds the output to ~2000 chars.
+  // slice) and only then bounds the output to ~2000 chars. A non-JSON body is
+  // NOT raw-echoed (it could be e.g. 'refresh_token=LEAKME'); it mirrors the
+  // request-body policy and becomes a bare size-only placeholder.
   async function summarize(res) {
     try {
       const text = await res.clone().text();
@@ -96,8 +111,8 @@
           const s = JSON.stringify(redactBody(parsed));
           return s.length > 2000 ? s.slice(0, 2000) + "…[truncated]" : s;
         }
-      } catch { /* not JSON — fall through to bounded raw text */ }
-      return text.length > 2000 ? text.slice(0, 2000) + "…[truncated]" : text;
+      } catch { /* not JSON — fall through to size-only placeholder */ }
+      return "[body " + text.length + " bytes]";
     } catch (err) {
       return "[unreadable body: " + String(err) + "]";
     }

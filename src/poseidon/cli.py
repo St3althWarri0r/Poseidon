@@ -202,10 +202,20 @@ def probe_model_backend(
             with httpx.Client(timeout=5.0, transport=transport) as c:
                 c.get(f"{base}/models").raise_for_status()
             return True, f"reachable at {base}"
-        except httpx.HTTPError as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Connect phase failed — nothing is listening. Actionable: start it.
             return False, (
-                f"UNREACHABLE at {base} — start LM Studio / the model server ({exc})"
+                f"unreachable at {base} — start LM Studio / the model server ({exc})"
             )
+        except httpx.HTTPStatusError as exc:
+            # We connected and got a response, just a bad status (e.g. a running
+            # LM Studio returning 500) — the server is up, don't say "start it".
+            return False, (
+                f"backend reachable at {base} but returned {exc.response.status_code}"
+            )
+        except httpx.HTTPError as exc:
+            # Any other transport-level failure (read timeout, protocol error…).
+            return False, f"backend probe to {base} failed ({exc})"
     try:  # anthropic: cheap authed liveness
         with httpx.Client(timeout=5.0, transport=transport) as c:
             r = c.get(
