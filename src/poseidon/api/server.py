@@ -348,7 +348,7 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     async def exit_plans() -> JSONResponse:
         return JSONResponse({"plans": await kernel.guardian.active_plans()})
 
-    @app.get("/api/quote/{symbol}")
+    @app.get("/api/quote/{symbol:path}")
     async def quote(symbol: str) -> JSONResponse:
         """Quote for the trade ticket. During regular hours only a FRESH quote
         is shown (a human about to trade sees the same freshness bar as the
