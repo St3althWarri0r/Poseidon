@@ -13,9 +13,10 @@ trade — that is the "never guess" contract enforced in code.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import TypeVar
 
 import structlog
@@ -24,6 +25,7 @@ from ..core.clock import FreshnessPolicy
 from ..core.enums import DataFreshness
 from ..core.errors import (
     AllProvidersFailedError,
+    DataError,
     DataUnavailableError,
     ProviderAuthError,
     ProviderError,
@@ -183,16 +185,94 @@ class DataRouter:
         # Reject a clearly-frozen feed (not normal weekend/holiday gaps).
         max_age = _MAX_BAR_AGE.get(timeframe)
         if bars and max_age is not None:
-            from datetime import UTC as _UTC
-            from datetime import datetime as _dt
-
-            age = (_dt.now(_UTC) - bars[-1].end).total_seconds()
+            age = (datetime.now(UTC) - bars[-1].end).total_seconds()
             if age > max_age:
                 raise StaleDataError(
                     f"bars for {symbol} ({timeframe}) from {bars[-1].source} end "
                     f"{bars[-1].end.isoformat()} — {age / 86400:.1f}d old, feed looks frozen"
                 )
         return bars
+
+    async def bars_multi(self, symbols: list[str], *, timeframe: str = "1d",
+                         limit: int = 90) -> dict[str, list[Bar]]:
+        """Batched daily bars for many symbols — the screener's throughput core.
+
+        Selects the first BARS-capable provider that implements the batch path;
+        ``NotImplementedError`` tries the next provider and a ``ProviderError``
+        penalizes it (existing backoff) before the next. If NO provider serves a
+        batch bars endpoint (or every one is down/penalized), degrades to a
+        bounded-concurrency single-symbol ``bars`` fan-out so the screener still
+        works against a non-batch stack.
+
+        NEVER raises — a symbol that cannot be served is simply absent; the same
+        boundary hygiene as :meth:`bars` is applied (drop structurally-unsound
+        bars, drop a symbol whose newest bar is older than ``_MAX_BAR_AGE`` — a
+        frozen feed we cannot rank). The screener degrades to the watchlist on an
+        empty result, so this path can never block or crash a review cycle.
+        """
+        if not symbols:
+            return {}
+        capable = [s for s in self._slots if DataCapability.BARS in s.provider.capabilities()]
+        if not capable:
+            return {}
+        was_available = {id(s): s.available for s in capable}
+        for last_resort in (False, True):
+            for slot in capable:
+                if was_available[id(slot)] == last_resort:
+                    continue
+                started = time.monotonic()
+                try:
+                    raw = await slot.provider.bars_multi(symbols, timeframe=timeframe, limit=limit)
+                except NotImplementedError:
+                    continue  # no batch path here — try the next provider, then degrade
+                except ProviderError as exc:
+                    slot.record_failure(retry_after=getattr(exc, "retry_after", None))
+                    log.warning("batch bars provider failed, failing over",
+                                provider=slot.provider.name, error=str(exc))
+                    continue
+                slot.record_success((time.monotonic() - started) * 1000)
+                return self._sanitize_bars_multi(raw, timeframe)
+        # No provider implements bars_multi (all NotImplementedError) or every
+        # capable provider is down — degrade to bounded single-symbol fetches.
+        return await self._bars_multi_via_single(symbols, timeframe=timeframe, limit=limit)
+
+    def _sanitize_bars_multi(self, raw: dict[str, list[Bar]],
+                             timeframe: str) -> dict[str, list[Bar]]:
+        """Apply :meth:`bars` boundary hygiene per symbol: drop structurally
+        unsound bars, and drop the whole symbol if it has no sound bars left or
+        its newest bar is stale (frozen feed). Unlike :meth:`bars` a frozen
+        symbol is dropped, not raised — one stalled name must not sink the screen."""
+        max_age = _MAX_BAR_AGE.get(timeframe)
+        now = datetime.now(UTC)
+        out: dict[str, list[Bar]] = {}
+        for symbol, bars in raw.items():
+            sound = [b for b in bars if _bar_is_sound(b)]
+            if not sound:
+                continue
+            if max_age is not None and (now - sound[-1].end).total_seconds() > max_age:
+                log.info("dropping frozen symbol from batch bars", symbol=symbol,
+                         timeframe=timeframe, newest=sound[-1].end.isoformat())
+                continue
+            out[symbol] = sound
+        return out
+
+    async def _bars_multi_via_single(self, symbols: list[str], *, timeframe: str,
+                                     limit: int) -> dict[str, list[Bar]]:
+        """Degrade path: bounded-concurrency single-symbol :meth:`bars` (which
+        already applies sound + frozen hygiene and raises on a frozen/failed
+        symbol). Per-symbol errors are swallowed so one bad name never aborts
+        the screen; absent symbols are simply omitted."""
+        sem = asyncio.Semaphore(16)
+
+        async def _one(sym: str) -> tuple[str, list[Bar] | None]:
+            async with sem:
+                try:
+                    return sym, await self.bars(sym, timeframe=timeframe, limit=limit)
+                except DataError:
+                    return sym, None
+
+        results = await asyncio.gather(*(_one(s) for s in symbols))
+        return {sym: bars for sym, bars in results if bars}
 
     async def option_chain(self, underlying: str, *, expiration: date | None = None,
                            allow_delayed: bool = False) -> OptionChain:

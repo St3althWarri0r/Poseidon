@@ -80,6 +80,89 @@ class FakeProvider(MarketDataProvider):
         return []
 
 
+class FakeBatchProvider(MarketDataProvider):
+    """In-memory provider that implements the batched ``bars_multi`` path.
+
+    Configurable per-symbol behaviour lets the router tests exercise the batch
+    contract without a network:
+      * ``unimplemented=True`` — ``bars_multi`` raises ``NotImplementedError`` so
+        the router falls back to the single-symbol degrade path.
+      * ``fail=True`` — ``bars_multi`` raises ``ProviderError`` (whole-provider
+        failure → the router penalizes and fails over / degrades).
+      * ``absent`` — symbols simply omitted from the returned dict (mirrors a
+        failed chunk / a name the feed has no data for: best-effort, absent).
+      * ``frozen`` — symbols whose newest bar is weeks old (a stalled feed) so
+        the router drops them via the ``_MAX_BAR_AGE`` guard.
+      * ``unsound`` — symbols that carry one structurally-malformed bar so the
+        router drops just that bar via ``_bar_is_sound``.
+    ``multi_calls``/``single_calls`` count each path for cache/degrade asserts.
+    """
+
+    name = "fakebatch"
+
+    def __init__(self, *, name: str = "fakebatch", unimplemented: bool = False,
+                 fail: bool = False, bars_count: int = 90, volume: int = 1_000_000,
+                 price: str = "100.00", absent: tuple[str, ...] = (),
+                 frozen: tuple[str, ...] = (), unsound: tuple[str, ...] = ()) -> None:
+        super().__init__(api_key="test")
+        self.name = name
+        self._unimplemented = unimplemented
+        self._fail = fail
+        self._bars_count = bars_count
+        self._volume = volume
+        self._price = float(Decimal(price))
+        self._absent = {s.upper() for s in absent}
+        self._frozen = {s.upper() for s in frozen}
+        self._unsound = {s.upper() for s in unsound}
+        self.multi_calls = 0
+        self.single_calls = 0
+
+    def capabilities(self) -> frozenset[DataCapability]:
+        return frozenset({DataCapability.QUOTES, DataCapability.BARS})
+
+    def _bars_for(self, symbol: str, limit: int) -> list[Bar]:
+        sym = symbol.upper()
+        now = datetime.now(UTC)
+        count = min(limit, self._bars_count)
+        frozen_days = 40 if sym in self._frozen else 0
+        bars: list[Bar] = []
+        for i in range(count):
+            day = now - timedelta(days=count - i + frozen_days)
+            bars.append(
+                Bar(symbol=sym, open=Decimal(str(self._price)),
+                    high=Decimal(str(self._price * 1.01)), low=Decimal(str(self._price * 0.99)),
+                    close=Decimal(str(self._price)), volume=self._volume,
+                    start=day, end=day, source=self.name)
+            )
+        if sym in self._unsound and bars:
+            # inject one structurally-broken bar (high < low) mid-series
+            broken = bars[len(bars) // 2]
+            bars[len(bars) // 2] = Bar(
+                symbol=sym, open=broken.open, high=Decimal("1"), low=Decimal("99"),
+                close=broken.close, volume=broken.volume,
+                start=broken.start, end=broken.end, source=self.name,
+            )
+        return bars
+
+    async def bars_multi(self, symbols: list[str], *, timeframe: str,
+                         limit: int) -> dict[str, list[Bar]]:
+        self.multi_calls += 1
+        if self._unimplemented:
+            raise NotImplementedError
+        if self._fail:
+            raise ProviderError(self.name, "simulated batch failure")
+        return {
+            s.upper(): self._bars_for(s, limit)
+            for s in symbols if s.upper() not in self._absent
+        }
+
+    async def bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
+        self.single_calls += 1
+        if self._fail or symbol.upper() in self._absent:
+            raise ProviderError(self.name, f"simulated failure for {symbol}")
+        return self._bars_for(symbol, limit)
+
+
 @pytest.fixture
 def fresh_policy() -> FreshnessPolicy:
     return FreshnessPolicy(real_time_max_age=5.0, delayed_max_age=900.0)

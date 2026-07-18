@@ -83,6 +83,17 @@ class MarketDataProvider(abc.ABC):
     async def bars(self, symbol: str, *, timeframe: str, limit: int) -> list[Bar]:
         raise NotImplementedError
 
+    async def bars_multi(self, symbols: list[str], *, timeframe: str,
+                         limit: int) -> dict[str, list[Bar]]:
+        """Batched daily bars for many symbols in one (paginated) round-trip.
+
+        Returns ``{symbol: chronological_bars}``; a symbol the feed cannot serve
+        is simply absent (never fabricated). Providers whose upstream has no
+        multi-symbol bars endpoint leave this at the default ``NotImplementedError``
+        so :class:`DataRouter` degrades to bounded single-symbol ``bars`` calls.
+        """
+        raise NotImplementedError
+
     async def option_chain(self, underlying: str, *, expiration: date | None = None) -> OptionChain:
         raise NotImplementedError
 
