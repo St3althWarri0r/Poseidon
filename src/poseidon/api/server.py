@@ -618,6 +618,32 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             },
         })
 
+    @app.post("/api/models")
+    async def apply_models(body: dict[str, Any]) -> JSONResponse:
+        """Apply an AI-brain selection (mirrors POST /api/brokers/connect).
+        Config-only: validates the body, then delegates the live swap to
+        ``kernel.apply_ai_config``, which PROVES the target is usable (anthropic
+        key in the vault / local endpoint reachable) BEFORE touching anything and
+        runs the rebind under ``_cycle_lock`` so it can never land mid-cycle — no
+        order path, no mode change, no secret. A precondition/build failure comes
+        back 422 with the old backend still live; the response echoes only the
+        resulting ``ai`` block (backend/model/base_url/paid), never a secret."""
+        backend = str(body.get("backend", "")).strip()
+        if backend not in {"anthropic", "openai_compatible"}:
+            raise HTTPException(
+                status_code=422,
+                detail="backend must be 'anthropic' or 'openai_compatible'")
+        # Custom ids are allowed (a wrong local id surfaces on the next cycle),
+        # but a blank one is not — strip before the emptiness check.
+        model = str(body.get("model", "")).strip()
+        if not model:
+            raise HTTPException(status_code=422, detail="model required")
+        try:
+            result = await kernel.apply_ai_config(backend=backend, model=model)
+        except (ConfigError, VaultError, DataError, AgentError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "ai": result})
+
     def _broker_request(
         body: dict[str, Any],
     ) -> tuple[str, bool, dict[str, str] | None, dict[str, object]]:
