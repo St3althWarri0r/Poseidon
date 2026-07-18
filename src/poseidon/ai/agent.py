@@ -99,6 +99,13 @@ class ClaudeAgent:
         """The shared chat backend (read-only) — used by the reflection loop."""
         return self._backend
 
+    def rebind_backend(self, backend: ChatBackend) -> None:
+        """Point the frozen backend ref at a new object on a live model/backend
+        swap. The kernel calls this under its ``_cycle_lock`` (never mid-cycle),
+        so ``run_cycle`` always completes on one backend; it deliberately avoids
+        re-running ``_wire_ai`` (which would double-subscribe reflection)."""
+        self._backend = backend
+
     def last_cycle_usage(self) -> dict[str, int]:
         """Tokens accumulated during the most recent cycle — readable even when
         the cycle aborted before producing a Decision, so already-billed usage

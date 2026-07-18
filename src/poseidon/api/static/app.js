@@ -16,6 +16,15 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// Pure view-logic for the Alpaca paper⇄live account toggle (broker_toggle.js,
+// loaded before this script). Kept separate so a node unit test can cover it.
+const { brokerBadge, brokerAccountOptions } = window.PoseidonBrokerToggle;
+
+// Pure view-logic for the AI-brain (backend + model) selector (model_selector.js,
+// loaded before this script). Kept separate so a node unit test can cover it.
+const { vramHintText, modelOptions, currentLabel, precondition, chosenModel } =
+  window.PoseidonModelSelector;
+
 async function errDetail(res, url) {
   // Surface the server's explanation (FastAPI puts it in .detail) instead of
   // a bare status code — "limit orders need a limit_price" beats "422".
@@ -55,7 +64,7 @@ const VIEWS = {
   portfolio:   { title: "Portfolio",   refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshOrders(), refreshExitPlans()]) },
   algorithms:  { title: "Algorithms",  refresh: () => Promise.allSettled([refreshStatus(), refreshAlgorithms()]) },
   ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage(), refreshChat()]) },
-  account:     { title: "Account",     refresh: () => Promise.allSettled([refreshStatus(), refreshAccount()]) },
+  account:     { title: "Account",     refresh: () => Promise.allSettled([refreshStatus(), refreshAccount(), refreshModels()]) },
   dryrun:      { title: "Dry Run",     refresh: () => refreshDryRun() },
   risk:        { title: "Risk",        refresh: () => Promise.allSettled([refreshStatus(), refreshRiskMetrics()]) },
   performance: { title: "Performance", refresh: () => Promise.allSettled([refreshPerformance(), refreshExecution()]) },
@@ -101,6 +110,11 @@ async function refreshStatus() {
   circuit.title = s.risk.circuit_reason || "trading permitted";
   $("#btn-resume").hidden = !s.risk.circuit_open;
   $("#btn-halt").hidden = !!s.risk.circuit_open;
+
+  const bk = $("#pill-broker");
+  const badge = brokerBadge(s.broker);
+  bk.textContent = badge.text;
+  bk.className = badge.cls;
 
   const cycleBtn = $("#btn-cycle");
   cycleBtn.disabled = !!s.cycle_running;
@@ -699,6 +713,7 @@ function connectWebsocket() {
   ws.onmessage = (msg) => {
     let evt;
     try { evt = JSON.parse(msg.data); } catch { return; }
+    window.__debugTap && window.__debugTap(evt);
     const row = document.createElement("div");
     row.className = "evt";
     const summary = typeof evt.payload === "object" && evt.payload
@@ -1304,6 +1319,17 @@ async function refreshAccount() {
     `<div class="kv"><span class="k">Buying power</span><span class="v">${fmtUsd(cur.buying_power)}</span></div>` +
     `<div class="kv"><span class="k">Operating mode</span><span class="v">${esc(data.mode || "")}</span></div>`;
 
+  // Alpaca paper⇄live account toggle: only appears while an env-scoped broker is
+  // active, and lists only the environments whose keys are already in the vault.
+  const envEntry = brokerCatalog.find((b) => b.name === cur.name);
+  const acctModel = brokerAccountOptions(envEntry, cur);
+  $("#acct-account-row").hidden = !acctModel.visible;
+  if (acctModel.visible) {
+    $("#acct-account-select").innerHTML = acctModel.options.map((o) =>
+      `<option value="${esc(o.value)}"${o.selected ? " selected" : ""}>${esc(o.label)}</option>`).join("");
+    $("#acct-account-hint").textContent = acctModel.hint;
+  }
+
   const connectable = brokerCatalog.filter((b) => b.connectable);
   $("#broker-list").innerHTML = connectable.map((b) => `
     <button type="button" class="broker-tile ${selectedBroker === b.name ? "selected" : ""}" data-broker="${esc(b.name)}">
@@ -1329,6 +1355,92 @@ $("#acct-sync").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
     btn.textContent = "Sync now";
+  }
+});
+
+/* ================= AI brain (backend + model) selector ================= */
+// Last GET /api/models body and the backend currently chosen in the card. The
+// card's backend starts on the running one and only changes when the operator
+// clicks a toggle — a Refresh keeps their pending choice.
+let aiModels = null;
+let aiBackend = null;
+
+async function refreshModels() {
+  aiModels = await getJSON("/api/models");
+  if (aiBackend == null) aiBackend = aiModels.current_backend;
+  renderModelCard();
+}
+
+// Pure view-model → DOM. Never posts; just reflects aiModels + aiBackend.
+function renderModelCard() {
+  if (!aiModels) return;
+  $("#ai-current").textContent = currentLabel(aiModels);
+
+  const isAnthropic = aiBackend === "anthropic";
+  $("#ai-backend-anthropic").setAttribute("aria-pressed", String(isAnthropic));
+  $("#ai-backend-local").setAttribute("aria-pressed", String(!isAnthropic));
+  $("#ai-backend-anthropic").classList.toggle("selected", isAnthropic);
+  $("#ai-backend-local").classList.toggle("selected", !isAnthropic);
+
+  const { options } = modelOptions(aiBackend, aiModels);
+  $("#ai-model-select").innerHTML = options.map((o) =>
+    `<option value="${esc(o.value)}"${o.selected ? " selected" : ""}>${esc(o.value)}</option>`).join("");
+
+  const vram = vramHintText(aiBackend, aiModels);
+  const vramEl = $("#ai-vram-hint");
+  vramEl.hidden = !vram;
+  vramEl.textContent = vram;
+
+  $("#ai-cost").hidden = !isAnthropic;
+
+  // Precondition (missing key / unreachable local) → note + disable Apply so a
+  // doomed POST never fires; the server re-checks and 422s regardless.
+  const pre = precondition(aiBackend, aiModels);
+  const warn = $("#ai-precond-warning");
+  warn.hidden = !pre.blocked;
+  warn.textContent = pre.note;
+  $("#ai-apply").disabled = pre.blocked;
+}
+
+$("#ai-backend-anthropic").addEventListener("click", () => {
+  aiBackend = "anthropic";
+  $("#ai-model-custom").value = "";
+  renderModelCard();
+});
+$("#ai-backend-local").addEventListener("click", () => {
+  aiBackend = "openai_compatible";
+  $("#ai-model-custom").value = "";
+  renderModelCard();
+});
+
+$("#ai-refresh").addEventListener("click", () => { refreshModels().catch(() => {}); });
+
+$("#ai-apply").addEventListener("click", async () => {
+  const model = chosenModel($("#ai-model-select").value, $("#ai-model-custom").value);
+  if (!model) { toast("Pick or type a model id first", "warn"); return; }
+  const body = { backend: aiBackend, model };
+  // Paid confirm, analogous to the LIVE-broker confirm — switching to the
+  // Claude API starts real per-token billing (mode is unchanged either way).
+  if (aiBackend === "anthropic" && !window.confirm(
+      `Switch the AI brain to the paid Claude API (${model})?\n\n` +
+      "Claude API calls are billed per token; the local model is free. " +
+      "This does not change your operating mode.")) return;
+  const btn = $("#ai-apply");
+  btn.disabled = true;
+  btn.textContent = "Applying…";
+  try {
+    const res = await postJSON("/api/models", body);
+    const ai = res.ai || {};
+    toast(`AI brain: ${ai.paid ? "Claude API" : "Local"} · ${ai.model}`, ai.paid ? "warn" : "good");
+    $("#ai-model-custom").value = "";
+    aiBackend = ai.backend || aiBackend;
+    refreshModels().catch(() => {});
+    refreshStatus().catch(() => {});
+  } catch (e) {
+    toast("Apply failed: " + String(e.message).slice(0, 250), "bad");
+  } finally {
+    btn.textContent = "Apply";
+    renderModelCard();  // restores disabled per current precondition
   }
 });
 
@@ -1418,6 +1530,41 @@ function updateLiveWarning() {
 }
 $("#bf-paper").addEventListener("change", updateLiveWarning);
 
+// Alpaca account toggle: flip the active environment (paper⇄live) with no key
+// re-entry — a credential-less POST reuses the vault-scoped keys. The confirm
+// here is UX only; the real live guard is server-side in switch_broker
+// (AUTONOMOUS→APPROVAL, unbypassable via any HTTP path).
+$("#acct-account-select").addEventListener("change", async (e) => {
+  const [name, env] = e.target.value.split(":");
+  // "Add …" options aren't a switch — reveal the connect form to save keys, and
+  // revert the select back to the true active account.
+  if (env === "add-live" || env === "add-paper") {
+    selectBroker(name);
+    const box = $("#bf-paper");
+    box.checked = env === "add-paper";
+    updateLiveWarning();
+    $("#broker-form").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    refreshAccount().catch(() => {});
+    return;
+  }
+  const paper = env === "paper";
+  if (!paper && !window.confirm(
+      "Switch to your LIVE real-money account?\n\n" +
+      "If trading is Autonomous it drops to Approval — you must deliberately re-enable Autonomous.")) {
+    refreshAccount().catch(() => {}); return;   // declined → revert selection, no-op
+  }
+  try {
+    await postJSON("/api/brokers/connect", { name, paper });   // no credentials → reuse vault
+    toast(paper ? "Switched to Alpaca Paper" : "Switched to Alpaca LIVE", paper ? "good" : "warn");
+  } catch (err) {
+    toast("Switch failed: " + String(err.message).slice(0, 200), "bad");
+    refreshAccount().catch(() => {});
+  }
+  refreshStatus().catch(() => {});
+  refreshAccount().catch(() => {});
+  refreshPortfolio().catch(() => {});
+});
+
 function brokerPayload() {
   const b = brokerCatalog.find((x) => x.name === selectedBroker);
   if (!b) throw new Error("pick a broker first");
@@ -1487,7 +1634,7 @@ $("#broker-form").addEventListener("submit", async (evt) => {
   if (!body.paper && !window.confirm(
       `Switch to your LIVE ${b.display_name} account?\n\nOrders (in approval/autonomous mode) will use real money. ` +
       (b.cost_note ? "\n\nCost note: " + b.cost_note + " " : "") +
-      "The operating mode is not changed by connecting.")) return;
+      "If trading is Autonomous it drops to Approval; otherwise the mode is unchanged.")) return;
   if (body.options && body.options.reset && !window.confirm(
       `Reset the paper simulator to $${Number(body.options.starting_cash).toLocaleString()}?\n\n` +
       "Paper positions and history start over. No real account is affected.")) return;

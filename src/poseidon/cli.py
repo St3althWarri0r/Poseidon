@@ -19,8 +19,10 @@ import sys
 from importlib.resources.abc import Traversable
 from pathlib import Path
 
+import httpx
+
 from . import __version__
-from .core.config import AppConfig, default_config_dir, load_config
+from .core.config import AIConfig, AppConfig, default_config_dir, load_config
 from .core.errors import ConfigError, PoseidonError, VaultError
 from .core.logging import configure_logging
 from .security.vault import Vault
@@ -230,6 +232,51 @@ def cmd_research(args: argparse.Namespace) -> int:
     return asyncio.run(main())
 
 
+def probe_model_backend(
+    ai: AIConfig,
+    api_key: str | None,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[bool, str]:
+    """Reachability liveness probe for the configured model backend.
+
+    Returns ``(ok, detail)``. ``transport`` lets tests inject an
+    ``httpx.MockTransport`` (a fake backend) so no network call is made.
+    Read-only: issues a single GET and never places or triggers any order.
+    """
+    if ai.backend == "openai_compatible":
+        base = (ai.base_url or "").rstrip("/")
+        try:
+            with httpx.Client(timeout=5.0, transport=transport) as c:
+                c.get(f"{base}/models").raise_for_status()
+            return True, f"reachable at {base}"
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # Connect phase failed — nothing is listening. Actionable: start it.
+            return False, (
+                f"unreachable at {base} — start LM Studio / the model server ({exc})"
+            )
+        except httpx.HTTPStatusError as exc:
+            # We connected and got a response, just a bad status (e.g. a running
+            # LM Studio returning 500) — the server is up, don't say "start it".
+            return False, (
+                f"backend reachable at {base} but returned {exc.response.status_code}"
+            )
+        except httpx.HTTPError as exc:
+            # Any other transport-level failure (read timeout, protocol error…).
+            return False, f"backend probe to {base} failed ({exc})"
+    try:  # anthropic: cheap authed liveness
+        with httpx.Client(timeout=5.0, transport=transport) as c:
+            r = c.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": api_key or "", "anthropic-version": "2023-06-01"},
+            )
+        if r.status_code == 401:
+            return False, "Anthropic API reachable but key rejected (401)"
+        return True, "Anthropic API reachable"
+    except httpx.HTTPError as exc:
+        return False, f"cannot reach Anthropic API ({exc})"
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Self-diagnostics: config, vault, calendar, DB, providers, broker, AI key."""
     problems = 0
@@ -268,6 +315,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             names = set(vault.names())
             check("anthropic api key stored", config.ai.api_key_credential in names,
                   config.ai.api_key_credential)
+            key_or_none = (
+                vault.get(config.ai.api_key_credential)
+                if config.ai.backend == "anthropic"
+                and config.ai.api_key_credential in names
+                else None
+            )
+            ok, detail = probe_model_backend(config.ai, key_or_none)
+            check(f"model backend reachable ({config.ai.backend})", ok, detail)
             for provider in config.data.providers:
                 if provider.enabled and provider.credential:
                     check(f"credential '{provider.credential}' (provider {provider.name})",

@@ -103,7 +103,9 @@ _CONNECT_META: dict[str, dict[str, object]] = {
         "notes": "Built-in simulator. Fills are priced from live quotes; no real money moves.",
     },
     "alpaca": {
-        "credential": "alpaca_keys",
+        "credential": "alpaca_keys",            # legacy; kept for migration + back-compat
+        "credential_paper": "alpaca_paper_keys",
+        "credential_live": "alpaca_live_keys",
         "fields": [
             _field("key_id", "API key ID", placeholder="AK..."),
             _field("secret_key", "API secret", secret=True),
@@ -197,6 +199,13 @@ def broker_catalog() -> list[dict[str, object]]:
             entry.update({
                 "credential": meta["credential"],
                 "fields": meta["fields"],
+            })
+            # Per-env credential names (Alpaca paper/live toggle); only present
+            # when a broker distinguishes paper vs live accounts.
+            for env_key in ("credential_paper", "credential_live"):
+                if env_key in meta:
+                    entry[env_key] = meta[env_key]
+            entry.update({
                 "option_fields": meta.get("option_fields", []),
                 "paper_choice": meta["paper_choice"],
                 "notes": meta["notes"],

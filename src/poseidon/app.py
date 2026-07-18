@@ -23,6 +23,7 @@ from .ai.agent import ClaudeAgent
 from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
+from .ai.hardware import DEFAULT_LM_STUDIO_URL, probe_local_models
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
 from .ai.tools import ToolDispatcher
@@ -43,7 +44,14 @@ from .core.config import (
 )
 from .core.container import Container
 from .core.enums import HealthState, TradingMode
-from .core.errors import AgentError, AgentRefusedError, ConfigError, DataError, VaultError
+from .core.errors import (
+    AgentError,
+    AgentRefusedError,
+    BackendUnreachableError,
+    ConfigError,
+    DataError,
+    VaultError,
+)
 from .core.events import EventBus, Topics
 from .data.providers import BUILTIN_PROVIDERS
 from .data.router import DataRouter
@@ -64,6 +72,24 @@ from .strategy.workshop import AlgorithmWorkshop
 from .updater import UpdateService
 
 log = structlog.get_logger(__name__)
+
+_OVERLAY_HEADER = (
+    "# Managed by the Poseidon dashboard (Account view).\n"
+    "# Broker connections chosen in the UI persist here and are merged over\n"
+    "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
+    "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
+)
+
+
+def _env_credential(entry: dict[str, object], paper: bool) -> str:
+    """Vault credential name for a broker's paper/live environment.
+
+    Alpaca is the only broker whose paper and live accounts are distinct with
+    their own API keys; its catalog entry carries ``credential_paper`` and
+    ``credential_live``. When those are absent (every other broker) this falls
+    back to the single ``credential`` name — unchanged behaviour."""
+    env_key = "credential_paper" if paper else "credential_live"
+    return str(entry.get(env_key) or entry.get("credential", ""))
 
 
 class ApplicationKernel:
@@ -142,6 +168,11 @@ class ApplicationKernel:
                 f"audit chain verification FAILED at seq {bad_seq} — the audit log has been "
                 "tampered with or corrupted; refusing to start (see docs/troubleshooting.md)"
             )
+
+        migrated_to = await self._migrate_legacy_alpaca_credential()
+        if migrated_to is not None:
+            log.info("migrated legacy alpaca_keys to env-scoped credential",
+                     credential=migrated_to)
 
         self.router = self._build_router()
         self.broker = await self._build_broker()
@@ -379,8 +410,15 @@ class ApplicationKernel:
         # name) — the dashboard switch must not silently discard them. Form
         # options (paper starting_cash, reset) layer on top.
         existing = next((b for b in self.config.brokers if b.name == name), None)
-        credential = (existing.credential if existing and existing.credential
-                      else str(entry.get("credential", "")))
+        # Credential is ENV-scoped: a matching-env config entry (name + paper +
+        # a saved credential) wins so an operator's custom vault name is kept;
+        # otherwise resolve the catalog's per-env name. Matching by name ALONE
+        # would hand a live switch the paper credential (or vice-versa) whenever
+        # the config holds only the opposite-env entry — a real-money hazard.
+        existing_env = next((b for b in self.config.brokers
+                             if b.name == name and b.paper == paper and b.credential), None)
+        credential = (existing_env.credential if existing_env
+                      else _env_credential(entry, paper))
         merged_options: dict[str, object] = dict(existing.options) if existing else {}
         merged_options.update(options or {})
         return BrokerConfig(name=name, enabled=True, primary=True,
@@ -462,6 +500,21 @@ class ApplicationKernel:
             old = self.broker
             self.broker = new_broker
             self.order_manager.set_broker(new_broker)
+            if not new_broker.is_paper and self.order_manager.mode is TradingMode.AUTONOMOUS:
+                # A real-money account just became the active broker while armed
+                # for autonomous trading. Demote to APPROVAL server-side so a
+                # mis-click (or any HTTP caller) can never auto-execute real
+                # money — the operator must deliberately re-arm Autonomous.
+                # Done HERE, still inside the switch guard (_switching is True so
+                # orders are refused and synced_at is None), so there is no
+                # window where the LIVE broker is live, the pipeline is reopened,
+                # and the mode is still AUTONOMOUS — a concurrent scheduler
+                # decision or guardian exit cannot slip a real order in before
+                # the clamp. Demotion-only: RESEARCH/APPROVAL are never raised,
+                # and a paper switch never clamps the mode. set_mode() writes the
+                # mode.changed audit record; the notify build below still reads
+                # the already-demoted mode string, so it stays accurate.
+                await self.set_mode(TradingMode.APPROVAL)
             await self.sync.set_broker(new_broker)
             self._apply_broker_to_config(cfg)
             # Everything account-scoped belongs to the OLD account. Clear the
@@ -575,18 +628,248 @@ class ApplicationKernel:
                                   "priority": 10, "enabled": True})
             data["providers"] = providers
             existing["data"] = data
-        header = (
-            "# Managed by the Poseidon dashboard (Account view).\n"
-            "# Broker connections chosen in the UI persist here and are merged over\n"
-            "# poseidon.yaml at startup. Delete this file to revert to the main config.\n"
-            "# SECRETS ARE NEVER STORED HERE — credentials live in the encrypted vault.\n"
-        )
+        self._save_overlay(overlay_file, existing)
+
+    def _write_ai_overlay(self, cfg: AIConfig, *, clear_utility: bool = False) -> None:
+        """Persist the dashboard's AI backend/model choice to poseidon.local.yaml
+        (merged over the main config at startup). Mirrors
+        ``_write_broker_overlay``: read the existing overlay (parse error →
+        ConfigError), set only the managed ``ai`` sub-block, atomic-write.
+
+        Secrets never land here — only the backend id, model id, and base_url.
+        The vault credential is referenced by NAME in the base config and is
+        never copied into the overlay.
+
+        ``clear_utility`` writes an explicit ``utility_model: null`` so the
+        startup deep-merge overrides a base ``ai.utility_model``. It is set only
+        when a backend change cleared the (now cross-backend-stale) utility
+        model; on a same-backend model change the key is omitted so a base
+        value survives untouched."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        ai_block: dict[str, object | None] = {
+            "backend": cfg.backend,
+            "model": cfg.model,
+            "base_url": cfg.base_url,
+        }
+        if clear_utility:
+            ai_block["utility_model"] = None
+        existing["ai"] = ai_block
+        self._save_overlay(overlay_file, existing)
+
+    @staticmethod
+    def _save_overlay(overlay_file: Path, existing: dict[str, object]) -> None:
         overlay_file.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write must not leave a truncated overlay that
         # bricks the next startup.
         tmp = overlay_file.with_name(overlay_file.name + ".tmp")
-        tmp.write_text(header + yaml.safe_dump(existing, sort_keys=False), encoding="utf-8")
+        tmp.write_text(_OVERLAY_HEADER + yaml.safe_dump(existing, sort_keys=False),
+                       encoding="utf-8")
         tmp.replace(overlay_file)
+
+    async def _migrate_legacy_alpaca_credential(self) -> str | None:
+        """One-time, idempotent migration of the pre-toggle single
+        ``alpaca_keys`` vault credential to the env-scoped
+        ``alpaca_paper_keys`` / ``alpaca_live_keys`` names the paper/live toggle
+        resolves.
+
+        Fires only when the alpaca BROKER is still configured on the legacy
+        ``alpaca_keys`` name and neither env name exists yet; the credential is
+        COPIED (never moved) into the current-env name and the broker config +
+        overlay are repointed. ``alpaca_keys`` is RETAINED because the Alpaca
+        *data provider* references it as its ``ProviderConfig.credential`` —
+        deleting it would break market data. Returns the new credential name
+        when a migration ran, else ``None`` (nothing to do / already migrated).
+        """
+        if not self.vault.unlocked:
+            return None  # locked vault: can't enumerate names — graceful no-op
+        # Anchor on the alpaca broker still carrying the legacy name; a
+        # data-provider-only ``alpaca_keys`` (no alpaca broker) is NOT migrated,
+        # and an already env-scoped broker is left alone. This is also what tells
+        # us which env (paper/live) the legacy account was, and which overlay
+        # entry to repoint.
+        legacy = next((b for b in self.config.brokers
+                       if b.name == "alpaca" and b.credential == "alpaca_keys"), None)
+        if legacy is None:
+            return None
+        names = set(self.vault.names())
+        if "alpaca_keys" not in names:
+            return None  # nothing to copy from
+        if "alpaca_paper_keys" in names or "alpaca_live_keys" in names:
+            return None  # already env-scoped — idempotent skip
+        target = "alpaca_paper_keys" if legacy.paper else "alpaca_live_keys"
+        # Copy within the vault (secret value never leaves it); legacy retained.
+        await asyncio.to_thread(self.vault.set, target, self.vault.get("alpaca_keys"))
+        migrated = legacy.model_copy(update={"credential": target})
+        self.config.brokers = [migrated if b is legacy else b
+                               for b in self.config.brokers]
+        await asyncio.to_thread(self._persist_migrated_broker_credential, migrated)
+        await self.audit.append("system", "broker.credential_migrated", {
+            "broker": "alpaca", "from": "alpaca_keys", "to": target,
+            "paper": legacy.paper,
+        })
+        return target
+
+    def _persist_migrated_broker_credential(self, cfg: BrokerConfig) -> None:
+        """Repoint the alpaca broker overlay entry's credential NAME, preserving
+        its primary/enabled/paper/options. Unlike ``_write_broker_overlay`` this
+        does NOT force the entry primary — the migration must never change which
+        broker trades. Secrets never land here (only the vault name)."""
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, object] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+        brokers_raw = existing.get("brokers")
+        brokers = [dict(b) for b in brokers_raw if isinstance(b, dict)] \
+            if isinstance(brokers_raw, list) else []
+        others = [b for b in brokers if b.get("name") != cfg.name]
+        if cfg.primary:
+            others = [{**b, "primary": False} for b in others]
+        entry: dict[str, object] = {"name": cfg.name, "enabled": cfg.enabled,
+                                    "primary": cfg.primary, "paper": cfg.paper,
+                                    "credential": cfg.credential}
+        if cfg.options:
+            entry["options"] = dict(cfg.options)
+        existing["brokers"] = [*others, entry]
+        self._save_overlay(overlay_file, existing)
+
+    async def apply_ai_config(self, *, backend: str, model: str) -> dict[str, object]:
+        """Live-swap the portfolio-manager brain between the Claude API and a
+        local LM Studio backend (and/or change the model within one). Config-only:
+        touches ``ai.*``, the overlay, and the backend objects — never the order
+        path, the operating mode, or any secret.
+
+        Ordering mirrors ``switch_broker`` — PROVE the target is usable before
+        touching anything, then commit: switching TO the Claude API requires the
+        anthropic key to already be in the vault, and switching TO local requires
+        the endpoint to be reachable; a bad request raises here with the old
+        backend still live, never half-switching into a dead brain. The swap
+        itself runs under ``_cycle_lock`` so a decision already in flight (a
+        multi-round tool loop holds the lock for its whole duration) finishes
+        entirely on its original backend/model and the swap can never land
+        mid-cycle. The two frozen refs (agent, chat) are rebound via their
+        setters — ``_wire_ai`` is deliberately NOT re-run (it double-subscribes
+        reflection); the reviewer, reflection, and analysis roles auto-follow
+        (they read ``self._backend`` fresh / resolve ``self._utility_backend``
+        via a lambda at call time)."""
+        if self.agent is None or self.chat is None \
+                or self._backend is None or self._utility_backend is None:
+            raise ConfigError("AI is not configured")
+        agent, chat = self.agent, self.chat
+        old_primary: ChatBackend = self._backend
+        old_utility: ChatBackend = self._utility_backend
+
+        base = self.config.ai
+        backend_changed = backend != base.backend
+        base_url = (base.base_url or DEFAULT_LM_STUDIO_URL) \
+            if backend == "openai_compatible" else base.base_url
+        update: dict[str, object | None] = {
+            "backend": backend, "model": model, "base_url": base_url,
+        }
+        if backend_changed:
+            # A stale cross-backend utility id would break the new backend, so
+            # utility follows the primary until the operator re-tiers in YAML.
+            update["utility_model"] = None
+        # Constructing the target runs the AIConfig validator early — a bad
+        # base_url / missing credential name surfaces here, before any swap.
+        target = base.model_copy(update=update)
+
+        # -- Preconditions: prove, THEN commit. This runs BEFORE build_backends
+        #    (which would otherwise raise a raw VaultError from vault.get) and
+        #    before any rebind, so a failure leaves the running backend intact.
+        if backend == "anthropic":
+            if base.api_key_credential not in self.vault.names():
+                raise ConfigError(
+                    "Set your Anthropic API key in the vault first (Account view / "
+                    "poseidon vault set anthropic_api_key) before switching to the "
+                    "Claude API."
+                )
+        else:
+            reachable, _ = await probe_local_models(base_url or DEFAULT_LM_STUDIO_URL)
+            if not reachable:
+                raise ConfigError(
+                    f"LM Studio not reachable at {base_url} — start it and load a "
+                    "model, then retry."
+                )
+
+        paid = backend == "anthropic"
+        # -- The swap, guarded so it can never land mid-cycle. Ordering mirrors
+        #    ``switch_broker``: PROVE (build) -> PERSIST -> only THEN swap the
+        #    in-memory brain. If the persist raises (an unparseable hand-edited
+        #    overlay -> ConfigError, or a filesystem fault in ``_save_overlay``
+        #    -> OSError: disk full / read-only fs / permissions), the freshly
+        #    built but uncommitted backends are closed and a clean error is
+        #    raised with the OLD backend still live — so the caller's 422 never
+        #    lies about a switch that silently happened (which, into the paid
+        #    Claude API, would bill while the UI reported failure). Only after a
+        #    durable persist do we rebind, audit, and — past the lock — notify.
+        async with self._cycle_lock:
+            new_primary, new_utility = build_backends(target, self.vault.get)
+            try:
+                await asyncio.to_thread(self._write_ai_overlay, target,
+                                        clear_utility=backend_changed)
+            except Exception as exc:
+                # Persist failed: nothing is swapped. Drop the proven-but-
+                # uncommitted backends (de-duped for the untiered shared-object
+                # case) and surface an actionable error; ConfigError/VaultError
+                # keep their message, any other fault (OSError from the atomic
+                # write) is wrapped so the route maps it to 422, not a 500.
+                closed_fail: set[int] = set()
+                for b in (new_primary, new_utility):
+                    if id(b) in closed_fail:
+                        continue
+                    closed_fail.add(id(b))
+                    with contextlib.suppress(Exception):
+                        await b.aclose()
+                if isinstance(exc, ConfigError | VaultError):
+                    raise
+                raise ConfigError(f"could not persist the AI config: {exc}") from exc
+            self._backend = new_primary
+            agent.rebind_backend(new_primary)
+            self._utility_backend = new_utility
+            chat.rebind_backend(new_utility)
+            self.config.ai = target
+            await self.audit.append("human", "ai.backend_changed",
+                                    {"backend": backend, "model": model, "paid": paid})
+
+        # -- Close the displaced backends AFTER releasing the lock (mirrors
+        #    shutdown). Skip any object reused as a new backend, and de-dupe the
+        #    untiered shared-object case so it is never closed twice.
+        closed: set[int] = set()
+        for b in (old_primary, old_utility):
+            if b is new_primary or b is new_utility or id(b) in closed:
+                continue
+            closed.add(id(b))
+            with contextlib.suppress(Exception):
+                await b.aclose()
+
+        await self.bus.publish(Topics.NOTIFY, {
+            "level": "warning" if paid else "info",
+            "title": f"AI brain: {'Claude API' if paid else 'Local'} · {model}",
+            "body": (("Trading decisions now run on the paid Claude API — billed per token."
+                      if paid else
+                      "Trading decisions now run on the free local model.")
+                     + " Switching the AI brain does not change your operating mode."),
+        })
+        return {"backend": backend, "model": model, "base_url": base_url, "paid": paid}
 
     # ------------------------------------------------------------------- chat
 
@@ -811,6 +1094,24 @@ class ApplicationKernel:
                 await self._record_ai_usage(
                     self.agent.last_cycle_usage(), "refused",
                     cycle_id=f"refused-{uuid.uuid4().hex[:8]}")
+                return
+            except BackendUnreachableError as exc:
+                # Connect-phase failure: the model backend is down, not erroring.
+                # Degrade exactly like the generic branch below (meter usage, publish,
+                # return — never re-raise) but emit a tailored, actionable hint under a
+                # distinct component so the operator knows the fix. Must precede the
+                # generic branch because BackendUnreachableError subclasses AgentError.
+                log.error("model backend unreachable", error=str(exc))
+                await self._record_ai_usage(
+                    self.agent.last_cycle_usage(), "failed",
+                    cycle_id=f"failed-{uuid.uuid4().hex[:8]}")
+                if self.config.ai.backend == "openai_compatible":
+                    hint = (f"Model backend unreachable at {self.config.ai.base_url} — "
+                            "is LM Studio (or your model server) running?")
+                else:
+                    hint = "Cannot reach the Anthropic API — check your network."
+                await self.bus.publish(Topics.SYSTEM_ERROR,
+                                       {"component": "model_backend", "error": hint})
                 return
             except (AgentError, DataError) as exc:
                 log.error("review cycle failed", error=str(exc))

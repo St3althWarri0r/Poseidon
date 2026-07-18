@@ -24,7 +24,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from ..ai.backends import CURATED_CLAUDE_MODELS
 from ..ai.chat import ChatBusyError
+from ..ai.hardware import DEFAULT_LM_STUDIO_URL, detect_vram, probe_local_models
 from ..brokers.registry import broker_catalog
 from ..core.enums import MarketSession, TradingMode
 from ..core.errors import (
@@ -80,6 +82,27 @@ def build_dryrun_state(*, broker_is_paper: bool, active_broker: str, mode_value:
         "market": {"session": session.value, "is_open": is_open,
                    "opens_hint": None if is_open else "9:30 ET"},
     }
+
+
+def broker_catalog_saved(saved_names: set[str], *, current_name: str) -> list[dict[str, Any]]:
+    """Annotate broker_catalog() with vault-presence flags (pure, testable).
+
+    Every entry gains `credential_saved` (its legacy single credential is in the
+    vault) and `is_current`. Entries that carry env-scoped credential names —
+    only Alpaca today — additionally gain `paper_saved`/`live_saved`, which the
+    toggle dropdown uses to decide which environments are reachable without
+    re-entering keys. Single-credential brokers never grow the env flags.
+    """
+    catalog = broker_catalog()
+    for entry in catalog:
+        cred = str(entry.get("credential", ""))
+        entry["credential_saved"] = bool(cred) and cred in saved_names
+        entry["is_current"] = entry["name"] == current_name
+        for env_key, flag in (("credential_paper", "paper_saved"),
+                              ("credential_live", "live_saved")):
+            if env_key in entry:
+                entry[flag] = str(entry[env_key]) in saved_names
+    return catalog
 
 
 class WebsocketHub:
@@ -577,14 +600,10 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.get("/api/brokers")
     async def brokers() -> JSONResponse:
-        catalog = broker_catalog()
         saved_names: set[str] = set()
         with contextlib.suppress(Exception):
             saved_names = set(kernel.vault.names())
-        for entry in catalog:
-            cred = str(entry.get("credential", ""))
-            entry["credential_saved"] = bool(cred) and cred in saved_names
-            entry["is_current"] = entry["name"] == kernel.broker.name
+        catalog = broker_catalog_saved(saved_names, current_name=kernel.broker.name)
         acct = kernel.portfolio.account
         return JSONResponse({
             "current": {
@@ -602,6 +621,63 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             "brokers": catalog,
             "mode": kernel.order_manager.mode.value,
         })
+
+    @app.get("/api/models")
+    async def models() -> JSONResponse:
+        """Read-only assembly for the AI-brain selector (mirrors GET
+        /api/brokers). Never raises: the local probe and VRAM detection are
+        best-effort (degrade to reachable=false / null), and a locked/erroring
+        vault degrades key_present to false. No secret is ever returned — only
+        the credential *name* is consulted via vault.names()."""
+        ai = kernel.config.ai
+        key_present = False
+        with contextlib.suppress(Exception):
+            key_present = ai.api_key_credential in kernel.vault.names()
+        # base_url is None while running on the Claude API; probe the default
+        # LM Studio endpoint so the selector can still show what local models
+        # are loadable before any switch.
+        reachable, local_models = await probe_local_models(
+            ai.base_url or DEFAULT_LM_STUDIO_URL)
+        vram = await detect_vram()
+        return JSONResponse({
+            "current_backend": ai.backend,
+            "current_model": ai.model,
+            "anthropic": {
+                "models": list(CURATED_CLAUDE_MODELS),
+                "key_present": key_present,
+            },
+            "local": {
+                "reachable": reachable,
+                "models": local_models,
+                "vram": vram,
+            },
+        })
+
+    @app.post("/api/models")
+    async def apply_models(body: dict[str, Any]) -> JSONResponse:
+        """Apply an AI-brain selection (mirrors POST /api/brokers/connect).
+        Config-only: validates the body, then delegates the live swap to
+        ``kernel.apply_ai_config``, which PROVES the target is usable (anthropic
+        key in the vault / local endpoint reachable) BEFORE touching anything and
+        runs the rebind under ``_cycle_lock`` so it can never land mid-cycle — no
+        order path, no mode change, no secret. A precondition/build failure comes
+        back 422 with the old backend still live; the response echoes only the
+        resulting ``ai`` block (backend/model/base_url/paid), never a secret."""
+        backend = str(body.get("backend", "")).strip()
+        if backend not in {"anthropic", "openai_compatible"}:
+            raise HTTPException(
+                status_code=422,
+                detail="backend must be 'anthropic' or 'openai_compatible'")
+        # Custom ids are allowed (a wrong local id surfaces on the next cycle),
+        # but a blank one is not — strip before the emptiness check.
+        model = str(body.get("model", "")).strip()
+        if not model:
+            raise HTTPException(status_code=422, detail="model required")
+        try:
+            result = await kernel.apply_ai_config(backend=backend, model=model)
+        except (ConfigError, VaultError, DataError, AgentError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "ai": result})
 
     def _broker_request(
         body: dict[str, Any],
@@ -651,8 +727,11 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
     @app.post("/api/brokers/connect")
     async def broker_connect(body: dict[str, Any]) -> JSONResponse:
         """Store credentials in the vault, persist the choice, and hot-swap
-        the active broker. The trading mode is untouched — connecting a live
-        account in research mode still cannot place an order."""
+        the active broker. Activating a LIVE account while the mode is
+        AUTONOMOUS demotes it to APPROVAL server-side (in switch_broker, the
+        single choke point) so a mis-click can never arm autonomous real-money
+        trading; RESEARCH/APPROVAL and paper switches leave the mode untouched.
+        Either way, no connect can itself place an order."""
         name, paper, credentials, options = _broker_request(body)
         try:
             result = await kernel.switch_broker(

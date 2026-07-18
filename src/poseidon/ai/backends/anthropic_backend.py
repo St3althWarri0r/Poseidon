@@ -12,7 +12,7 @@ from typing import Any, cast
 import anthropic
 
 from ...core.config import AIConfig
-from ...core.errors import AgentError
+from ...core.errors import AgentError, BackendUnreachableError
 from .base import LLMResponse, StopReason, ToolCall, ToolResult
 
 
@@ -59,7 +59,7 @@ class AnthropicBackend:
         except anthropic.APIStatusError as exc:
             raise AgentError(f"Anthropic API error {exc.status_code}: {exc.message}") from exc
         except anthropic.APIConnectionError as exc:
-            raise AgentError(f"cannot reach Anthropic API: {exc}") from exc
+            raise BackendUnreachableError(f"cannot reach Anthropic API: {exc}") from exc
 
         calls = [ToolCall(b.id, b.name, dict(b.input))
                  for b in resp.content if b.type == "tool_use"]
