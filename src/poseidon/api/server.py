@@ -22,7 +22,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from ..ai.backends import CURATED_CLAUDE_MODELS
 from ..ai.chat import ChatBusyError
+from ..ai.hardware import DEFAULT_LM_STUDIO_URL, detect_vram, probe_local_models
 from ..brokers.registry import broker_catalog
 from ..core.enums import MarketSession, TradingMode
 from ..core.errors import (
@@ -583,6 +585,37 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
             },
             "brokers": catalog,
             "mode": kernel.order_manager.mode.value,
+        })
+
+    @app.get("/api/models")
+    async def models() -> JSONResponse:
+        """Read-only assembly for the AI-brain selector (mirrors GET
+        /api/brokers). Never raises: the local probe and VRAM detection are
+        best-effort (degrade to reachable=false / null), and a locked/erroring
+        vault degrades key_present to false. No secret is ever returned — only
+        the credential *name* is consulted via vault.names()."""
+        ai = kernel.config.ai
+        key_present = False
+        with contextlib.suppress(Exception):
+            key_present = ai.api_key_credential in kernel.vault.names()
+        # base_url is None while running on the Claude API; probe the default
+        # LM Studio endpoint so the selector can still show what local models
+        # are loadable before any switch.
+        reachable, local_models = await probe_local_models(
+            ai.base_url or DEFAULT_LM_STUDIO_URL)
+        vram = await detect_vram()
+        return JSONResponse({
+            "current_backend": ai.backend,
+            "current_model": ai.model,
+            "anthropic": {
+                "models": list(CURATED_CLAUDE_MODELS),
+                "key_present": key_present,
+            },
+            "local": {
+                "reachable": reachable,
+                "models": local_models,
+                "vram": vram,
+            },
         })
 
     def _broker_request(
