@@ -139,6 +139,15 @@ class UpdateService:
                 "body": output[-500:],
             })
             return False
+        # Louder than the desktop toast alone: a WARNING lands in the terminal
+        # and the journal for a headless `poseidon run` service, where a human
+        # watching logs would otherwise miss the toast. The restart stays
+        # user-initiated — we never bounce the engine ourselves.
+        log.warning(
+            "update installed — restart to activate",
+            remote=self.available,
+            restart_cmd="systemctl --user restart poseidon",
+        )
         await self._bus.publish(Topics.NOTIFY, {
             "level": "info", "title": "Update applied",
             "body": "New version installed. Restart the service to activate "

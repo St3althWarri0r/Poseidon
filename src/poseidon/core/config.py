@@ -243,7 +243,7 @@ class UpdateConfig(StrictModel):
     enabled: bool = True
     check_interval_hours: int = Field(default=24, ge=1)
     channel: Literal["git"] = "git"  # self-update via the installed git checkout
-    auto_apply: bool = False  # download+notify by default; apply only when told to
+    auto_apply: bool = True  # self-update on launch by default; restart-gated + --ff-only safe
 
 
 class WatchlistConfig(StrictModel):
