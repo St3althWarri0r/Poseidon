@@ -107,6 +107,14 @@ class ICResult:
     n_periods: int
     ic_by_horizon: dict[int, float | None]
     breadth: int
+    # Appended, keyword-constructed null/split fields (design §4.6, finding-14 discipline):
+    # alpha_mean/alpha_t are None IFF n_periods == 0 (never-evaluated != measured 0.0);
+    # alpha_t_train/alpha_t_test are None when the chronological split is off or n/a.
+    alpha_mean: float | None = None
+    alpha_t: float | None = None
+    alpha_t_train: float | None = None
+    alpha_t_test: float | None = None
+    n_eff: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,6 +184,11 @@ class NullSpec:
     min_n_eff: int = 10              # below this -> verdict "insufficient_data"
 
 
+# Immutable all-defaults singleton used as the `null` default arg (frozen dataclass ->
+# safe to share; a bare `NullSpec()` in the signature trips ruff B008).
+_DEFAULT_NULL = NullSpec()
+
+
 def _shuffled(vals: list[float], seed_key: str) -> list[float]:
     """A copy of `vals` shuffled by `random.Random(seed_key)`. String seeding is
     version-2 (sha512-based): deterministic across runs and platforms and independent
@@ -231,9 +244,37 @@ def _t_stat(series: list[float], n_eff: int) -> float:
     return statistics.fmean(series) / std * math.sqrt(n_eff)
 
 
+_MIN_SPLIT_SAMPLES = 6   # a train/test segment shorter than this -> split n/a
+
+
+def _split_alpha_t(alpha: list[float], *, horizon: int, rebalance_every: int,
+                   train_frac: float) -> tuple[float | None, float | None]:
+    """Chronological train/test split of the EMITTED alpha series (design §4.2).
+    `train_frac <= 0` disables it -> (None, None). Otherwise split at
+    `k = floor(n * train_frac)`: train = alpha[:k]; the test segment drops its first
+    `stride - 1` samples as an embargo (`stride = ceil(horizon / rebalance_every)`) so no
+    test forward window overlaps a train window — with the default `rebalance_every ==
+    horizon` the stride is 1 and nothing is dropped. Each segment is scored by its own
+    `_t_stat` over its own non-overlapping `_effective_n`. If either segment ends shorter
+    than `_MIN_SPLIT_SAMPLES` after the embargo the split is n/a -> (None, None), and the
+    caller falls back to the full-sample verdict — never a silent partial readout."""
+    if train_frac <= 0.0:
+        return None, None
+    n = len(alpha)
+    k = math.floor(n * train_frac)
+    stride = max(1, math.ceil(horizon / max(1, rebalance_every)))
+    train = alpha[:k]
+    test = alpha[k + stride - 1:]
+    if len(train) < _MIN_SPLIT_SAMPLES or len(test) < _MIN_SPLIT_SAMPLES:
+        return None, None
+    t_train = _t_stat(train, _effective_n(len(train), horizon, rebalance_every))
+    t_test = _t_stat(test, _effective_n(len(test), horizon, rebalance_every))
+    return t_train, t_test
+
+
 def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: int,
                     rebalance_every: int, horizons: list[int],
-                    min_cross: int = 5) -> ICResult:
+                    min_cross: int = 5, null: NullSpec = _DEFAULT_NULL) -> ICResult:
     # Defense in depth: a non-positive horizon/rebalance_every/horizons entry would let
     # forward_return index onto a REAL future bar — a silent look-ahead leak, not a
     # crash. The CLI now passes through a user-supplied --horizon, so this can no
@@ -244,9 +285,26 @@ def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: i
             f"horizons >= 1 (got horizon={horizon}, rebalance_every={rebalance_every}, "
             f"horizons={horizons})"
         )
+    # NullSpec is an unvalidated frozen dataclass; the config layer (pydantic) normally
+    # guards its fields, but direct callers can pass nonsense — reject it defensively.
+    if (null.n_seeds < 1 or not (0.0 <= null.train_frac < 1.0)
+            or null.alpha_t_threshold <= 0.0 or null.min_n_eff < 2):
+        raise ValueError(
+            f"evaluate_factor requires NullSpec with n_seeds >= 1, 0 <= train_frac < 1, "
+            f"alpha_t_threshold > 0, and min_n_eff >= 2 (got {null})"
+        )
     calendar = union_calendar(history)
     dates = calendar[::max(1, rebalance_every)]
-    ic, widths = _ic_series(factor, history, dates, horizon, min_cross, calendar)
+    # One cross-section pass feeds both the base IC series and the random-control null,
+    # so factor fns are called once per (date, symbol) and the alpha series stays 1:1.
+    sections = _cross_sections(factor, history, dates, horizon, min_cross, calendar)
+    ic: list[float] = []
+    widths: list[int] = []
+    for sec in sections:
+        v = spearman(sec.vals, sec.fwds)
+        assert v is not None                    # _cross_sections keeps only defined ICs
+        ic.append(v)
+        widths.append(len(sec.vals))
     n = len(ic)
     ic_mean = statistics.fmean(ic) if ic else 0.0
     ic_std = statistics.stdev(ic) if n >= 2 else 0.0
@@ -254,10 +312,19 @@ def evaluate_factor(factor: Factor, history: dict[str, list[Bar]], *, horizon: i
     n_eff = _effective_n(n, horizon, rebalance_every)   # independent (non-overlapping) samples
     t_stat = _t_stat(ic, n_eff)
     hit_rate = sum(1 for x in ic if x > 0) / n if n else 0.0
+    # Random-control null: alpha_t inherits the base series' overlap and gets the SAME
+    # non-overlapping n_eff (design §4.2). alpha_mean/alpha_t are None IFF n_periods == 0.
+    alpha = _alpha_series(sections, ic, n_seeds=null.n_seeds, base_seed=null.base_seed)
+    assert len(alpha) == n                      # every emitted date yields a defined alpha
+    alpha_mean = statistics.fmean(alpha) if alpha else None
+    alpha_t = _t_stat(alpha, n_eff) if alpha else None
+    alpha_t_train, alpha_t_test = _split_alpha_t(
+        alpha, horizon=horizon, rebalance_every=rebalance_every, train_frac=null.train_frac)
     by_h: dict[int, float | None] = {}
     for h in horizons:
         s, _ = _ic_series(factor, history, dates, h, min_cross, calendar)
         by_h[h] = statistics.fmean(s) if s else None
     breadth = int(statistics.median(widths)) if widths else 0
     return ICResult(factor.name, horizon, ic_mean, ic_std, ir, t_stat, hit_rate, n,
-                    by_h, breadth)
+                    by_h, breadth, alpha_mean=alpha_mean, alpha_t=alpha_t,
+                    alpha_t_train=alpha_t_train, alpha_t_test=alpha_t_test, n_eff=n_eff)
