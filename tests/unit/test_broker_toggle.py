@@ -294,6 +294,32 @@ async def test_live_switch_from_autonomous_demotes_to_approval(wired) -> None:
     assert changes == [{"from": "autonomous", "to": "approval"}]
 
 
+async def test_live_switch_demotes_before_pipeline_reopens(wired) -> None:
+    """The demotion must land WHILE the switch is still guarded — before the
+    order pipeline reopens. ``end_broker_switch`` clears ``_switching`` (orders
+    accepted again) and runs before the post-switch ``sync_once`` whose awaits
+    yield the loop; if the mode were still AUTONOMOUS at that instant a
+    concurrent autonomous decision could reach the LIVE broker and auto-submit
+    real money. Capture the mode at the exact moment the pipeline reopens and
+    prove it is already APPROVAL, closing the race window."""
+    make, _audits = wired
+    kernel = await make(TradingMode.AUTONOMOUS)
+    observed: dict[str, object] = {}
+    real_end = kernel.order_manager.end_broker_switch
+
+    def spy_end() -> None:
+        observed["mode_at_reopen"] = kernel.order_manager.mode
+        observed["synced_at_at_reopen"] = kernel.portfolio.synced_at
+        real_end()
+
+    kernel.order_manager.end_broker_switch = spy_end  # type: ignore[method-assign]
+    await kernel.switch_broker("alpaca", paper=False, credentials=None)
+    # Pipeline reopens only after the mode is already demoted and while the
+    # account snapshot is still cleared (synced_at=None ⇒ risk refuses to trade).
+    assert observed["mode_at_reopen"] is TradingMode.APPROVAL
+    assert observed["synced_at_at_reopen"] is None
+
+
 async def test_paper_switch_from_autonomous_leaves_mode(wired) -> None:
     """Activating a PAPER account never clamps the mode — AUTONOMOUS stays, no
     ``mode.changed`` is written."""

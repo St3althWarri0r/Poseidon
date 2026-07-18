@@ -475,6 +475,21 @@ class ApplicationKernel:
             old = self.broker
             self.broker = new_broker
             self.order_manager.set_broker(new_broker)
+            if not new_broker.is_paper and self.order_manager.mode is TradingMode.AUTONOMOUS:
+                # A real-money account just became the active broker while armed
+                # for autonomous trading. Demote to APPROVAL server-side so a
+                # mis-click (or any HTTP caller) can never auto-execute real
+                # money — the operator must deliberately re-arm Autonomous.
+                # Done HERE, still inside the switch guard (_switching is True so
+                # orders are refused and synced_at is None), so there is no
+                # window where the LIVE broker is live, the pipeline is reopened,
+                # and the mode is still AUTONOMOUS — a concurrent scheduler
+                # decision or guardian exit cannot slip a real order in before
+                # the clamp. Demotion-only: RESEARCH/APPROVAL are never raised,
+                # and a paper switch never clamps the mode. set_mode() writes the
+                # mode.changed audit record; the notify build below still reads
+                # the already-demoted mode string, so it stays accurate.
+                await self.set_mode(TradingMode.APPROVAL)
             await self.sync.set_broker(new_broker)
             self._apply_broker_to_config(cfg)
             # Everything account-scoped belongs to the OLD account. Clear the
@@ -522,15 +537,6 @@ class ApplicationKernel:
         except Exception as exc:
             log.warning("first sync after broker switch failed; sync loop will retry",
                         error=str(exc))
-        if not new_broker.is_paper and self.order_manager.mode is TradingMode.AUTONOMOUS:
-            # A real-money account just went active while armed for autonomous
-            # trading. Demote to APPROVAL server-side so a mis-click (or any
-            # HTTP caller) can never auto-execute real money — the operator must
-            # deliberately re-arm Autonomous. Demotion-only: RESEARCH/APPROVAL
-            # are never raised, and a paper switch never clamps the mode.
-            # set_mode() writes the mode.changed audit record; runs before the
-            # notify build below so the notification's mode string is accurate.
-            await self.set_mode(TradingMode.APPROVAL)
         display = new_broker.display_name or new_broker.name
         await self.bus.publish(Topics.NOTIFY, {
             "level": "info" if new_broker.is_paper else "warning",
