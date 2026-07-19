@@ -158,6 +158,27 @@ async def test_require_crypto_no_capable_provider_returns_empty(policy: Freshnes
     assert equity.multi_calls == 0
 
 
+async def test_crypto_capable_provider_returning_empty_fails_over(policy: FreshnessPolicy) -> None:
+    # THE ALPACA BUG: a provider that ADVERTISES CRYPTO (so require=CRYPTO does not
+    # exclude it) but whose batch endpoint silently drops /USD pairs and returns {}
+    # WITHOUT erroring. An empty batch must not count as served — the router fails
+    # over to the next CRYPTO-capable provider (else the crypto screen is starved,
+    # ranked=0 every cycle). ``empty`` is higher priority so it is tried first.
+    empty = FakeBatchProvider(name="alpaca", bars_count=90, crypto=True,
+                              absent=("BTC/USD", "ETH/USD"))
+    good = FakeBatchProvider(name="coinbase", bars_count=90, crypto=True)
+    router = DataRouter([(empty, 10), (good, 20)], policy)
+
+    result = await router.bars_multi(
+        ["BTC/USD", "ETH/USD"], timeframe="1d", limit=90,
+        require=DataCapability.CRYPTO,
+    )
+
+    assert set(result) == {"BTC/USD", "ETH/USD"}  # served by the fallback
+    assert empty.multi_calls == 1  # the empty provider WAS tried first
+    assert good.multi_calls == 1   # ...and failover reached the working one
+
+
 async def test_require_none_equity_path_unchanged(policy: FreshnessPolicy) -> None:
     # require=None (the equity/default path) keeps the capable set byte-identical
     # to today: an equity-only provider still serves the batch.
