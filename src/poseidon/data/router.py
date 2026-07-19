@@ -252,6 +252,19 @@ class DataRouter:
                     log.warning("batch bars provider failed, failing over",
                                 provider=slot.provider.name, error=str(exc))
                     continue
+                if not raw:
+                    # A batch that serves NONE of the requested symbols did not
+                    # actually serve this request — e.g. Alpaca advertises CRYPTO
+                    # (so require=CRYPTO does not exclude it) but its equity batch
+                    # endpoint silently drops /USD pairs and returns {} WITHOUT
+                    # erroring. Accepting that empty as success would short-circuit
+                    # failover and STARVE the crypto screen; instead fail over to
+                    # the next capable provider, then the single-symbol degrade
+                    # path below (Coinbase per-symbol bars). A provider that serves
+                    # even one symbol (partial) is still honored.
+                    log.info("batch bars served nothing, failing over",
+                             provider=slot.provider.name, requested=len(symbols))
+                    continue
                 slot.record_success((time.monotonic() - started) * 1000)
                 return self._sanitize_bars_multi(raw, timeframe)
         # No provider implements bars_multi (all NotImplementedError) or every
