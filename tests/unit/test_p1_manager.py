@@ -374,3 +374,107 @@ async def test_submit_recheck_honors_active_token(stack) -> None:
     assert result.status is OrderStatus.FILLED, (result.status, result.status_reason)
     assert "halted before submit" not in (result.status_reason or "")
     assert submit_calls == [exit_order], "the token-bearing exit never reached the broker"
+
+
+# --- manual trading over a delayed feed (the after-hours reality) --------------
+
+
+async def _delayed_stack(tmp_path, age_seconds: float = 60.0):
+    """The stack, rebuilt with a feed whose quotes are 60s old — DELAYED grade
+    (past real_time_max_age, inside delayed_max_age). After-hours IEX looks
+    exactly like this. The pair of tests below is the contract: the operator's
+    own ticket may trade on it; the AI path may not."""
+    bus = EventBus()
+    router = DataRouter([(FakeProvider(name="feed", age_seconds=age_seconds), 10)], FreshnessPolicy())
+    broker = PaperBroker(credentials={}, options={
+        "starting_cash": "100000", "state_file": str(tmp_path / "paper-delayed.json")})
+    broker.set_quote_fn(lambda s: router.quote(s, allow_delayed=True))
+    await broker.connect()
+    db = Database(tmp_path / "delayed.db")
+    await db.open()
+    audit = AuditLog(db)
+    portfolio = PortfolioState()
+    clock = MarketClock()
+    sync = PortfolioSyncService(broker, portfolio, bus, db, clock)
+    await sync.sync_once()
+    risk = RiskEngine(RiskConfig(news_blackout_minutes_before_econ=0),
+                      portfolio, router, clock, bus)
+    manager = OrderManager(broker, risk, ApprovalQueue(bus), db, audit, bus,
+                           mode=TradingMode.AUTONOMOUS)
+    return {"manager": manager, "db": db, "bus": bus}
+
+
+async def _close_delayed_stack(s) -> None:
+    await s["bus"].close()
+    await s["db"].close()
+
+
+async def test_manual_order_trades_on_delayed_quote(tmp_path) -> None:
+    # The operator at the ticket is looking at the market; a 60s-old reference
+    # quote (after-hours reality on free feeds) must not reject their order.
+    # Every OTHER risk rule still runs — only the freshness bound differs.
+    s = await _delayed_stack(tmp_path)
+    try:
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                          quantity=Decimal("10"), limit_price=Decimal("100.05"),
+                          strategy="manual")
+            result = await s["manager"].submit_manual(order)
+        # FILLED, not merely "not rejected": the paper fill is synchronous and
+        # deterministic here, and the stronger form also catches a stuck-
+        # pending regression that never reaches the broker.
+        assert result.status is OrderStatus.FILLED, result.status_reason
+    finally:
+        await _close_delayed_stack(s)
+
+
+async def test_ai_decision_still_refuses_delayed_quote(tmp_path) -> None:
+    # The discriminating twin: same 60s-old feed, same symbol — the AI path
+    # keeps the live-only gate. Only the human at the ticket may accept
+    # delayed data, because only the human is watching the market.
+    s = await _delayed_stack(tmp_path)
+    try:
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            orders = await s["manager"].execute_decision(make_decision())
+        assert len(orders) == 1
+        assert orders[0].status is OrderStatus.REJECTED_RISK
+        assert "delayed" in (orders[0].status_reason or "")
+    finally:
+        await _close_delayed_stack(s)
+
+
+async def test_manual_order_still_refuses_stale_quote(tmp_path) -> None:
+    # The carve-out accepts DELAYED only. Past delayed_max_age (900s) the
+    # price is dead: sizing and price bands against it would be fiction, so
+    # even the operator's own ticket refuses.
+    s = await _delayed_stack(tmp_path, age_seconds=3600.0)
+    try:
+        with patch.object(MarketClock, "session", return_value=MarketSession.REGULAR):
+            order = Order(symbol="AAPL", side=OrderSide.BUY, order_type=OrderType.LIMIT,
+                          quantity=Decimal("10"), limit_price=Decimal("100.05"),
+                          strategy="manual")
+            result = await s["manager"].submit_manual(order)
+        assert result.status is OrderStatus.REJECTED_RISK
+        assert "stale" in (result.status_reason or "")
+    finally:
+        await _close_delayed_stack(s)
+
+
+async def test_approval_path_validates_strictly_no_manual_carveout(stack) -> None:
+    # Neither the pre-approval gate nor the post-approval re-check may inherit
+    # the manual ticket's delayed-quote carve-out: an approval can sit for
+    # minutes while the human decides, and the re-check exists precisely to
+    # re-anchor the order to live data.
+    stack["manager"].set_mode(TradingMode.APPROVAL)
+    stack["approvals"].wait = AsyncMock(return_value=True)
+    seen: list[bool] = []
+
+    async def spy(order, *, halt_token=None, allow_delayed=False):
+        seen.append(allow_delayed)
+        return  # pass both gates; the strictness of the CALL is the tooth
+
+    stack["risk"].validate_order = spy
+
+    await stack["manager"].execute_decision(make_decision())
+
+    assert seen == [False, False]  # pre-approval gate + post-approval re-check
