@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -146,3 +147,88 @@ async def test_relevant_lessons_respects_inject_flag(db) -> None:
     off = _service(db, backend=FakeBackend([]), fills=_fills(),
                    cfg=ReflectionConfig(inject=False))
     assert await off.relevant_lessons(["SPY"]) == []
+
+
+async def test_reflection_prompt_carries_entry_conviction_and_invalidation(db) -> None:
+    # The stored entry decision's confidence + invalidation must reach the
+    # reflection prompt so lessons can score whether the conviction was earned.
+    payload = json.dumps({"rationale": {
+        "thesis": "momentum breakout", "confidence": 0.85,
+        "invalidation": "loses the 50dma on volume"}})
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("d1", "c1", "buy", payload, "2026-06-01T00:00:00+00:00"))
+    backend = FakeBackend([text_end("Conviction was justified.")])
+    svc = _service(db, backend=backend, fills=_fills())
+    await svc.reflect_episode("SPY")
+    assert await _lesson_count(db) == 1
+    sent = backend.calls[0]["messages"][0]["content"]
+    # Line-anchored: a thesis<->invalidation tuple swap keeps both substrings
+    # present somewhere; anchoring to the labeled lines kills that mutant.
+    assert "Original entry thesis: momentum breakout" in sent
+    assert "Entry conviction: 85%." in sent
+    assert "Stated invalidation: loses the 50dma on volume" in sent
+
+
+async def test_legacy_decision_without_risk_case_still_reflects(db) -> None:
+    # Rationale JSON from before the fields existed: no crash, no noise lines.
+    payload = json.dumps({"rationale": {"thesis": "old style"}})
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("d1", "c1", "buy", payload, "2026-06-01T00:00:00+00:00"))
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_fills())
+    await svc.reflect_episode("SPY")
+    assert await _lesson_count(db) == 1
+    sent = backend.calls[0]["messages"][0]["content"]
+    assert "old style" in sent
+    assert "conviction" not in sent.lower()
+
+
+async def test_out_of_range_confidence_clamps_instead_of_killing(db) -> None:
+    # A junk row (confidence 7) must clamp into the model's [0,1] bounds —
+    # dropping the clamp turns it into a ValidationError swallowed by the
+    # best-effort except, and the lesson is permanently lost (the watermark
+    # has already advanced past the close).
+    payload = json.dumps({"rationale": {"thesis": "t", "confidence": 7}})
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("d1", "c1", "buy", payload, "2026-06-01T00:00:00+00:00"))
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_fills())
+    await svc.reflect_episode("SPY")
+    assert await _lesson_count(db) == 1
+    assert "Entry conviction: 100%." in backend.calls[0]["messages"][0]["content"]
+
+
+async def test_nan_confidence_degrades_without_killing_episode(db) -> None:
+    # NaN passes isinstance and slides through min/max (every comparison is
+    # False) — it must be filtered out, not allowed to fail the episode.
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("d1", "c1", "buy", '{"rationale": {"thesis": "t", "confidence": NaN}}',
+         "2026-06-01T00:00:00+00:00"))
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_fills())
+    await svc.reflect_episode("SPY")
+    assert await _lesson_count(db) == 1
+    assert "conviction" not in backend.calls[0]["messages"][0]["content"].lower()
+
+
+async def test_bool_confidence_is_junk_not_full_conviction(db) -> None:
+    # bool subclasses int; "confidence": true must not fabricate an
+    # "Entry conviction: 100%." line for the lesson writer to judge.
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("d1", "c1", "buy", '{"rationale": {"thesis": "t", "confidence": true}}',
+         "2026-06-01T00:00:00+00:00"))
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_fills())
+    await svc.reflect_episode("SPY")
+    assert await _lesson_count(db) == 1
+    assert "conviction" not in backend.calls[0]["messages"][0]["content"].lower()
