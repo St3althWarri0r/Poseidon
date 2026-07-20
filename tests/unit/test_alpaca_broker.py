@@ -99,3 +99,31 @@ async def test_crypto_order_preserves_already_valid_tif() -> None:
     body = captured["body"]
     assert body["time_in_force"] == "ioc"
     assert "extended_hours" not in body
+
+
+async def test_positions_canonicalize_slashless_crypto_symbols() -> None:
+    # Alpaca /v2/positions returns crypto pairs SLASHLESS ("USDTUSD") while its
+    # own trading/data APIs — and this whole platform — use "USDT/USD". Mapped
+    # raw, the ledger key never matches an exit order or a crypto quote route.
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/v2/positions")
+        return httpx.Response(200, json=[
+            {"symbol": "USDTUSD", "asset_class": "crypto", "qty": "9.985",
+             "avg_entry_price": "1", "market_value": "9.97", "unrealized_pl": "-0.01"},
+            {"symbol": "AAPL", "asset_class": "us_equity", "qty": "10",
+             "avg_entry_price": "100", "market_value": "1000", "unrealized_pl": "0"},
+            {"symbol": "BTCUSD", "asset_class": "us_equity", "qty": "5",
+             "avg_entry_price": "10", "market_value": "50", "unrealized_pl": "0"},
+        ], headers={"content-type": "application/json"})
+
+    broker = AlpacaBroker(credentials=_CREDS)
+    broker._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    positions = await broker.positions()
+
+    assert positions[0].symbol == "USDT/USD"
+    assert positions[0].asset_class is AssetClass.CRYPTO
+    assert positions[1].symbol == "AAPL"  # equities untouched
+    # An equity that merely LOOKS like a pair must stay raw: the guard
+    # keys off the broker's asset_class, never off symbol shape.
+    assert positions[2].symbol == "BTCUSD"
+    assert positions[2].asset_class is AssetClass.EQUITY
