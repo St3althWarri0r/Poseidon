@@ -129,3 +129,88 @@ def test_schema_and_prompt_contracts() -> None:
     # The live-data contract is stated in the system prompt.
     assert "LIVE DATA ONLY" in SYSTEM_PROMPT
     assert "submit_decision exactly once" in SYSTEM_PROMPT
+
+
+INVALIDATION = "close below 172.50 on above-average volume, or the catalyst prints a miss"
+
+_TRADE = {"symbol": "aapl", "asset_class": "equity", "side": "buy",
+          "order_type": "limit", "quantity": "10", "limit_price": "100.50",
+          "stop_price": None, "time_in_force": "day", "strategy": "momentum"}
+
+
+def test_rationale_invalidation_round_trips() -> None:
+    agent = make_agent()
+    decision = agent._parse_decision(
+        {"action": "buy", "trades": [dict(_TRADE)],
+         "rationale": {**RATIONALE, "invalidation": INVALIDATION},
+         "data_gaps": [], "summary": "s"},
+        "cycle5", "m",
+    )
+    assert decision.rationale is not None
+    assert decision.rationale.invalidation == INVALIDATION
+    assert decision.trades  # risk case present -> trades intact
+
+
+def test_missing_invalidation_defaults_empty_and_keeps_trades() -> None:
+    # Decisions stored before the field existed, and weak local models that
+    # omit it, must not void trades: invalidation is advisory context for
+    # reflection and the operator, not execution data.
+    agent = make_agent()
+    decision = agent._parse_decision(
+        {"action": "buy", "trades": [dict(_TRADE)], "rationale": dict(RATIONALE),
+         "data_gaps": [], "summary": "s"},
+        "cycle6", "m",
+    )
+    assert decision.trades and decision.rationale is not None
+    assert decision.rationale.invalidation == ""
+
+
+def test_non_string_invalidation_degrades_to_empty_not_void() -> None:
+    # Execution-relevant malformations void trades; the advisory risk-case
+    # field must never have that power.
+    agent = make_agent()
+    decision = agent._parse_decision(
+        {"action": "buy", "trades": [dict(_TRADE)],
+         "rationale": {**RATIONALE, "invalidation": ["not", "a", "string"]},
+         "data_gaps": [], "summary": "s"},
+        "cycle7", "m",
+    )
+    assert decision.trades and decision.rationale is not None
+    assert decision.rationale.invalidation == ""
+
+
+def test_whitespace_invalidation_normalizes_to_empty() -> None:
+    # Whitespace-only is "not recorded": it must not defeat the
+    # only-render-when-present guards downstream.
+    agent = make_agent()
+    decision = agent._parse_decision(
+        {"action": "hold", "trades": [], "rationale": {**RATIONALE, "invalidation": "   "},
+         "data_gaps": [], "summary": "s"},
+        "cycle8", "m",
+    )
+    assert decision.rationale is not None
+    assert decision.rationale.invalidation == ""
+
+
+def test_schema_requires_invalidation() -> None:
+    rationale_schema = SUBMIT_DECISION_TOOL["input_schema"]["properties"]["rationale"]["anyOf"][0]
+    assert "invalidation" in rationale_schema["properties"]
+    assert "invalidation" in rationale_schema["required"]
+    # Strict tools demand a COMPLETE required list (ai/CLAUDE.md): a property
+    # added without its required entry breaks strict validation at the API
+    # with no local signal. Pin completeness at every hand-maintained level.
+    assert set(rationale_schema["required"]) == set(rationale_schema["properties"])
+    top = SUBMIT_DECISION_TOOL["input_schema"]
+    assert set(top["required"]) == set(top["properties"])
+    trade_schema = top["properties"]["trades"]["items"]
+    assert set(trade_schema["required"]) == set(trade_schema["properties"])
+
+
+def test_system_prompt_carries_sizing_and_risk_case_discipline() -> None:
+    # The conviction-scaled sizing contract: baseline from suggest_position_size,
+    # size expresses confidence, and the armed stop mechanizes the stated
+    # invalidation condition.
+    lower = SYSTEM_PROMPT.lower()
+    assert "position sizing" in lower
+    assert "suggest_position_size" in SYSTEM_PROMPT
+    assert "invalidation" in lower
