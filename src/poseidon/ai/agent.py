@@ -80,6 +80,22 @@ in autonomous mode they execute directly after risk checks — be exactly as car
 Write the rationale for a skeptical human reviewer: concrete, quantified, citing the \
 tool data you actually retrieved (timestamps included where relevant).
 
+## Position sizing and the risk case
+
+Risk is a judgment you make per trade, not a fixed amount. Size expresses conviction: \
+start from suggest_position_size as the volatility-equalized baseline, scale it by your \
+confidence — marginal setups get a fraction of baseline or no trade at all; strong, \
+well-supported setups may scale above it; only an exceptional, asymmetric setup justifies \
+approaching the position-size limit from get_risk_status. A high-risk play is acceptable \
+exactly when the reward case is a multiple of the risk case and max_expected_loss stays \
+survivable — show that arithmetic in risk/reward.
+
+State in rationale.invalidation the OBSERVABLE condition that proves the thesis wrong (a \
+price level, a failed catalyst, a data release), and when it is a price, arm stop_loss at \
+that level. Your confidence is recorded with the decision and scored against the realized \
+outcome once the position closes: overconfident losers and underconfident winners both \
+come back to you as lessons.
+
 The stop_loss and take_profit you set in an entry's exit plan are ARMED: the position \
 guardian watches them against live quotes between your review cycles and exits when they \
 are hit. Choose them as real, executable levels — not aspirational prose. time_stop \
@@ -411,12 +427,17 @@ class ClaudeAgent:
             try:
                 exit_raw = raw_rationale.get("exit_plan")
                 exit_raw = exit_raw if isinstance(exit_raw, dict) else {}
+                raw_inval = raw_rationale.get("invalidation")
                 rationale = TradeRationale(
                     thesis=raw_rationale.get("thesis", ""),
                     timing=raw_rationale.get("timing", ""),
                     expected_edge=raw_rationale.get("expected_edge", ""),
                     risk=raw_rationale.get("risk", ""),
                     reward=raw_rationale.get("reward", ""),
+                    # Advisory context for reflection/operators: a wrong-typed
+                    # value must degrade to "" rather than void the trades the
+                    # way execution-relevant malformations below do.
+                    invalidation=raw_inval.strip() if isinstance(raw_inval, str) else "",
                     confidence=min(max(float(raw_rationale.get("confidence", 0.0)), 0.0), 1.0),
                     supporting_indicators=list(raw_rationale.get("supporting_indicators", [])),
                     supporting_news=list(raw_rationale.get("supporting_news", [])),
