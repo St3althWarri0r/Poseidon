@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -155,7 +156,7 @@ class ReflectionService:
                 return
             if await self._db.lesson_exists(symbol, ep.entered_at, ep.exited_at):
                 return
-            thesis = await self._entry_thesis(ep.decision_id)
+            thesis, entry_confidence, invalidation = await self._entry_risk_case(ep.decision_id)
             bars = await self._router.bars(_BENCHMARK, timeframe="1d", limit=400)
             bench = benchmark_return(bars, ep.entered_at, ep.exited_at)
             alpha = None if bench is None else ep.realized_return - bench
@@ -165,7 +166,8 @@ class ReflectionService:
                 quantity=ep.quantity, entry_price=ep.entry_price, exit_price=ep.exit_price,
                 entered_at=ep.entered_at, exited_at=ep.exited_at,
                 realized_return=ep.realized_return, alpha=alpha,
-                holding_days=ep.holding_days, thesis=thesis)
+                holding_days=ep.holding_days, thesis=thesis,
+                entry_confidence=entry_confidence, invalidation=invalidation)
             prose = await reflect_on_position(backend, pos, model=self._model, usage=usage)
             if not prose:
                 return
@@ -192,18 +194,37 @@ class ReflectionService:
                 except Exception as exc:
                     log.warning("reflection usage metering failed", error=str(exc))
 
-    async def _entry_thesis(self, decision_id: str) -> str:
+    async def _entry_risk_case(self, decision_id: str) -> tuple[str, float | None, str]:
+        """(thesis, confidence, invalidation) from the stored entry decision.
+
+        Best-effort like the old thesis lookup: legacy rows without the risk-case
+        fields (or with junk in them) yield ("", None, "") shapes rather than
+        failing the episode — reflection proceeds, just without those lines.
+        """
         if not decision_id:
-            return ""
+            return "", None, ""
         row = await self._db.fetch_one(
             "SELECT payload FROM decisions WHERE id = ?", (decision_id,))
         if not row:
-            return ""
+            return "", None, ""
         try:
             rat = json.loads(row[0]).get("rationale")
-            return str(rat.get("thesis", "")) if isinstance(rat, dict) else ""
+            if not isinstance(rat, dict):
+                return "", None, ""
+            raw_conf = rat.get("confidence")
+            # bool subclasses int, and NaN slips through a min/max clamp (every
+            # comparison is False) only to blow up ClosedPosition's ge/le
+            # bounds — both are row junk that must degrade, not kill the
+            # episode.
+            confidence = None
+            if (isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool)
+                    and math.isfinite(raw_conf)):
+                confidence = min(max(float(raw_conf), 0.0), 1.0)
+            raw_inval = rat.get("invalidation")
+            return (str(rat.get("thesis", "")), confidence,
+                    raw_inval.strip() if isinstance(raw_inval, str) else "")
         except Exception:
-            return ""
+            return "", None, ""
 
     async def relevant_lessons(self, symbols: list[str]) -> list[TradeLesson]:
         r = self._config
