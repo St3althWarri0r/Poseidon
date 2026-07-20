@@ -38,7 +38,7 @@ def new_id() -> str:
 
 
 class PoseidonModel(BaseModel):
-    """Base model: mutable with validated assignment (``frozen=False``), strict-ish validation (``extra=\"forbid\"``)."""
+    """Base model: mutable with validated assignment (``frozen=False``), strict-ish validation (``extra="forbid"``)."""
 
     model_config = ConfigDict(frozen=False, extra="forbid", validate_assignment=True)
 
