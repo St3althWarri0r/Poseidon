@@ -38,7 +38,7 @@ def new_id() -> str:
 
 
 class PoseidonModel(BaseModel):
-    """Base model: mutable with validated assignment (``frozen=False``), strict-ish validation (``extra="forbid"``)."""
+    """Base model: mutable with validated assignment (``frozen=False``), strict-ish validation (``extra=\"forbid\"``)."""
 
     model_config = ConfigDict(frozen=False, extra="forbid", validate_assignment=True)
 
@@ -327,6 +327,10 @@ class TradeRationale(PoseidonModel):
     expected_edge: str
     risk: str
     reward: str
+    # The observable condition that proves the thesis wrong (price level,
+    # failed catalyst, data release). Advisory context — defaults empty so
+    # decisions stored before the field existed still parse.
+    invalidation: str = ""
     confidence: float = Field(ge=0.0, le=1.0)
     supporting_indicators: list[str] = Field(default_factory=list)
     supporting_news: list[str] = Field(default_factory=list)
@@ -511,6 +515,10 @@ class ClosedPosition(PoseidonModel):
     alpha: float | None = None
     holding_days: float
     thesis: str = ""
+    # Risk case recorded at entry — None/empty for legacy episodes, so the
+    # reflection prompt only mentions conviction when it was actually stated.
+    entry_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    invalidation: str = ""
 
 
 # --------------------------------------------------------------------------
