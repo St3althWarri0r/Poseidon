@@ -25,6 +25,12 @@ RATIONALE_SCHEMA: dict[str, Any] = {
         "expected_edge": {"type": "string"},
         "risk": {"type": "string", "description": "What can go wrong and how badly"},
         "reward": {"type": "string", "description": "The upside case"},
+        "invalidation": {
+            "type": "string",
+            "description": "The OBSERVABLE condition that proves this thesis wrong — a "
+                           "price level, a failed catalyst, a data release. When it is a "
+                           "price, arm stop_loss at that level to mechanize it.",
+        },
         "confidence": {"type": "number", "description": "0.0-1.0"},
         "supporting_indicators": {"type": "array", "items": {"type": "string"}},
         "supporting_news": {
@@ -47,8 +53,8 @@ RATIONALE_SCHEMA: dict[str, Any] = {
         "alternative_scenarios": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "thesis", "timing", "expected_edge", "risk", "reward", "confidence",
-        "supporting_indicators", "supporting_news", "portfolio_impact",
+        "thesis", "timing", "expected_edge", "risk", "reward", "invalidation",
+        "confidence", "supporting_indicators", "supporting_news", "portfolio_impact",
         "exit_plan", "max_expected_loss", "alternative_scenarios",
     ],
     "additionalProperties": False,
