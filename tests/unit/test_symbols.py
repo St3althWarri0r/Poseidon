@@ -8,6 +8,7 @@ from poseidon.core.enums import AssetClass
 from poseidon.core.errors import PoseidonError, UnsupportedSymbolError
 from poseidon.core.symbols import (
     asset_class_for_symbol,
+    canonical_crypto_pair,
     is_crypto_symbol,
     normalize_crypto_symbol,
 )
@@ -59,3 +60,26 @@ class TestNormalizeCryptoSymbol:
             normalize_crypto_symbol("BTC/USDT")
         assert isinstance(exc_info.value, PoseidonError)
         assert exc_info.value.retryable is False
+
+
+class TestCanonicalCryptoPair:
+    """Broker position feeds return crypto pairs slashless (alpaca /v2/positions:
+    "USDTUSD") while the platform's canonical form is BASE/USD. One position must
+    not split across two ledger keys — that leaves an exit unmatchable by
+    reduce-only and a quote unroutable to the crypto provider."""
+
+    def test_slashless_usd_pair_gains_slash(self) -> None:
+        assert canonical_crypto_pair("USDTUSD") == "USDT/USD"
+        assert canonical_crypto_pair("BTCUSD") == "BTC/USD"
+
+    def test_canonical_form_is_idempotent(self) -> None:
+        assert canonical_crypto_pair("USDT/USD") == "USDT/USD"
+
+    def test_lowercase_is_uppercased(self) -> None:
+        assert canonical_crypto_pair("ethusd") == "ETH/USD"
+
+    def test_shapes_that_cannot_be_split_pass_through(self) -> None:
+        # Never guess: a bare quote, a non-USD suffix, an equity ticker.
+        assert canonical_crypto_pair("USD") == "USD"
+        assert canonical_crypto_pair("AAPL") == "AAPL"
+        assert canonical_crypto_pair("BTCEUR") == "BTCEUR"

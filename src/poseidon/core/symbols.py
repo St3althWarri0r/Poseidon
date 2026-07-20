@@ -54,3 +54,24 @@ def normalize_crypto_symbol(symbol: str) -> str:
             f"(stablecoin/{quote or '?'}-quoted pairs are not)"
         )
     return s
+
+
+def canonical_crypto_pair(symbol: str) -> str:
+    """Canonical ``BASE/QUOTE`` form for a symbol a BROKER already tags as crypto.
+
+    Alpaca's positions endpoint returns crypto pairs slashless (``USDTUSD``)
+    while its trading/data APIs — and this platform's canonical form — use
+    ``USDT/USD``. Mapped raw, one position splits across two ledger keys: the
+    exit order cannot match it (reduce-only sees 0 closable, so the platform
+    refuses the sell as a would-be short) and its quote cannot route to the
+    crypto-capable provider. Slashless BASE+supported-quote forms gain the
+    slash; anything else passes through unchanged — this function never
+    guesses about a shape it cannot split safely.
+    """
+    s = symbol.strip().upper()
+    if "/" in s:
+        return s
+    for quote in SUPPORTED_CRYPTO_QUOTES:
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}/{quote}"
+    return s
