@@ -37,7 +37,8 @@ class AnalysisService:
                  scan: Callable[[str], str] | None = None,
                  record_usage: Callable[[dict[str, int]], Awaitable[None]] | None = None,
                  over_budget: Callable[[], Awaitable[bool]] | None = None,
-                 snapshot_config: SnapshotConfig | None = None) -> None:
+                 snapshot_config: SnapshotConfig | None = None,
+                 fundamentals_context: Callable[[str], Awaitable[str]] | None = None) -> None:
         self._db = db
         self._router = router
         self._config = config
@@ -49,6 +50,9 @@ class AnalysisService:
         self._scan = scan
         self._record_usage = record_usage
         self._over_budget = over_budget
+        # Best-effort per-symbol fundamentals digest for the fundamentals
+        # analyst's desk context (callable seam, like watchlist/scan/over_budget).
+        self._fundamentals_context = fundamentals_context
         self._tasks: set[asyncio.Task[None]] = set()
         # Symbols with an analysis pipeline currently in flight. packet_fresh
         # only sees *written* packets, so without this a sweep tick that fires
@@ -122,8 +126,17 @@ class AnalysisService:
             snap = await build_snapshot(self._router, symbol, config=self._snapshot_config)
             if snap is None:
                 return
-            reports = await run_analysts(backend, snap, context="", scan=self._scan,
-                                         usage=usage)
+            fundamentals_digest = ""
+            if self._fundamentals_context is not None:
+                try:
+                    fundamentals_digest = await self._fundamentals_context(symbol)
+                except Exception as exc:  # best-effort — never sink the pipeline
+                    log.warning("fundamentals context failed", symbol=symbol,
+                                error=str(exc))
+            reports = await run_analysts(
+                backend, snap, context="", scan=self._scan, usage=usage,
+                role_contexts=({"fundamentals": fundamentals_digest}
+                               if fundamentals_digest else None))
             verdict = await run_debate(backend, reports, rounds=self._config.debate_rounds,
                                        usage=usage)
             # A fully degraded run (backend outage: every analyst empty AND the

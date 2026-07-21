@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import signal
 import uuid
@@ -20,13 +21,14 @@ import yaml
 
 from . import __version__
 from .ai.agent import ClaudeAgent
+from .ai.analysis.fundamentals import fundamentals_context
 from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
 from .ai.hardware import DEFAULT_LM_STUDIO_URL, probe_local_models
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
-from .ai.tools import ToolDispatcher
+from .ai.tools import ToolDispatcher, annotate_untrusted
 from .analytics.decay_service import StrategyHealthService
 from .analytics.performance import FillRecord, RoundTrip, build_round_trips, compute_performance
 from .api.server import DashboardServer
@@ -299,6 +301,7 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            fundamentals_config=cfg.ai.fundamentals,
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -312,6 +315,7 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            fundamentals_config=cfg.ai.fundamentals,
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -382,13 +386,16 @@ class ApplicationKernel:
             get_backend=lambda: self._utility_backend,
             watchlist=lambda: self.config.all_watchlist_symbols(),
             audit_append=self.audit.append,
-            # v1: scan=None — no untrusted text flows yet (context=""); wire
-            # ai/tools.py's injection scanner here when the per-role
-            # news/fundamentals retrieval fast-follow lands.
-            scan=None,
+            # Untrusted retrieved text (the per-role desk context) flows through
+            # the shared injection scanner: annotate-never-rewrite.
+            scan=annotate_untrusted,
             record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
             over_budget=self._over_ai_budget,
-            snapshot_config=ai_cfg.snapshot)
+            snapshot_config=ai_cfg.snapshot,
+            # Best-effort fundamentals digest for the fundamentals analyst —
+            # inert ('' with zero router calls) while ai.fundamentals is off.
+            fundamentals_context=functools.partial(
+                fundamentals_context, self.router, config=ai_cfg.fundamentals))
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
