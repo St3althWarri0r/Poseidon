@@ -29,7 +29,7 @@ from ..core.models import (
     TradeRationale,
 )
 from .backends.base import ChatBackend, ToolResult
-from .schemas import ALL_TOOLS
+from .schemas import ALL_TOOLS, DATA_TOOLS, FUNDAMENTALS_TOOLS, SUBMIT_DECISION_TOOL
 from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
@@ -109,6 +109,12 @@ class ClaudeAgent:
         self._backend = backend
         self._dispatcher = dispatcher
         self._cycle_usage: dict[str, int] = {}
+        # Tool catalog: the fundamentals trio joins only when its gate is on;
+        # submit_decision stays LAST exactly once (schemas.ALL_TOOLS order). The
+        # disabled default must BE the module constant — object identity keeps
+        # prior behavior (and the Anthropic prompt-cache prefix) byte-identical.
+        self._tools = ([*DATA_TOOLS, *FUNDAMENTALS_TOOLS, SUBMIT_DECISION_TOOL]
+                       if config.fundamentals.enabled else ALL_TOOLS)
 
     @property
     def backend(self) -> ChatBackend:
@@ -163,7 +169,7 @@ class ClaudeAgent:
             return decision
 
         for iteration in range(self._config.max_tool_iterations):
-            resp = await self._backend.complete(messages, tools=ALL_TOOLS, system=SYSTEM_PROMPT)
+            resp = await self._backend.complete(messages, tools=self._tools, system=SYSTEM_PROMPT)
             self._record_usage(resp.usage)
 
             if resp.stop_reason == "refusal":

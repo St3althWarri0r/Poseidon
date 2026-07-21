@@ -249,3 +249,43 @@ DATA_TOOLS: list[dict[str, Any]] = [
 ]
 
 ALL_TOOLS: list[dict[str, Any]] = [*DATA_TOOLS, SUBMIT_DECISION_TOOL]
+
+# Config-gated fundamentals tools (ai.fundamentals.enabled). Deliberately NOT
+# folded into DATA_TOOLS/ALL_TOOLS: the disabled default must reuse those
+# identical module objects so prior behavior stays byte-identical — agent/chat
+# compose their catalogs from these lists only when the gate is on.
+FUNDAMENTALS_TOOLS: list[dict[str, Any]] = [
+    _simple_tool(
+        "get_fundamentals",
+        "Filed fundamentals for a stock: company overview and recent income/balance/"
+        "cash-flow periods from live providers (SEC EDGAR filed numbers, Alpha Vantage, "
+        "Yahoo overview). Sections a source cannot serve are absent — treat absent as "
+        "unavailable, record it in data_gaps, never derive or estimate a missing figure. "
+        "Numbers are as-reported; the market snapshot remains the source of truth for "
+        "prices.",
+        {"symbol": {"type": "string"}}, ["symbol"],
+    ),
+    _simple_tool(
+        "get_filings",
+        "Recent SEC filings metadata for a stock: form, filed date, report items, and a "
+        "document link — metadata only, never document text. Use it to see WHAT was "
+        "filed and when; cite forms and dates from this result, not remembered contents.",
+        {
+            "symbol": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+        ["symbol", "limit"],
+    ),
+    _simple_tool(
+        "get_insider_transactions",
+        "Recent insider (Form-4-style) transactions for a stock, exactly as reported: "
+        "insider name and title, dates, transaction code, signed share change, and "
+        "price. An empty list means the source reported none — that is a real answer, "
+        "not a data gap.",
+        {
+            "symbol": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+        },
+        ["symbol", "limit"],
+    ),
+]

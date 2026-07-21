@@ -14,7 +14,7 @@ from typing import Any
 
 import structlog
 
-from ..core.config import CycleBudgetConfig, RiskConfig, SnapshotConfig
+from ..core.config import CycleBudgetConfig, FundamentalsConfig, RiskConfig, SnapshotConfig
 from ..core.errors import ConfigError, DataError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
@@ -31,6 +31,7 @@ log = structlog.get_logger(__name__)
 _DATA_TOOL_NAMES = frozenset({
     "get_quote", "get_bars", "get_option_chain", "get_news",
     "get_earnings_calendar", "get_economic_calendar", "get_market_snapshot",
+    "get_fundamentals", "get_filings", "get_insider_transactions",
 })
 
 _SOFT_BUDGET_NOTE = (
@@ -71,13 +72,25 @@ def _scan_injection(text: str) -> str | None:
     return None
 
 
+def annotate_untrusted(text: str) -> str:
+    """Annotate-never-rewrite adapter for untrusted external text flowing into
+    prompts (the ``Callable[[str], str]`` scan seam AnalysisService expects):
+    flagged text gets a prepended warning line, the original text is preserved
+    verbatim, and clean text passes through unchanged."""
+    warning = _scan_injection(text)
+    if warning:
+        return f"[injection warning: {warning}]\n{text}"
+    return text
+
+
 class ToolDispatcher:
     def __init__(self, router: DataRouter, portfolio: PortfolioState, risk: RiskEngine,
                  *, allow_delayed_quotes: bool, benchmark_symbol: str = "SPY",
                  risk_config: RiskConfig | None = None,
                  workshop: AlgorithmWorkshop | None = None,
                  snapshot_config: SnapshotConfig | None = None,
-                 budget: CycleBudgetConfig | None = None) -> None:
+                 budget: CycleBudgetConfig | None = None,
+                 fundamentals_config: FundamentalsConfig | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
@@ -87,6 +100,7 @@ class ToolDispatcher:
         self._workshop = workshop
         self._snapshot_config = snapshot_config or SnapshotConfig()
         self._budget = budget or CycleBudgetConfig()
+        self._fundamentals = fundamentals_config or FundamentalsConfig()  # disabled default
         self.sources_used: set[str] = set()
         # Cumulative serialized tool-output chars this cycle; reset per cycle by
         # ``reset_cycle_budget()`` (the agent calls it alongside sources_used).
@@ -237,6 +251,91 @@ class ToolDispatcher:
             raise DataError(f"no live snapshot available for {symbol}")
         self.sources_used.update(snap.sources)  # provenance → Decision.data_sources
         return snap.payload
+
+    # -- fundamentals tools (config-gated; ai.fundamentals.enabled) ---------------
+
+    _FUNDAMENTALS_DISABLED = {
+        "error": "fundamentals tools are disabled (ai.fundamentals.enabled=false)"
+    }
+
+    def _fundamentals_disabled(self) -> dict[str, Any] | None:
+        """Defense-in-depth for a hallucinated call while the gate is off: the
+        schemas are already absent from the catalogs, but a dict-returning
+        (non-raising) envelope keeps even that case calm — mirrors
+        _tool_list_algorithms' workshop-unavailable envelope."""
+        if not self._fundamentals.enabled:
+            return dict(self._FUNDAMENTALS_DISABLED)
+        return None
+
+    def _annotate(self, item: dict[str, Any], text: str, *, tool: str,
+                  symbol: str) -> None:
+        """Scan untrusted provider text and ANNOTATE the payload item (never
+        rewrite): the injection scan runs on the FULL text before any cap."""
+        warning = _scan_injection(text)
+        if warning:
+            item["injection_warning"] = warning
+            log.warning("fundamentals payload flagged for possible prompt injection",
+                        tool=tool, symbol=symbol)
+
+    async def _tool_get_fundamentals(self, symbol: str) -> dict[str, Any]:
+        disabled = self._fundamentals_disabled()
+        if disabled is not None:
+            return disabled
+        cfg = self._fundamentals
+        report = await self._router.fundamentals(symbol)
+        self.sources_used.add(report.source)  # provenance → Decision.data_sources
+        payload: dict[str, Any] = report.model_dump(mode="json")  # Decimal → exact str
+        overview = payload.get("overview")
+        if isinstance(overview, dict):
+            untrusted = "\n".join(
+                str(overview.get(field) or "")
+                for field in ("name", "sector", "industry", "description"))
+            self._annotate(overview, untrusted, tool="get_fundamentals", symbol=symbol)
+            description = overview.get("description")
+            if isinstance(description, str) and len(description) > cfg.max_description_chars:
+                # Cap AFTER the full-text scan so a payload split across the
+                # boundary can never dodge the detector (get_news precedent).
+                overview["description"] = description[: cfg.max_description_chars] + "…"
+        statements = payload.get("statements")
+        if isinstance(statements, list):
+            statements.sort(key=lambda s: str(s.get("fiscal_date_ending", "")), reverse=True)
+            payload["statements"] = statements[: cfg.max_statement_periods]
+        return payload
+
+    async def _tool_get_filings(self, symbol: str, limit: int) -> dict[str, Any]:
+        disabled = self._fundamentals_disabled()
+        if disabled is not None:
+            return disabled
+        bounded = max(1, min(limit, self._fundamentals.max_filings))
+        filings = await self._router.filings(symbol, limit=bounded)
+        out: list[dict[str, Any]] = []
+        for filing in filings[:bounded]:
+            if not out:
+                self.sources_used.add(filing.source)
+            item = filing.model_dump(mode="json")
+            untrusted = "\n".join((filing.description or "", *filing.items))
+            self._annotate(item, untrusted, tool="get_filings", symbol=symbol)
+            out.append(item)
+        return {"filings": out}
+
+    async def _tool_get_insider_transactions(self, symbol: str, limit: int) -> dict[str, Any]:
+        disabled = self._fundamentals_disabled()
+        if disabled is not None:
+            return disabled
+        bounded = max(1, min(limit, self._fundamentals.max_insider))
+        rows = await self._router.insider_transactions(symbol, limit=bounded)
+        if not rows:
+            # A real answer from the source, not a data gap (pinned contract).
+            return {"insider_transactions": [], "note": "none reported by the source"}
+        out: list[dict[str, Any]] = []
+        for tx in rows[:bounded]:
+            if not out:
+                self.sources_used.add(tx.source)
+            item = tx.model_dump(mode="json")
+            self._annotate(item, f"{tx.name}\n{tx.title or ''}",
+                           tool="get_insider_transactions", symbol=symbol)
+            out.append(item)
+        return {"insider_transactions": out}
 
     # -- portfolio / risk tools -----------------------------------------------------
 
