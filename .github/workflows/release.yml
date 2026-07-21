@@ -23,7 +23,7 @@ jobs:
       - name: read version
         id: v
         run: |
-          v="$(sed -n 's/^version = "\\(.*\\)"/\\1/p' pyproject.toml)"
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: create release (idempotent)
         env:
@@ -35,10 +35,10 @@ jobs:
             exit 0
           fi
           awk -v ver="${{ steps.v.outputs.version }}" '
-            $0 ~ "^## \\\\[" ver "\\\\]" {hit=1; next}
-            hit && /^## \\[/ {exit}
+            $0 ~ "^## \\[" ver "\\]" {hit=1; next}
+            hit && /^## \[/ {exit}
             hit {print}
           ' CHANGELOG.md > notes.md
           if ! [ -s notes.md ]; then echo "_No changelog section found for $tag._" > notes.md; fi
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \\
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Poseidon ${{ steps.v.outputs.version }}" --notes-file notes.md
