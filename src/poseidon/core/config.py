@@ -129,6 +129,27 @@ class CycleBudgetConfig(StrictModel):
     hard_cycle_tool_chars: int = Field(default=64000, ge=2000)  # cumulative last-resort backstop
 
 
+class FundamentalsConfig(StrictModel):
+    """Fundamentals, filings & insider data surface for the AI (tools + analyst
+    context).
+
+    OFF by default — the ship-OFF invariant: enabling adds three read-only
+    PM/chat tools (get_fundamentals / get_filings / get_insider_transactions)
+    and the fundamentals analyst's retrieval digest, a new AI-facing surface
+    with live provider cost, so it must be a deliberate operator choice.
+    Advisory only: filed/reported reference data upstream of the PM — it never
+    touches the risk engine or the order path.
+    """
+
+    enabled: bool = False
+    analyst_context: bool = True  # inert while enabled=False (the parent gate)
+    max_statement_periods: int = Field(default=5, ge=1, le=12)
+    max_filings: int = Field(default=10, ge=1, le=20)
+    max_insider: int = Field(default=20, ge=1, le=50)
+    max_description_chars: int = Field(default=600, ge=0)
+    digest_max_chars: int = Field(default=900, ge=200)
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -156,6 +177,9 @@ class AIConfig(StrictModel):
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     # Per-cycle token bounds for the user turn + tool loop (see CycleBudgetConfig).
     budget: CycleBudgetConfig = Field(default_factory=CycleBudgetConfig)
+    # Fundamentals/filings/insider tools + analyst digest (OFF by default; see
+    # FundamentalsConfig).
+    fundamentals: FundamentalsConfig = Field(default_factory=FundamentalsConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses

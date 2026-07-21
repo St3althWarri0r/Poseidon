@@ -12,7 +12,7 @@ at the boundary and coerced, never used internally for money math.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -175,6 +175,138 @@ class EconomicEvent(PoseidonModel):
     previous: str | None = None
     as_of: datetime
     source: str
+
+
+# --------------------------------------------------------------------------
+# Fundamentals / filings / insider (reference data)
+# --------------------------------------------------------------------------
+
+
+class FundamentalsOverview(PoseidonModel):
+    """Company overview from a fundamentals provider (reference data).
+
+    Money-like magnitudes are Decimal end to end; dimensionless ratios stay
+    float, matching the :class:`EarningsEvent` estimate-field precedent. An
+    absent field means the source did not serve that figure — it is never
+    derived or estimated locally.
+    """
+
+    name: str | None = None
+    sector: str | None = None
+    industry: str | None = None
+    description: str | None = None
+    market_cap: Money | None = None
+    revenue_ttm: Money | None = None
+    eps_ttm: Money | None = None
+    analyst_target: Money | None = None
+    shares_outstanding: Decimal | None = None
+    pe_ratio: float | None = None
+    forward_pe: float | None = None
+    peg_ratio: float | None = None
+    price_to_book: float | None = None
+    ev_to_ebitda: float | None = None
+    profit_margin: float | None = None
+    operating_margin: float | None = None
+    return_on_equity: float | None = None
+    dividend_yield: float | None = None
+    beta: float | None = None
+
+
+class StatementPeriod(PoseidonModel):
+    """One reported income/balance/cash-flow period, as filed.
+
+    ``items`` maps canonical line-item names (revenue, net_income,
+    total_assets, ...) to the exact reported Decimals. ``filed`` is the date
+    the figures became public knowledge where the source states it (SEC EDGAR
+    does; Alpha Vantage does not).
+    """
+
+    period: str  # "annual" | "quarterly"
+    fiscal_date_ending: date
+    filed: date | None = None
+    form: str | None = None  # e.g. "10-K" / "10-Q" where the source states it
+    currency: str | None = None
+    items: dict[str, Decimal] = Field(default_factory=dict)
+
+
+# Conservative publication lag assumed when a source has no ``filed`` date: a
+# period only becomes knowable 90 days after its fiscal end, so a backtest can
+# never see a figure before the market plausibly could.
+_UNFILED_KNOWABLE_LAG_DAYS = 90
+
+
+class FundamentalsReport(PoseidonModel):
+    """Filed/reported fundamentals for one symbol: overview + statement periods."""
+
+    symbol: str
+    overview: FundamentalsOverview | None = None
+    statements: list[StatementPeriod] = Field(default_factory=list)
+    as_of: datetime
+    source: str
+
+    @field_validator("symbol")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.strip().upper()
+
+    def as_known_at(self, cutoff: date) -> FundamentalsReport:
+        """Point-in-time slice: drop statement periods not yet knowable at
+        ``cutoff``. A period is knowable at its ``filed`` date, or at
+        ``fiscal_date_ending`` + 90 days when the source published no filed
+        date (lookahead guard for research/backtests). Pure — returns a new
+        report and leaves this one untouched."""
+        kept = [
+            p for p in self.statements
+            if (p.filed if p.filed is not None
+                else p.fiscal_date_ending + timedelta(days=_UNFILED_KNOWABLE_LAG_DAYS)) <= cutoff
+        ]
+        return self.model_copy(update={"statements": kept})
+
+
+class Filing(PoseidonModel):
+    """SEC filing metadata — form, dates, items, and a document link. Never
+    fetched document text (metadata + links only)."""
+
+    symbol: str
+    form: str
+    filed: date
+    accession: str
+    description: str | None = None
+    items: list[str] = Field(default_factory=list)
+    period_end: date | None = None
+    url: str | None = None
+    as_of: datetime
+    source: str
+
+    @field_validator("symbol")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.strip().upper()
+
+
+class InsiderTransaction(PoseidonModel):
+    """One reported insider (Form-4-style) transaction, exactly as published.
+
+    ``shares_changed`` is signed: positive = acquired, negative = disposed.
+    Raw reported data only — no scoring or aggregation; interpretation is the
+    reader's job.
+    """
+
+    symbol: str
+    name: str
+    title: str | None = None
+    transaction_date: date | None = None
+    filing_date: date | None = None
+    code: str | None = None
+    shares_changed: Decimal | None = None
+    price: Money | None = None
+    as_of: datetime
+    source: str
+
+    @field_validator("symbol")
+    @classmethod
+    def _upper(cls, v: str) -> str:
+        return v.strip().upper()
 
 
 # --------------------------------------------------------------------------
