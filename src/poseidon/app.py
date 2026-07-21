@@ -299,6 +299,9 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            # Data-only view of the ACTIVE broker's per-order caps (a callable
+            # so a broker hot-swap is reflected without rebuilding dispatchers).
+            broker_limits=lambda: self.broker.order_limits(),
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -312,6 +315,7 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            broker_limits=lambda: self.broker.order_limits(),
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
