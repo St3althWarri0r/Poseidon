@@ -4,7 +4,55 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
-## [Unreleased] — 2.13.0 candidate
+## [2.14.0] — 2026-07-20
+
+### Fixed — manual trading unblocked (#27)
+
+- **Crypto position canonicalization.** Alpaca's positions feed returns crypto
+  pairs slashless (`USDTUSD`) while orders, quotes, and risk matching use the
+  canonical `USDT/USD` — one real position split across two ledger keys, so
+  reduce-only refused its exit as a would-be short and its quote misrouted as
+  an equity ticker and failed on every provider. Positions are now
+  canonicalized at the broker seam, gated on the broker's own asset class
+  (an equity that merely looks like a pair stays raw).
+- **Manual delayed-quote carve-out.** The operator's dashboard ticket may
+  validate against a DELAYED (≤ `delayed_max_age_seconds`, 15 min) reference
+  quote — the after-hours reality on free feeds. STALE always refuses, every
+  other risk rule runs unchanged, and the AI cycle, approval re-check, and
+  guardian halt-flatten keep the strict live-only gate (each pinned by tests).
+  The accepted quote's freshness/source/as_of are recorded in the
+  `order.manual_submitted` audit entry.
+
+### Added — per-trade risk case (#26)
+
+- `submit_decision`'s rationale gains a required **invalidation** field: the
+  observable condition that proves the thesis wrong, mechanized by the armed
+  stop-loss when it is a price. Advisory — missing/malformed values degrade to
+  empty and can never void trades.
+- **Conviction-scaled sizing** in the PM system prompt: size from the
+  volatility-equalized `suggest_position_size` baseline scaled by confidence;
+  a high-risk play is licensed exactly when the reward case is a multiple of
+  the risk case and the max expected loss stays survivable.
+- **Reflection scores conviction**: closed positions carry their entry
+  confidence and stated invalidation back to the lesson writer (junk-tolerant
+  threading from stored decisions), which judges whether the outcome earned
+  the conviction — overconfident losers and underconfident winners both
+  become lessons.
+
+### Fixed — actionable local-backend errors (#25)
+
+- HTTP 4xx/5xx from the OpenAI-compatible backend now surface the server's own
+  diagnosis (bounded, single-line) in the component-error notification, and
+  known context-overflow signatures (LM Studio/llama.cpp/OpenAI/vLLM
+  phrasings) append a copy-pasteable remedy naming the configured model.
+
+### Added — release automation
+
+- Pushing a version bump to `main` now auto-tags and publishes the GitHub
+  release, using the matching changelog section as the release notes
+  (`.github/workflows/release.yml`).
+
+## [2.13.0] — 2026-07-18
 
 ### Added — market screener (widen the live trading universe; OFF by default)
 
