@@ -258,3 +258,65 @@ async def test_gather_no_covered_pair_raises() -> None:
         await gather_correlation_matrix(
             router,  # type: ignore[arg-type]
             ["AAPL", "MSFT"], window_days=40, method="pearson", min_overlap=3)
+
+
+# ------------------------------------------------------ dispatcher tool surface
+
+
+def _dispatcher(router: _Router, pm_tools: Any = None) -> Any:
+    from poseidon.ai.tools import ToolDispatcher
+
+    return ToolDispatcher(router, None, None,  # type: ignore[arg-type]
+                          allow_delayed_quotes=True, pm_tools=pm_tools)
+
+
+async def test_tool_disabled_by_default_returns_error_envelope() -> None:
+    import json
+
+    router = _Router({})
+    out, is_error = await _dispatcher(router).dispatch(
+        "compute_correlation_matrix", {"symbols": ["AAPL", "MSFT"]})
+    assert is_error is True
+    assert "disabled" in json.loads(out)["error"]
+    assert router.calls == []  # gated off: no fetch is ever attempted
+
+
+async def test_tool_caps_symbols_before_fetching() -> None:
+    import json
+
+    from poseidon.core.config import PMToolsConfig
+
+    d0 = date(2026, 1, 5)
+    series = _closes_from_returns(d0, 100.0, [0.01, -0.02, 0.03, 0.01, -0.01])
+    router = _Router({
+        "AAPL": _bars_for("AAPL", series),
+        "MSFT": _bars_for("MSFT", [(d, c * 2.0) for d, c in series]),
+        "NVDA": _bars_for("NVDA", [(d, c * 3.0) for d, c in series]),
+    })
+    pm = PMToolsConfig(correlation=True, correlation_max_symbols=2,
+                       correlation_window_days=40, correlation_min_overlap=3)
+    out, is_error = await _dispatcher(router, pm).dispatch(
+        "compute_correlation_matrix", {"symbols": ["AAPL", "MSFT", "NVDA"]})
+    assert is_error is False
+    payload = json.loads(out)
+    fetched = {s for call in router.calls for s in call["symbols"]}
+    assert fetched == {"AAPL", "MSFT"}  # capped BEFORE any fetch — NVDA never asked
+    assert payload["symbols"] == ["AAPL", "MSFT"]
+    assert "capped" in payload["note_capped"]
+    assert payload["matrix"][0][1] is not None
+    assert "advisory" in payload["note"].lower()
+
+
+async def test_tool_maps_unusable_history_to_data_gap_envelope() -> None:
+    import json
+
+    from poseidon.core.config import PMToolsConfig
+
+    router = _Router({})  # nothing served
+    pm = PMToolsConfig(correlation=True)
+    out, is_error = await _dispatcher(router, pm).dispatch(
+        "compute_correlation_matrix", {"symbols": ["AAPL", "MSFT"]})
+    assert is_error is True
+    payload = json.loads(out)
+    assert "usable" in payload["error"]
+    assert "data_gaps" in payload["instruction"]  # the honest data-gap envelope
