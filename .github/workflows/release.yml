@@ -3,12 +3,14 @@ name: release
 # Auto-tag + publish a GitHub release whenever a version bump lands on main.
 # The release body is the matching "## [X.Y.Z]" section of CHANGELOG.md.
 # Idempotent: if the tag's release already exists, the job exits cleanly, so
-# non-bump edits to pyproject.toml are safe.
+# non-bump edits to pyproject.toml (or to this workflow) are safe.
 
 on:
   push:
     branches: [main]
-    paths: [pyproject.toml]
+    paths:
+      - pyproject.toml
+      - .github/workflows/release.yml
 
 permissions:
   contents: write
@@ -29,7 +31,7 @@ jobs:
         run: |
           tag="v${{ steps.v.outputs.version }}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $tag already exists — nothing to do"
+            echo "release $tag already exists - nothing to do"
             exit 0
           fi
           awk -v ver="${{ steps.v.outputs.version }}" '
