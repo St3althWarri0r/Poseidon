@@ -150,6 +150,43 @@ class FundamentalsConfig(StrictModel):
     digest_max_chars: int = Field(default=900, ge=200)
 
 
+class WebReadConfig(StrictModel):
+    """Guarded web-read (``read_url``) tool for the PM/chat.
+
+    OFF by default — the ship-OFF invariant: enabling gives the AI a bounded,
+    SSRF-guarded fetch of PUBLIC pages (https only unless ``allow_http``), a
+    new AI-facing surface that must be a deliberate operator choice. Advisory
+    only: page text is untrusted third-party data upstream of the PM — never
+    instructions, never a live-price source, never near the order path.
+    """
+
+    enabled: bool = False
+    timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    max_bytes: int = Field(default=2_000_000, ge=10_000)  # streamed-body abort cap
+    max_chars: int = Field(default=8000, ge=500)  # per-call extracted-text slice
+    max_redirects: int = Field(default=3, ge=0, le=10)
+    allow_http: bool = False  # plain http:// (still IP-guarded) only if opted in
+
+
+class PMToolsConfig(StrictModel):
+    """Optional research-tool breadth for the PM/chat (all OFF by default).
+
+    Each flag adds one read-only, advisory tool to the AI catalogs: a guarded
+    web read (``read_url``), a view over the platform screener cache
+    (``screen_market``), and a date-aligned correlation matrix
+    (``compute_correlation_matrix``). Advisory only — data upstream of the PM;
+    nothing here touches the risk engine or the order path, and with every
+    flag off the catalogs are byte-identical to today's.
+    """
+
+    web_read: WebReadConfig = Field(default_factory=WebReadConfig)
+    screen_market: bool = False
+    correlation: bool = False
+    correlation_max_symbols: int = Field(default=12, ge=2, le=30)
+    correlation_window_days: int = Field(default=120, ge=30, le=250)
+    correlation_min_overlap: int = Field(default=30, ge=3)
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -180,6 +217,9 @@ class AIConfig(StrictModel):
     # Fundamentals/filings/insider tools + analyst digest (OFF by default; see
     # FundamentalsConfig).
     fundamentals: FundamentalsConfig = Field(default_factory=FundamentalsConfig)
+    # Optional PM research tools: guarded web read, screener view, correlation
+    # matrix (all OFF by default; see PMToolsConfig).
+    pm_tools: PMToolsConfig = Field(default_factory=PMToolsConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses
