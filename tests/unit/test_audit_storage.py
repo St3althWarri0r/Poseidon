@@ -39,6 +39,33 @@ CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_created ON orders(created_at);
 """
 
+# decisions + trade_lessons as they shipped BEFORE the outcome-resolution
+# columns (decisions.resolved_at/resolution, trade_lessons.kind) existed.
+_PRE_OUTCOME_DDL = """
+CREATE TABLE decisions (
+    id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_decisions_created ON decisions(created_at);
+CREATE TABLE trade_lessons (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT '',
+    decision_id TEXT,
+    entered_at TEXT NOT NULL,
+    exited_at TEXT NOT NULL,
+    realized_return REAL NOT NULL,
+    alpha REAL,
+    holding_days REAL NOT NULL,
+    lesson TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def _make_pre_v240_db(path: Path) -> None:
     conn = sqlite3.connect(path)
@@ -137,6 +164,93 @@ async def test_prune_advisory_deletes_only_expired_rows(db: Database) -> None:
     assert [ls.symbol for ls in kept] == ["SPY"]
     packets = await db.recent_packets(["SPY"], refresh_hours=refresh_hours, limit=3, now=now)
     assert [p.symbol for p in packets] == ["SPY"]
+
+
+async def _columns(db: Database, table: str) -> list[str]:
+    rows = await db.fetch_all(f"PRAGMA table_info({table})")
+    return [str(r[1]) for r in rows]
+
+
+async def test_open_migrates_pre_outcome_decisions_and_lessons(tmp_path) -> None:
+    """A pre-outcome-resolution DB gains resolved_at/resolution and kind on
+    open(), with column order IDENTICAL to a fresh DB — recent_lessons reads
+    trade_lessons positionally via SELECT *, so a divergent order on either
+    path silently corrupts every lesson-consuming surface."""
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(_PRE_OUTCOME_DDL)
+    conn.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES ('d-old', 'c1', 'trade', '{}', '2026-01-01T00:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO trade_lessons (id, symbol, strategy, decision_id, entered_at, "
+        "exited_at, realized_return, alpha, holding_days, lesson, model, created_at) "
+        "VALUES ('l-old', 'SPY', 's', 'd-old', '2026-01-01T00:00:00+00:00', "
+        "'2026-01-03T00:00:00+00:00', 0.01, 0.005, 2.0, 'old lesson', 'm', "
+        "'2026-01-03T00:00:00+00:00')")
+    conn.commit()
+    conn.close()
+
+    legacy = Database(path)
+    await legacy.open()
+    fresh = Database(tmp_path / "fresh.db")
+    await fresh.open()
+    try:
+        for table in ("decisions", "trade_lessons"):
+            assert await _columns(legacy, table) == await _columns(fresh, table)
+        assert (await _columns(legacy, "decisions"))[-2:] == ["resolved_at", "resolution"]
+        assert (await _columns(legacy, "trade_lessons"))[-1] == "kind"
+        # Old decisions read back PENDING; old lessons backfill kind='trade'.
+        row = await legacy.fetch_one(
+            "SELECT resolved_at, resolution FROM decisions WHERE id = 'd-old'")
+        assert row == (None, None)
+        row = await legacy.fetch_one("SELECT kind FROM trade_lessons WHERE id = 'l-old'")
+        assert row == ("trade",)
+        kept = await legacy.recent_lessons(
+            ["SPY"], per_symbol=2, global_n=2, lookback_days=365, limit=8,
+            now=datetime(2026, 2, 1, tzinfo=UTC))
+        assert [(ls.id, ls.kind) for ls in kept] == [("l-old", "trade")]
+    finally:
+        await legacy.close()
+        await fresh.close()
+
+
+async def _decision(db: Database, did: str, created_at: str, *,
+                    action: str = "trade") -> None:
+    await db.execute(
+        "INSERT INTO decisions (id, cycle_id, action, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)", (did, "c1", action, "{}", created_at))
+
+
+async def test_unresolved_decisions_filters_order_and_limit(db: Database) -> None:
+    await _decision(db, "d1", "2026-06-01T00:00:00+00:00")
+    await _decision(db, "d2", "2026-06-02T00:00:00+00:00")
+    await _decision(db, "d3", "2026-06-03T00:00:00+00:00")
+    await _decision(db, "d4", "2026-06-10T00:00:00+00:00")  # after `before` cutoff
+    await _decision(db, "d0", "2026-05-01T00:00:00+00:00")  # at/before `after` cutoff
+    await db.mark_decision_resolved(
+        "d2", resolved_at_iso="2026-06-09T00:00:00+00:00",
+        resolution_json='{"status": "executed"}')
+
+    rows = await db.unresolved_decisions(
+        after="2026-05-01T00:00:00+00:00", before="2026-06-05T00:00:00+00:00", limit=10)
+    assert [r[0] for r in rows] == ["d1", "d3"]  # resolved + cutoffs excluded, ASC
+    assert rows[0] == ("d1", "trade", "{}", "2026-06-01T00:00:00+00:00")
+
+    capped = await db.unresolved_decisions(
+        after="2026-05-01T00:00:00+00:00", before="2026-06-05T00:00:00+00:00", limit=1)
+    assert [r[0] for r in capped] == ["d1"]
+
+
+async def test_mark_decision_resolved_round_trips(db: Database) -> None:
+    await _decision(db, "d1", "2026-06-01T00:00:00+00:00")
+    await db.mark_decision_resolved(
+        "d1", resolved_at_iso="2026-06-09T00:00:00+00:00",
+        resolution_json='{"status": "unexecuted", "horizon_trading_days": 5}')
+    row = await db.fetch_one(
+        "SELECT resolved_at, resolution FROM decisions WHERE id = 'd1'")
+    assert row is not None and row[0] == "2026-06-09T00:00:00+00:00"
+    assert row[1] == '{"status": "unexecuted", "horizon_trading_days": 5}'
 
 
 async def test_prune_advisory_never_touches_reader_windows(db: Database) -> None:

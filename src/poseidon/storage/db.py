@@ -82,9 +82,14 @@ CREATE TABLE IF NOT EXISTS decisions (
     cycle_id TEXT NOT NULL,
     action TEXT NOT NULL,
     payload TEXT NOT NULL,          -- full Decision JSON incl. rationale
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,               -- outcome-resolution marker (NULL = pending)
+    resolution TEXT                 -- small status JSON: status + rounded numbers, never prose
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at);
+-- No resolution index: decisions grow one row per review cycle, and the
+-- outcome sweep's created_at range scan is already served by
+-- idx_decisions_created.
 
 CREATE TABLE IF NOT EXISTS equity_marks (
     at TEXT PRIMARY KEY,
@@ -165,7 +170,8 @@ CREATE TABLE IF NOT EXISTS trade_lessons (
     holding_days REAL NOT NULL,
     lesson TEXT NOT NULL,
     model TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'trade'  -- MUST stay the LAST column: read positionally (r[12])
 );
 CREATE INDEX IF NOT EXISTS idx_trade_lessons_symbol ON trade_lessons(symbol, created_at);
 -- Backs the cross-ticker arm of recent_lessons (no symbol equality, so the
@@ -190,7 +196,7 @@ def _row_to_lesson(r: tuple[Any, ...]) -> TradeLesson:
         id=r[0], symbol=r[1], strategy=r[2], decision_id=r[3],
         entered_at=datetime.fromisoformat(r[4]), exited_at=datetime.fromisoformat(r[5]),
         realized_return=r[6], alpha=r[7], holding_days=r[8], lesson=r[9],
-        model=r[10], created_at=datetime.fromisoformat(r[11]))
+        model=r[10], created_at=datetime.fromisoformat(r[11]), kind=r[12])
 
 
 def _row_to_packet(row: Any) -> AnalysisPacket:
@@ -248,6 +254,22 @@ class Database:
             # report. Legacy rows keep '' and drop out of scoped reports.
             await self._conn.execute(
                 "ALTER TABLE orders ADD COLUMN account_scope TEXT NOT NULL DEFAULT ''"
+            )
+        # Outcome-resolution columns. Appended in the exact fresh-DDL order so
+        # migrated and fresh databases agree column-for-column: recent_lessons
+        # reads trade_lessons positionally through SELECT * / _row_to_lesson.
+        if not await self._column_exists("decisions", "resolved_at"):
+            await self._conn.execute(
+                "ALTER TABLE decisions ADD COLUMN resolved_at TEXT"
+            )
+        if not await self._column_exists("decisions", "resolution"):
+            await self._conn.execute(
+                "ALTER TABLE decisions ADD COLUMN resolution TEXT"
+            )
+        if not await self._column_exists("trade_lessons", "kind"):
+            # Pre-taxonomy lessons are all executed-trade reflections.
+            await self._conn.execute(
+                "ALTER TABLE trade_lessons ADD COLUMN kind TEXT NOT NULL DEFAULT 'trade'"
             )
         if not await self._column_exists("strategy_health", "account_scope"):
             # Strategy-health verdicts are account-scoped like the fills that
@@ -350,11 +372,11 @@ class Database:
         await self.execute(
             "INSERT OR REPLACE INTO trade_lessons (id, symbol, strategy, decision_id, "
             "entered_at, exited_at, realized_return, alpha, holding_days, lesson, model, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (lesson.id, lesson.symbol, lesson.strategy, lesson.decision_id,
              lesson.entered_at.isoformat(), lesson.exited_at.isoformat(),
              lesson.realized_return, lesson.alpha, lesson.holding_days,
-             lesson.lesson, lesson.model, lesson.created_at.isoformat()),
+             lesson.lesson, lesson.model, lesson.created_at.isoformat(), lesson.kind),
         )
 
     async def lesson_exists(self, symbol: str, entered_at: datetime,
@@ -390,6 +412,35 @@ class Database:
             picked[r[0]] = _row_to_lesson(r)
         ordered = sorted(picked.values(), key=lambda lsn: lsn.exited_at, reverse=True)
         return ordered[:limit]
+
+    # -- decision outcome resolution (advisory markers; NOT the audit chain) ---
+
+    async def unresolved_decisions(self, *, after: str, before: str,
+                                   limit: int) -> list[tuple[str, str, str, str]]:
+        """Pending decisions in ``(after, before]`` created-order, oldest first.
+
+        ``after`` is the outcome watermark (a static floor: pre-feature history
+        is never scanned) and ``before`` the calendar pre-filter for decisions
+        whose forward bars could exist. Served by ``idx_decisions_created``.
+        """
+        rows = await self.fetch_all(
+            "SELECT id, action, payload, created_at FROM decisions "
+            "WHERE resolved_at IS NULL AND created_at > ? AND created_at <= ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (after, before, limit),
+        )
+        return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+    async def mark_decision_resolved(self, decision_id: str, *, resolved_at_iso: str,
+                                     resolution_json: str) -> None:
+        """Stamp a decision's outcome marker. ``resolution_json`` is a small
+        status JSON (status string + rounded numbers) — never model or thesis
+        prose. A single ``execute`` on purpose: ``db.transaction()`` would
+        self-deadlock on the write lock (see ``transaction``)."""
+        await self.execute(
+            "UPDATE decisions SET resolved_at = ?, resolution = ? WHERE id = ?",
+            (resolved_at_iso, resolution_json, decision_id),
+        )
 
     # -- analysis packets (advisory debate packet; NOT the audit chain) --------
 

@@ -54,3 +54,34 @@ async def test_limit_is_hard_cap(db: Database) -> None:
     out = await db.recent_lessons(
         ["SPY"], per_symbol=10, global_n=10, lookback_days=60, limit=3, now=now)
     assert len(out) == 3
+
+
+async def test_kind_round_trips_and_defaults_to_trade(db: Database) -> None:
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    plain = _lesson("SPY", day=10)  # no kind passed -> model default 'trade'
+    cf = _lesson("QQQ", day=12)
+    cf = cf.model_copy(update={"kind": "counterfactual"})
+    await db.add_trade_lesson(plain)
+    await db.add_trade_lesson(cf)
+    out = await db.recent_lessons(
+        ["SPY", "QQQ"], per_symbol=2, global_n=2, lookback_days=60, limit=8, now=now)
+    kinds = {ls.id: ls.kind for ls in out}
+    # kind survives the positional SELECT * read path (r[12]).
+    assert kinds[plain.id] == "trade" and kinds[cf.id] == "counterfactual"
+
+
+async def test_deterministic_id_add_replaces_not_duplicates(db: Database) -> None:
+    # The cf-/hold-/bias: singleton semantics ride INSERT OR REPLACE: rewriting
+    # the same deterministic id must refresh the row, never mint a second one.
+    now = datetime(2026, 6, 20, tzinfo=UTC)
+    first = _lesson("SPY", day=10).model_copy(
+        update={"id": "cf-abc123", "kind": "counterfactual", "lesson": "v1"})
+    second = first.model_copy(update={"lesson": "v2"})
+    await db.add_trade_lesson(first)
+    await db.add_trade_lesson(second)
+    rows = await db.fetch_all(
+        "SELECT lesson, kind FROM trade_lessons WHERE id = 'cf-abc123'")
+    assert rows == [("v2", "counterfactual")]
+    out = await db.recent_lessons(
+        ["SPY"], per_symbol=2, global_n=2, lookback_days=60, limit=8, now=now)
+    assert [ls.lesson for ls in out if ls.id == "cf-abc123"] == ["v2"]
