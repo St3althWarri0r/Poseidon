@@ -464,6 +464,22 @@ class ResearchConfig(StrictModel):
     n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
+class BacktestEvalConfig(StrictModel):
+    """Evaluation depth for the operator-triggered workshop backtest
+    (dashboard endpoint + audit only — NO AI surface consumes backtests; no
+    backtest tool exists in ``ai/tools.py``). ON by default under the
+    :class:`SnapshotConfig` precedent: zero LLM cost, fully deterministic,
+    and every failure degrades to an explicit null + warning. Each heavy
+    knob is individually disabled by setting it to 0. The benchmark symbol
+    is NOT configured here — the workshop reuses ``risk.benchmark_symbol``."""
+
+    significance_runs: int = Field(default=1000, ge=0, le=20000)  # sign-flip/permutation draws
+    bootstrap_runs: int = Field(default=1000, ge=0, le=20000)  # Sharpe CI resamples
+    monte_carlo_runs: int = Field(default=1000, ge=0, le=20000)  # outcome-distribution paths
+    walk_forward_folds: int = Field(default=3, ge=0, le=10)  # 0 disables the fold spread
+    seed: int = 42  # explicit seed — never wall-clock; mirrors research.null_base_seed
+
+
 class ScreenerConfigBase(StrictModel):
     """Fields shared by every screener (equity + crypto). The :class:`MarketScreener`
     types against this base and is reused verbatim for both universes — the only
@@ -529,6 +545,7 @@ class AppConfig(StrictModel):
     strategy_health: StrategyHealthConfig = Field(default_factory=StrategyHealthConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     crypto_screener: CryptoScreenerConfig = Field(default_factory=CryptoScreenerConfig)
+    backtest: BacktestEvalConfig = Field(default_factory=BacktestEvalConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:

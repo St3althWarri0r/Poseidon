@@ -56,6 +56,24 @@ def _two_symbol_history(days: int = 320) -> dict[str, list[Bar]]:
     return {"A": _bars("A", prices_a), "B": _bars("B", prices_b)}
 
 
+# -- config surface -----------------------------------------------------------
+
+
+def test_backtest_eval_config_defaults_and_app_wiring() -> None:
+    """ON by default under the SnapshotConfig precedent (deterministic, zero
+    LLM cost, operator-facing only); every heavy knob individually
+    disabled by 0; seed explicit and never wall-clock."""
+    from poseidon.core.config import AppConfig, BacktestEvalConfig
+
+    cfg = BacktestEvalConfig()
+    assert (cfg.significance_runs, cfg.bootstrap_runs, cfg.monte_carlo_runs,
+            cfg.walk_forward_folds, cfg.seed) == (1000, 1000, 1000, 3, 42)
+    assert AppConfig().backtest == BacktestEvalConfig()
+    off = BacktestEvalConfig(significance_runs=0, bootstrap_runs=0,
+                             monte_carlo_runs=0, walk_forward_folds=0)
+    assert off.significance_runs == 0 and off.walk_forward_folds == 0
+
+
 # -- direct rebalance: conservation, wipeout, fallback, gating ----------------
 
 
