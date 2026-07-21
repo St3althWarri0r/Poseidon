@@ -1,0 +1,42 @@
+name: release
+
+# Auto-tag + publish a GitHub release whenever a version bump lands on main.
+# The release body is the matching "## [X.Y.Z]" section of CHANGELOG.md.
+# Idempotent: if the tag's release already exists, the job exits cleanly, so
+# non-bump edits to pyproject.toml are safe.
+
+on:
+  push:
+    branches: [main]
+    paths: [pyproject.toml]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: read version
+        id: v
+        run: |
+          v="$(sed -n 's/^version = "\\(.*\\)"/\\1/p' pyproject.toml)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: create release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.v.outputs.version }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists — nothing to do"
+            exit 0
+          fi
+          awk -v ver="${{ steps.v.outputs.version }}" '
+            $0 ~ "^## \\\\[" ver "\\\\]" {hit=1; next}
+            hit && /^## \\[/ {exit}
+            hit {print}
+          ' CHANGELOG.md > notes.md
+          if ! [ -s notes.md ]; then echo "_No changelog section found for $tag._" > notes.md; fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \\
+            --title "Poseidon ${{ steps.v.outputs.version }}" --notes-file notes.md
