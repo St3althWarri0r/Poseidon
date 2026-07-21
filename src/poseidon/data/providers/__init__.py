@@ -15,8 +15,10 @@ from .coinbase_data import CoinbaseDataProvider
 from .finnhub import FinnhubProvider
 from .polygon import PolygonProvider
 from .public_data import PublicDataProvider
+from .sec_edgar import SecEdgarProvider
 from .tradier_data import TradierDataProvider
 from .twelvedata import TwelveDataProvider
+from .yahoo_fundamentals import YahooFundamentalsProvider
 
 BUILTIN_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     PolygonProvider.name: PolygonProvider,
@@ -27,6 +29,8 @@ BUILTIN_PROVIDERS: dict[str, type[MarketDataProvider]] = {
     TradierDataProvider.name: TradierDataProvider,
     PublicDataProvider.name: PublicDataProvider,
     CoinbaseDataProvider.name: CoinbaseDataProvider,
+    SecEdgarProvider.name: SecEdgarProvider,
+    YahooFundamentalsProvider.name: YahooFundamentalsProvider,
 }
 
 __all__ = ["BUILTIN_PROVIDERS"]

@@ -26,6 +26,9 @@ from ..core.models import (
     Bar,
     EarningsEvent,
     EconomicEvent,
+    Filing,
+    FundamentalsReport,
+    InsiderTransaction,
     InstrumentProfile,
     NewsArticle,
     OptionChain,
@@ -58,6 +61,9 @@ class DataCapability(StrEnum):
     SECTOR = "sector"  # company sector/industry taxonomy
     CRYPTO = "crypto"  # spot crypto pairs (BASE/USD); gates crypto quote/bars routing
     PROFILE = "profile"  # instrument identity (company name/exchange/currency)
+    FUNDAMENTALS = "fundamentals"  # filed/reported statements + company overview
+    FILINGS = "filings"  # SEC filing metadata + document links (never document text)
+    INSIDER = "insider"  # reported insider (Form-4-style) transactions
 
 
 class MarketDataProvider(abc.ABC):
@@ -114,6 +120,25 @@ class MarketDataProvider(abc.ABC):
     async def sector(self, symbol: str) -> str:
         """Company sector/industry classification. Raise ProviderError when
         the provider has no classification for the symbol (e.g. ETFs)."""
+        raise NotImplementedError
+
+    async def fundamentals(self, symbol: str) -> FundamentalsReport:
+        """Filed/reported fundamentals: company overview + statement periods.
+        Values are served exactly as reported (Decimal), never derived. Raise
+        ProviderError(retryable=False) when the provider has no fundamentals
+        for the symbol."""
+        raise NotImplementedError
+
+    async def filings(self, symbol: str, *, limit: int = 10) -> list[Filing]:
+        """Recent filing metadata, newest first, bounded by ``limit``.
+        Metadata + document links only — never fetched document text."""
+        raise NotImplementedError
+
+    async def insider_transactions(self, symbol: str, *,
+                                   limit: int = 20) -> list[InsiderTransaction]:
+        """Recent reported insider transactions, newest first, bounded by
+        ``limit``. An empty list means none reported — a real answer, never
+        an error."""
         raise NotImplementedError
 
     async def close(self) -> None:
