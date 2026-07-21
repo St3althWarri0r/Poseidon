@@ -146,10 +146,13 @@ async def test_rebalance_provider_benchmark_ols_and_annuals() -> None:
     bench = report["benchmark"]
     assert bench["symbol"] == "SPY" and bench["source"] == "provider"
     assert "benchmark_fallback_equal_weight" not in report["warnings"]
-    # The book IS the benchmark (up to first-day costs): beta ~ 1, r2 ~ 1.
+    # The book IS the benchmark (up to first-day costs): beta ~ 1, r2 ~ 1,
+    # and the ~zero alpha is flagged as statistically insignificant.
     assert abs(bench["beta"] - 1.0) < 0.05
     assert bench["r2"] > 0.95
     assert abs(bench["alpha_daily"]) < 1e-3
+    assert 0 < abs(bench["t_alpha"]) < 2
+    assert bench["alpha_warning"] == "|t(alpha)|<2 — alpha not statistically significant"
     assert "2023" in bench["annual_returns"]
     # excess is computed from UNROUNDED totals; recomputing from the two
     # rounded payload numbers can differ by one rounding step.
@@ -334,8 +337,29 @@ async def test_workshop_short_window_reports_ols_honesty(tmp_path) -> None:  # n
     bench = report["benchmark"]
     assert bench["n_days"] <= 60
     assert bench["alpha_daily"] is None and bench["beta"] is None
-    assert bench["t_alpha"] is None
+    assert bench["t_alpha"] is None and bench["alpha_warning"] is None
     assert "ols_insufficient_days" in report["run_card"]["warnings"]
+
+
+async def test_workshop_nulls_forced_non_finite_metric_with_warning(
+        tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A non-finite metric must reach the payload as null (never NaN/Inf in
+    JSON) and be counted in an explicit run-card warning."""
+    import poseidon.backtest.rebalance as rebalance_mod
+
+    real = rebalance_mod.rebalance_backtest
+
+    async def poisoned(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        report = await real(*args, **kwargs)
+        report["sharpe"] = float("nan")
+        return report
+
+    monkeypatch.setattr(rebalance_mod, "rebalance_backtest", poisoned)
+    async with _Shop(tmp_path, eval_config=_FAST_EVAL) as ctx:
+        report = await ctx.run()
+    assert report["sharpe"] is None
+    assert "non_finite_values_nulled:1" in report["run_card"]["warnings"]
+    json.dumps(report, allow_nan=False)
 
 
 async def test_workshop_benchmark_fallback_is_reported(tmp_path) -> None:  # noqa: ANN001
