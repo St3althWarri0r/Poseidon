@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import date
 from typing import Any
 
@@ -77,7 +78,8 @@ class ToolDispatcher:
                  risk_config: RiskConfig | None = None,
                  workshop: AlgorithmWorkshop | None = None,
                  snapshot_config: SnapshotConfig | None = None,
-                 budget: CycleBudgetConfig | None = None) -> None:
+                 budget: CycleBudgetConfig | None = None,
+                 broker_limits: Callable[[], dict[str, Any]] | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
@@ -87,6 +89,10 @@ class ToolDispatcher:
         self._workshop = workshop
         self._snapshot_config = snapshot_config or SnapshotConfig()
         self._budget = budget or CycleBudgetConfig()
+        # Read-only DATA about the active broker's hard per-order constraints
+        # (never the broker object itself — tools must stay unable to reach the
+        # order path). A callable so a broker hot-swap is reflected live.
+        self._broker_limits = broker_limits
         self.sources_used: set[str] = set()
         # Cumulative serialized tool-output chars this cycle; reset per cycle by
         # ``reset_cycle_budget()`` (the agent calls it alongside sources_used).
@@ -248,7 +254,13 @@ class ToolDispatcher:
         return state
 
     async def _tool_get_risk_status(self) -> dict[str, Any]:
-        return self._risk.status()
+        status = self._risk.status()
+        if self._broker_limits is not None:
+            # Broker-side per-order caps (e.g. alpaca's $200k crypto notional):
+            # the model must size each single order within them — a larger
+            # position is built across cycles, never in one oversized order.
+            status["broker_limits"] = self._broker_limits()
+        return status
 
     # -- algorithm workshop ------------------------------------------------------
 

@@ -60,6 +60,12 @@ _SIDE_MAP = {
 # time_in_force". A valid crypto TIF is preserved; the rest are remapped to gtc.
 _CRYPTO_TIF = frozenset({TimeInForce.GTC, TimeInForce.IOC, TimeInForce.FOK})
 
+# Alpaca refuses any single crypto order above this notional with HTTP 403
+# code 40310000 "order notional ... exceeds max notional per order 200000"
+# (observed live 2026-07-20). A platform policy, not an account setting. No
+# equity-side cap is hardcoded — none has been verified.
+_CRYPTO_MAX_ORDER_NOTIONAL = Decimal("200000")
+
 
 def _parse_ts(value: str | None) -> datetime:
     if not value:
@@ -149,6 +155,39 @@ class AlpacaBroker(Broker):
                 )
             )
         return result
+
+    def order_limits(self) -> dict[str, Any]:
+        return {
+            "max_order_notional": {"crypto": str(_CRYPTO_MAX_ORDER_NOTIONAL)},
+            "note": ("alpaca refuses any single crypto order (buy OR sell) above "
+                     "$200,000 notional; size each crypto order within the cap. A "
+                     "position larger than the cap must also be EXITED in slices "
+                     "across cycles — plan entries and exits accordingly"),
+        }
+
+    async def preflight(self, order: Order) -> str | None:
+        # Alpaca's crypto per-order notional cap is policy, not transport, so
+        # exceeding it is a DEFINITE refusal — reject pre-submit with the
+        # remedy instead of a late 403. Price the check exactly as alpaca
+        # does: for a limit/stop-limit order the cap is computed off the
+        # LIMIT price (proven from live 403 bodies — notional == qty x limit
+        # to the cent, even when the arrival mid differed), a stop order off
+        # its trigger, a market order off the arrival mid (the closest bound
+        # available). Pricing it conservatively at max(limit, arrival) would
+        # falsely refuse placeable orders — including risk-reducing exits —
+        # which the base contract forbids. An unpriceable order stays None.
+        if order.asset_class is AssetClass.CRYPTO:
+            price = order.limit_price or order.stop_price or order.arrival_price
+            if price is not None:
+                notional = order.quantity * price
+                if notional > _CRYPTO_MAX_ORDER_NOTIONAL:
+                    return (
+                        f"alpaca refuses crypto orders above "
+                        f"${_CRYPTO_MAX_ORDER_NOTIONAL:,.0f} notional per order "
+                        f"(this one is ~${notional:,.0f}); size at or under the cap "
+                        f"and build or unwind the position across cycles"
+                    )
+        return None
 
     async def submit_order(self, order: Order) -> Order:
         # Crypto rejects the equity order fields: the day/opg/cls TIFs return
