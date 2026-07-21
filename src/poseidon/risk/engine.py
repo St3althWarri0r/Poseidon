@@ -173,7 +173,8 @@ class RiskEngine:
 
     # -- validation -------------------------------------------------------------
 
-    async def validate_order(self, order: Order, *, halt_token: object | None = None) -> Quote:
+    async def validate_order(self, order: Order, *, halt_token: object | None = None,
+                             allow_delayed: bool = False) -> Quote:
         """Run every risk rule against live data.
 
         Returns the fresh quote used, so the caller can reuse it (e.g. for
@@ -194,7 +195,10 @@ class RiskEngine:
 
         # Live inputs. Any failure here aborts the order — deliberately no
         # fallbacks to cached or assumed values.
-        quote = await self._router.quote(order.symbol, allow_delayed=False)
+        # allow_delayed is the manual-ticket carve-out: the operator may accept
+        # a DELAYED reference quote; STALE always refuses, and automated
+        # callers (AI cycle, guardian, approvals) keep the default False.
+        quote = await self._router.quote(order.symbol, allow_delayed=allow_delayed)
         order.arrival_price = quote.mid or quote.last  # TCA benchmark price
         bars: list[Bar] = []
         try:

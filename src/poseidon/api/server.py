@@ -412,8 +412,9 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
         is shown (a human about to trade sees the same freshness bar as the
         AI). Outside regular hours a fresh print cannot exist, so the last
         real trade is returned clearly flagged ``reference: true`` — display
-        only; order submission still requires a fresh quote in the risk
-        engine, always."""
+        only; order submission still runs the risk engine's freshness gate
+        (AI and guardian orders require a fresh quote, always; the operator's
+        manual ticket may accept a delayed — never stale — one)."""
         from ..core.enums import MarketSession
         from ..core.errors import StaleDataError
 

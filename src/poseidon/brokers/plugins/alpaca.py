@@ -24,6 +24,7 @@ from ...core.enums import (
 )
 from ...core.errors import BrokerAuthError, BrokerError
 from ...core.models import AccountSnapshot, Fill, Order, Position
+from ...core.symbols import canonical_crypto_pair
 from ..base import Broker
 
 _LIVE = "https://api.alpaca.markets"
@@ -131,9 +132,15 @@ class AlpacaBroker(Broker):
                 "us_option": AssetClass.OPTION,
                 "crypto": AssetClass.CRYPTO,
             }.get(p.get("asset_class", "us_equity"), AssetClass.EQUITY)
+            symbol = p["symbol"]
+            if asset_class is AssetClass.CRYPTO:
+                # /v2/positions returns crypto pairs slashless ("USDTUSD");
+                # orders, quotes, and risk matching all use the canonical
+                # "USDT/USD" — map at the seam so one position has one key.
+                symbol = canonical_crypto_pair(symbol)
             result.append(
                 Position(
-                    symbol=p["symbol"], asset_class=asset_class,
+                    symbol=symbol, asset_class=asset_class,
                     quantity=Decimal(p["qty"]),
                     avg_entry_price=Decimal(p["avg_entry_price"]),
                     market_value=Decimal(p["market_value"]) if p.get("market_value") else None,

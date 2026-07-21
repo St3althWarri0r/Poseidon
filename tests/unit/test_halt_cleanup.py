@@ -319,7 +319,13 @@ class FakeRisk:
         return (token is not None and token is self.token
                 and order.side.is_risk_reducing and not order.legs)
 
-    async def validate_order(self, order: Order, *, halt_token: object | None = None):
+    async def validate_order(self, order: Order, *, halt_token: object | None = None,
+                             allow_delayed: bool = False):
+        # Semantic pin, not signature convenience: the halt-flatten path must
+        # validate strictly — a delayed carve-out there would submit real-book
+        # exits on aged quotes. (Without this assert, merely syncing the stub's
+        # signature would silently erase the strictness pin.)
+        assert allow_delayed is False, "halt-flatten must validate live-only"
         self.validate_calls.append(order)
         if self.circuit.is_open and not (
                 halt_token is not None and self.halt_exit_permitted(order, halt_token)):

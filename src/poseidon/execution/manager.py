@@ -337,8 +337,11 @@ class OrderManager:
     async def submit_manual(self, order: Order) -> Order:
         """A trade the operator entered on the dashboard. The human IS the
         approver, so the approval queue is skipped — but the risk engine is
-        not: manual orders pass every rule, exactly like AI orders. Research
-        mode still refuses (research means no orders, from anyone)."""
+        not: manual orders pass every rule, exactly like AI orders, with ONE
+        deliberate difference — the reference quote may be DELAYED (the
+        operator is watching the market; after-hours free feeds age past the
+        live bound). STALE quotes still refuse. Research mode still refuses
+        (research means no orders, from anyone)."""
         order.strategy = order.strategy or "manual"
         await self._persist(order)
         if self._mode is TradingMode.RESEARCH:
@@ -356,7 +359,7 @@ class OrderManager:
 
     async def _submit_manual_gated(self, order: Order) -> Order:
         try:
-            await self._risk.validate_order(order)
+            quote = await self._risk.validate_order(order, allow_delayed=True)
         except (RiskViolation, CircuitBreakerOpen, DataError) as exc:
             order.status = OrderStatus.REJECTED_RISK
             order.status_reason = str(exc)
@@ -371,6 +374,13 @@ class OrderManager:
         await self._audit.append("human", "order.manual_submitted", {
             "order_id": order.id, "symbol": order.symbol,
             "side": order.side, "qty": str(order.quantity),
+            # The carve-out makes the reference-quote grade variable for manual
+            # orders: record it, or post-incident review cannot distinguish a
+            # delayed-reference trade from a live one (and TCA misreads market
+            # drift since an aged arrival price as execution slippage).
+            "quote_freshness": str(quote.freshness),
+            "quote_source": quote.source,
+            "quote_as_of": quote.as_of.isoformat(),
         })
         return await self._submit(order)
 
