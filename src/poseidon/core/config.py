@@ -37,6 +37,56 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class OutcomeResolutionConfig(StrictModel):
+    """Decision outcome resolution (advisory, OFF by default).
+
+    A scheduled sweep grades decisions that never became trades — HOLDs,
+    risk-vetoed and human-rejected proposals, never-filled orders — at a fixed
+    forward horizon (counted in DAILY BARS, so equity weekends and 24/7 crypto
+    are both exact) and mints counterfactual/hold lessons for the material
+    ones. Purely advisory: resolution markers and lessons never gate the risk
+    engine or touch the order path.
+    """
+
+    enabled: bool = False
+    horizon_trading_days: int = Field(default=5, ge=1, le=60)
+    max_decisions_per_sweep: int = Field(default=25, ge=1, le=200)
+    max_lessons_per_sweep: int = Field(default=3, ge=0)
+    min_abs_alpha: float = Field(default=0.02, ge=0)  # materiality gate for lessons
+    max_age_days: int = Field(default=45, ge=1)  # unresolvable after this many days
+
+    @model_validator(mode="after")
+    def _age_covers_horizon(self) -> OutcomeResolutionConfig:
+        # N trading bars span >= N calendar days (weekends/holidays stretch
+        # them to ~2N): a tighter max_age would age every decision out before
+        # its forward bars can even exist.
+        if self.max_age_days < 2 * self.horizon_trading_days:
+            raise ValueError(
+                f"max_age_days ({self.max_age_days}) must be >= 2 * "
+                f"horizon_trading_days ({self.horizon_trading_days})"
+            )
+        return self
+
+
+class BehaviorConfig(StrictModel):
+    """Behavioral self-assessment (advisory, OFF by default).
+
+    A scheduled deterministic sweep over the platform's own closed round trips
+    computes bias diagnostics (hold-time asymmetry, trade frequency vs marginal
+    PnL, entry-after-runup share, re-entry proximity) and refreshes ONE
+    advisory bias-profile lesson. No LLM is ever involved; flags are advisory
+    prose only and never tune risk, sizing, or cadence.
+    """
+
+    enabled: bool = False
+    window_days: int = Field(default=90, ge=7)  # named to avoid clashing with lookback_days
+    min_trades: int = Field(default=10, ge=2)  # sample-size guard
+    runup_days: int = Field(default=5, ge=1)
+    runup_threshold: float = Field(default=0.05, gt=0)
+    reentry_days: int = Field(default=3, ge=1)
+    max_bar_symbols: int = Field(default=20, ge=0)  # bar fan-out bound
+
+
 class ReflectionConfig(StrictModel):
     """Post-trade reflection → lesson-memory loop (advisory).
 
@@ -53,6 +103,8 @@ class ReflectionConfig(StrictModel):
     per_symbol: int = Field(default=2, ge=0)
     global_n: int = Field(default=3, ge=0)
     lookback_days: int = Field(default=120, ge=1)
+    outcomes: OutcomeResolutionConfig = Field(default_factory=OutcomeResolutionConfig)
+    behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
 
 
 class StrategyHealthConfig(StrictModel):
@@ -290,6 +342,11 @@ class RiskConfig(StrictModel):
     # enabled, fresh risk metrics are REQUIRED before opening new risk.
     max_portfolio_var_pct: float = Field(default=0.0, ge=0, le=1)
     benchmark_symbol: str = "SPY"  # beta/correlation benchmark for risk metrics
+    # Two-class asset-to-benchmark map (equity default + crypto override):
+    # crypto pairs are reflection-graded/labeled against this instead of the
+    # equity benchmark; anything that is not a crypto pair falls back to
+    # benchmark_symbol.
+    crypto_benchmark_symbol: str = "BTC/USD"
     # Vol-targeted sizing: per-position daily risk budget as a fraction of
     # equity (0.005 = a position sized so one typical day moves it by
     # ~0.5% of account equity). Advisory input to the AI's sizing tool.

@@ -556,6 +556,14 @@ class TradeLesson(PoseidonModel):
     lesson: str
     model: str = ""
     created_at: datetime
+    # Lesson taxonomy: 'trade' (closed round trip), 'counterfactual'
+    # (unexecuted/vetoed proposal graded at a fixed horizon: realized_return
+    # holds the SIGNED HYPOTHETICAL forward return, holding_days the horizon),
+    # 'hold' (no-trade decision graded on portfolio-vs-benchmark forward
+    # return), 'bias_profile' (deterministic behavioral summary:
+    # realized_return is the mean trip return over its window, holding_days
+    # the window length).
+    kind: str = "trade"
 
 
 class AnalystReport(PoseidonModel):
@@ -651,6 +659,39 @@ class ClosedPosition(PoseidonModel):
     # reflection prompt only mentions conviction when it was actually stated.
     entry_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     invalidation: str = ""
+    # Benchmark the alpha was computed against (parameterizes the reflection
+    # prompt's alpha label; the default keeps legacy prompts byte-identical).
+    benchmark: str = "SPY"
+
+
+class DecisionOutcome(PoseidonModel):
+    """The outcome-resolution sweep's input view of a decision that never
+    became a trade (``counterfactual``) or deliberately held (``hold``),
+    graded at a fixed forward horizon. Never persisted — resolution markers
+    store a small status JSON instead, and thesis/invalidation (Poseidon's own
+    stored rationale, already prompt-visible today) feed the reflection prompt
+    only, never resolution JSON or audit payloads.
+    """
+
+    decision_id: str
+    kind: str  # counterfactual | hold
+    symbol: str  # graded symbol, or 'PORTFOLIO' for holds
+    action: str
+    side: str = ""
+    thesis: str = ""
+    entry_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    invalidation: str = ""
+    # 'rejected_risk' if any linked order carries it, else 'rejected_human',
+    # else 'unfilled' when orders exist, else '' (never reached execution).
+    blocked_status: str = ""
+    decided_at: datetime
+    horizon_trading_days: int
+    # Signed in the proposal's direction (sell_to_open inverts); the portfolio
+    # forward return for holds.
+    forward_return: float
+    benchmark: str
+    benchmark_return: float | None = None
+    alpha: float | None = None
 
 
 # --------------------------------------------------------------------------
