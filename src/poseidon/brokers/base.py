@@ -119,6 +119,14 @@ class Broker(abc.ABC):
 
     # -- orders ----------------------------------------------------------------------
 
+    def order_limits(self) -> dict[str, Any]:
+        """Data-only description of this broker's hard per-order constraints
+        (e.g. alpaca's $200k crypto notional cap). Surfaced to the AI through
+        get_risk_status so it can size single orders within them, and mirrored
+        by the broker's own ``preflight``. Money values are decimal STRINGS.
+        Empty when the broker declares none."""
+        return {}
+
     async def preflight(self, order: Order) -> str | None:
         """Optional broker-side pre-trade validation (buying power, margin
         impact, locate for shorts). Returns a human-readable rejection
