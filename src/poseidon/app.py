@@ -302,6 +302,8 @@ class ApplicationKernel:
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
             fundamentals_config=cfg.ai.fundamentals,
+            pm_tools=cfg.ai.pm_tools,
+            screeners={"sp500": self.screener, "crypto": self.crypto_screener},
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -316,6 +318,8 @@ class ApplicationKernel:
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
             fundamentals_config=cfg.ai.fundamentals,
+            pm_tools=cfg.ai.pm_tools,
+            screeners={"sp500": self.screener, "crypto": self.crypto_screener},
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)

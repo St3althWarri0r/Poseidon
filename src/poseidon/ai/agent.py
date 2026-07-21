@@ -29,7 +29,13 @@ from ..core.models import (
     TradeRationale,
 )
 from .backends.base import ChatBackend, ToolResult
-from .schemas import ALL_TOOLS, DATA_TOOLS, FUNDAMENTALS_TOOLS, SUBMIT_DECISION_TOOL
+from .schemas import (
+    ALL_TOOLS,
+    DATA_TOOLS,
+    FUNDAMENTALS_TOOLS,
+    SUBMIT_DECISION_TOOL,
+    optional_data_tools,
+)
 from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
@@ -109,12 +115,15 @@ class ClaudeAgent:
         self._backend = backend
         self._dispatcher = dispatcher
         self._cycle_usage: dict[str, int] = {}
-        # Tool catalog: the fundamentals trio joins only when its gate is on;
-        # submit_decision stays LAST exactly once (schemas.ALL_TOOLS order). The
-        # disabled default must BE the module constant — object identity keeps
-        # prior behavior (and the Anthropic prompt-cache prefix) byte-identical.
-        self._tools = ([*DATA_TOOLS, *FUNDAMENTALS_TOOLS, SUBMIT_DECISION_TOOL]
-                       if config.fundamentals.enabled else ALL_TOOLS)
+        # Tool catalog: config-gated extras (the fundamentals trio, then the
+        # pm_tools trio) join only when their gates are on; submit_decision
+        # stays LAST exactly once (schemas.ALL_TOOLS order). The all-off
+        # default must BE the module constant — object identity keeps prior
+        # behavior (and the Anthropic prompt-cache prefix) byte-identical.
+        extra = [*(FUNDAMENTALS_TOOLS if config.fundamentals.enabled else []),
+                 *optional_data_tools(config.pm_tools)]
+        self._tools = ([*DATA_TOOLS, *extra, SUBMIT_DECISION_TOOL]
+                       if extra else ALL_TOOLS)
 
     @property
     def backend(self) -> ChatBackend:

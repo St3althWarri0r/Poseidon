@@ -25,7 +25,7 @@ from ..core.config import AIConfig
 from ..core.errors import AgentError
 from ..storage.db import Database
 from .backends.base import ChatBackend, ToolResult
-from .schemas import DATA_TOOLS, FUNDAMENTALS_TOOLS
+from .schemas import DATA_TOOLS, FUNDAMENTALS_TOOLS, optional_data_tools
 from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
@@ -80,12 +80,14 @@ class ChatService:
         self._dispatcher = dispatcher
         self._db = db
         self._lock = asyncio.Lock()
-        # Chat catalog: gains at most the read-only fundamentals trio when its
-        # gate is on; submit_decision is NEVER offered here in any flag state
-        # (chat cannot trade). Disabled default IS the DATA_TOOLS module object
-        # — object identity keeps prior behavior byte-identical.
-        self._tools = ([*DATA_TOOLS, *FUNDAMENTALS_TOOLS]
-                       if config.fundamentals.enabled else DATA_TOOLS)
+        # Chat catalog: gains at most the read-only fundamentals + pm_tools
+        # trios when their gates are on; submit_decision is NEVER offered here
+        # in any flag state (chat cannot trade). The all-off default IS the
+        # DATA_TOOLS module object — object identity keeps prior behavior
+        # byte-identical.
+        extra = [*(FUNDAMENTALS_TOOLS if config.fundamentals.enabled else []),
+                 *optional_data_tools(config.pm_tools)]
+        self._tools = [*DATA_TOOLS, *extra] if extra else DATA_TOOLS
 
     @property
     def busy(self) -> bool:
