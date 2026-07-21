@@ -66,6 +66,33 @@ def latest_closed_episode(fills: list[FillRecord]) -> ClosedEpisode | None:
     )
 
 
+def forward_return(bars: list[Bar], start: datetime, horizon: int) -> float | None:
+    """Close-to-close return over ``horizon`` bars forward from ``start``.
+
+    Entry bar = the FIRST bar whose ``end`` is at/after ``start`` — deliberately
+    NOT the ``close_asof`` convention of :func:`benchmark_return`: grading a
+    counterfactual from the prior close would credit it with same-day
+    pre-decision drift, systematically inflating "missed rally" magnitude (the
+    exact chasing bias the outcome sweep exists to expose). First close at or
+    after the decision is the conservative no-lookahead-credit convention.
+
+    Exit bar = ``horizon`` bars past the entry in the end-sorted series.
+    Counting BARS (not calendar days) makes equity weekends/holidays and 24/7
+    crypto both exact with zero calendar math. Returns None when the entry bar
+    is missing, its close is not positive, or the series does not yet extend
+    ``horizon`` bars past the entry (the caller skips and retries). Tolerates
+    unsorted input like its sibling.
+    """
+    if not bars:
+        return None
+    ordered = sorted(bars, key=lambda b: b.end)
+    entry = next((i for i, b in enumerate(ordered) if b.end >= start), None)
+    if entry is None or entry + horizon >= len(ordered):
+        return None
+    p0, p1 = float(ordered[entry].close), float(ordered[entry + horizon].close)
+    return (p1 / p0 - 1) if p0 > 0 else None
+
+
 def benchmark_return(bars: list[Bar], start: datetime, end: datetime) -> float | None:
     """Close-to-close benchmark return over [start, end]; None if the window is
     not covered or resolves to a single (sub-day) bar."""

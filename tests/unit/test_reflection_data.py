@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from poseidon.analytics.performance import FillRecord
-from poseidon.analytics.reflection_data import benchmark_return, latest_closed_episode
+from poseidon.analytics.reflection_data import (
+    benchmark_return,
+    forward_return,
+    latest_closed_episode,
+)
 from poseidon.core.enums import OrderSide
 from poseidon.core.models import Bar
 
@@ -67,3 +71,49 @@ def test_benchmark_none_when_subday_or_gap() -> None:
                             datetime(2026, 6, 1, 15, tzinfo=UTC)) is None
     assert benchmark_return([], datetime(2026, 6, 1, tzinfo=UTC),
                             datetime(2026, 6, 4, tzinfo=UTC)) is None
+
+
+# ---- forward_return (outcome-resolution grading) ----------------------------
+
+
+def test_forward_return_exact_horizon_bar_arithmetic() -> None:
+    bars = [_bar(1, "100"), _bar(2, "110"), _bar(3, "121"), _bar(4, "133")]
+    # Decision mid-day June 1: entry bar = FIRST bar ending at/after it (June 1),
+    # exit = 2 bars later (June 3): 121/100 - 1.
+    r = forward_return(bars, datetime(2026, 6, 1, tzinfo=UTC), 2)
+    assert r is not None and abs(r - 0.21) < 1e-9
+
+
+def test_forward_return_never_credits_pre_decision_drift() -> None:
+    # A decision AFTER June 1's close must enter at June 2's close (the first
+    # bar that ends at/after it) — the close_asof convention would grade from
+    # June 1 and credit the counterfactual with same-day pre-decision drift,
+    # inflating every "missed rally" lesson (the chasing bias itself).
+    bars = [_bar(1, "100"), _bar(2, "110"), _bar(3, "121")]
+    r = forward_return(bars, datetime(2026, 6, 1, 12, tzinfo=UTC), 1)
+    assert r is not None and abs(r - (121 / 110 - 1)) < 1e-9
+
+
+def test_forward_return_none_until_horizon_bars_exist() -> None:
+    # Skip-and-retry contract: the series must extend `horizon` bars past the
+    # entry bar before a grade exists.
+    bars = [_bar(1, "100"), _bar(2, "110")]
+    assert forward_return(bars, datetime(2026, 6, 1, tzinfo=UTC), 2) is None
+    assert forward_return(bars, datetime(2026, 6, 1, tzinfo=UTC), 1) is not None
+
+
+def test_forward_return_none_when_entry_bar_missing() -> None:
+    bars = [_bar(1, "100"), _bar(2, "110")]
+    assert forward_return(bars, datetime(2026, 6, 10, tzinfo=UTC), 1) is None
+    assert forward_return([], datetime(2026, 6, 1, tzinfo=UTC), 1) is None
+
+
+def test_forward_return_none_on_nonpositive_entry_close() -> None:
+    bars = [_bar(1, "0"), _bar(2, "110"), _bar(3, "121")]
+    assert forward_return(bars, datetime(2026, 6, 1, tzinfo=UTC), 1) is None
+
+
+def test_forward_return_tolerates_unsorted_input() -> None:
+    bars = [_bar(3, "121"), _bar(1, "100"), _bar(2, "110")]
+    r = forward_return(bars, datetime(2026, 6, 1, tzinfo=UTC), 2)
+    assert r is not None and abs(r - 0.21) < 1e-9
