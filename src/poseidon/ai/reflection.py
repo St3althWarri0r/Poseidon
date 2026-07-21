@@ -22,6 +22,9 @@ portfolio manager's future decisions. Discipline:
 - 2 to 4 sentences. Every word must earn its place.
 - State whether the directional call was right, and cite the realized alpha.
 - Say concisely what in the thesis worked or failed.
+- When entry conviction is given, judge whether the outcome earned it — name \
+overconfidence and underconfidence plainly, and note if the stated invalidation \
+was the right tripwire.
 - End with exactly one actionable lesson for next time.
 Write plain prose only — no preamble, no headings, no markdown, no numbers you \
 were not given. This is retrospective: never assert a current market price."""
@@ -31,13 +34,20 @@ def _describe(pos: ClosedPosition) -> str:
     direction = "short" if pos.is_short else "long"
     alpha = "n/a" if pos.alpha is None else f"{pos.alpha * 100:+.2f}%"
     thesis = pos.thesis.strip() or "(no recorded thesis)"
-    return (
-        f"Closed {direction} {pos.symbol} (strategy: {pos.strategy or 'unattributed'}).\n"
-        f"Entry {pos.entry_price} -> exit {pos.exit_price}, held {pos.holding_days:.1f} days.\n"
-        f"Realized return: {pos.realized_return * 100:+.2f}%. Alpha vs SPY: {alpha}.\n"
-        f"Original entry thesis: {thesis}\n\n"
-        "Write the lesson now."
-    )
+    lines = [
+        f"Closed {direction} {pos.symbol} (strategy: {pos.strategy or 'unattributed'}).",
+        f"Entry {pos.entry_price} -> exit {pos.exit_price}, held {pos.holding_days:.1f} days.",
+        f"Realized return: {pos.realized_return * 100:+.2f}%. Alpha vs SPY: {alpha}.",
+        f"Original entry thesis: {thesis}",
+    ]
+    # Only when recorded at entry — legacy episodes must not grow noise lines.
+    if pos.entry_confidence is not None:
+        lines.append(f"Entry conviction: {pos.entry_confidence:.0%}.")
+    invalidation = pos.invalidation.strip()
+    if invalidation:
+        lines.append(f"Stated invalidation: {invalidation}")
+    lines += ["", "Write the lesson now."]
+    return "\n".join(lines)
 
 
 async def reflect_on_position(backend: ChatBackend, pos: ClosedPosition, *,

@@ -83,10 +83,11 @@ def test_no_block_when_empty_or_none() -> None:
 
 def test_system_prompt_byte_identical() -> None:
     # The Anthropic backend cache-controls tools+system as the frozen prefix;
-    # identity text must ride the user turn only. Hashes pin the v2.12.1
-    # (0377d59) prompt bytes — any drift busts the prompt cache and fails here.
+    # identity text must ride the user turn only. Hashes pin the current prompt
+    # bytes (last updated for the position-sizing/risk-case section) — any
+    # drift busts the prompt cache and fails here until consciously re-pinned.
     assert hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest() == (
-        "1ce763381512c7304927e327cd9985933e074455cc3d3e60f67a87074ba0fb9d")
+        "bb906e82e5f209633bf0b5f42c7c3d1eacc6bf88a195051b55dac0e595dc73b6")
     assert hashlib.sha256(CHAT_SYSTEM_PROMPT.encode()).hexdigest() == (
         "324ff9971e78a1aba9b6dc7d90e6e57c6125d67bc767a2926f2069ab73c670c1")
     assert "Instrument identities" not in SYSTEM_PROMPT

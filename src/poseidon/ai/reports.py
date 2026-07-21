@@ -45,6 +45,11 @@ def render_decision_report(decision: Decision) -> str:
             f"**Expected edge:** {r.expected_edge}",
             f"**Risk:** {r.risk}",
             f"**Reward:** {r.reward}",
+        ]
+        invalidation = r.invalidation.strip()
+        if invalidation:  # absent on decisions recorded before the field existed
+            lines.append(f"**Invalidates:** {invalidation}")
+        lines += [
             f"**Confidence:** {r.confidence:.0%}",
             f"**Portfolio impact:** {r.portfolio_impact}",
             f"**Exit plan:** {'; '.join(exit_bits) or 'see notes'}"
