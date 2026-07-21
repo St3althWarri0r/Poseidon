@@ -140,6 +140,70 @@ async def test_stress_scenarios() -> None:
         assert 0 < report["total_drawdown"] < 1
 
 
+def _rebalance_history(days: int) -> dict[str, list[Bar]]:
+    history: dict[str, list[Bar]] = {}
+    start = datetime(2022, 1, 3, tzinfo=UTC)
+    for symbol, drift in (("A", 1.0008), ("B", 0.9996)):
+        price, bars = 100.0, []
+        for i in range(days):
+            day = start + timedelta(days=i)
+            price *= drift
+            bars.append(Bar(symbol=symbol, open=Decimal(str(round(price, 4))),
+                            high=Decimal(str(round(price * 1.01, 4))),
+                            low=Decimal(str(round(price * 0.99, 4))),
+                            close=Decimal(str(round(price, 4))), volume=1_000_000,
+                            start=day, end=day, source="synthetic"))
+        history[symbol] = bars
+    return history
+
+
+async def test_walk_forward_rebalance_sequential_point_metric_folds() -> None:
+    from poseidon.backtest.analysis import walk_forward_rebalance
+    from poseidon.strategy.base import Signal, Strategy
+
+    class _HoldA(Strategy):
+        name = "hold_a"
+
+        async def scan(self, router, portfolio):  # type: ignore[no-untyped-def]
+            return [Signal(strategy=self.name, symbol="A", direction="long",
+                           strength=1.0, evidence={"target_weight": 1.0})]
+
+    history = _rebalance_history(900)
+    reports = await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]), history, folds=3)
+    assert len(reports) == 3
+    for i, entry in enumerate(reports):
+        assert entry["fold"] == i + 1
+        # Point metrics only — no equity_curve/attribution/annual_returns bloat.
+        assert set(entry) == {"fold", "start", "end", "days_tested", "total_return",
+                              "cagr", "sharpe", "max_drawdown"}
+    # Sequential, non-overlapping windows.
+    assert reports[0]["end"] < reports[1]["start"]
+    assert reports[1]["end"] < reports[2]["start"]
+    # 900 days - 210 warmup = 690 eval days over 3 folds.
+    assert reports[0]["days_tested"] == 230
+    assert reports[1]["days_tested"] == 230
+
+
+async def test_walk_forward_rebalance_insufficient_history_returns_empty() -> None:
+    from poseidon.backtest.analysis import walk_forward_rebalance
+    from poseidon.strategy.base import Signal, Strategy
+
+    class _HoldA(Strategy):
+        name = "hold_a"
+
+        async def scan(self, router, portfolio):  # type: ignore[no-untyped-def]
+            return [Signal(strategy=self.name, symbol="A", direction="long",
+                           strength=1.0, evidence={"target_weight": 1.0})]
+
+    # 260 days: only 50 eval days -> one 40-day fold maximum -> no spread.
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]),
+                                        _rebalance_history(260), folds=3) == []
+    # folds=0 is inert.
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]),
+                                        _rebalance_history(900), folds=0) == []
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]), {}, folds=3) == []
+
+
 async def test_rebalance_gap_day_does_not_crater_equity() -> None:
     # A2 regression: on a day a HELD symbol prints no bar (holiday/halt/gap),
     # the backtester must mark it at its last known close, not 0 — otherwise
