@@ -77,6 +77,37 @@ class OpenAICompatibleBackend:
             # erroring — that stays a plain AgentError below.
             raise BackendUnreachableError(
                 f"model backend unreachable at {self._client.base_url}: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            # On 4xx/5xx the response body carries the server's own diagnosis
+            # (e.g. LM Studio's exceed_context_size_error with token counts);
+            # this message is all the operator sees in the component-error
+            # notification, so surface the body — bounded and single-line — and
+            # name the remedy for a too-small context window, which is a
+            # host-side condition only the operator can fix. No angle brackets
+            # in the added text: the desktop channel feeds notify-send, and
+            # body-markup daemons (KDE) strip unknown <tags> silently.
+            full = " ".join((exc.response.text or "").split())
+            body = full[:400]
+            detail = (f"local model backend error: HTTP {exc.response.status_code} "
+                      f"from {exc.request.url.path}")
+            if body:
+                detail += f" — server said: {body}"
+            # Vendor context-overflow signatures (LM Studio/llama.cpp type and
+            # message, OpenAI code, vLLM/Anthropic-style messages), matched as
+            # phrases on the UNtruncated body so incidental words in an
+            # unrelated error ("contextlib", "exceeded") cannot trigger the
+            # remedy and a long preamble cannot hide it.
+            lower = full.lower()
+            if any(marker in lower for marker in (
+                    "exceed_context_size", "context_length_exceeded",
+                    "exceeds the available context size", "maximum context length",
+                    "context window", "prompt is too long")):
+                detail += (f"; fix: reload the model with a larger context length (>=32768) — "
+                           f"LM Studio: App Settings > Default Context Length, or "
+                           f"`lms load {self.model} --context-length 32768`")
+            log.error("model backend rejected request",
+                      status=exc.response.status_code, body=body)
+            raise AgentError(detail) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise AgentError(f"local model backend error: {exc}") from exc
         if not isinstance(data, dict):
