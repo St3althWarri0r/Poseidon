@@ -500,6 +500,56 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse(cached)
 
+    @app.get("/api/correlation")
+    async def correlation(symbols: str, window: int | None = None,
+                          method: str = "pearson") -> JSONResponse:
+        """Date-aligned daily-return correlation matrix over live bar history
+        for a comma-separated symbol set (crypto pairs normalized like
+        /api/trade). An unconditional OPERATOR surface, like /api/risk-metrics
+        — the AI-facing tool carries its own ai.pm_tools.correlation gate.
+        No coverage means 503, never a fabricated matrix."""
+        from ..analytics.correlation import CorrelationMethod, gather_correlation_matrix
+        from ..core.errors import UnsupportedSymbolError
+        from ..core.symbols import is_crypto_symbol, normalize_crypto_symbol
+
+        pm = kernel.config.ai.pm_tools
+        parsed: list[str] = []
+        try:
+            for raw in symbols.split(","):
+                sym = raw.strip().upper()
+                if not sym:
+                    continue
+                if is_crypto_symbol(sym):
+                    sym = normalize_crypto_symbol(sym)
+                if sym not in parsed:
+                    parsed.append(sym)
+        except UnsupportedSymbolError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if len(parsed) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="symbols must name at least 2 distinct comma-separated symbols")
+        if len(parsed) > pm.correlation_max_symbols:
+            raise HTTPException(
+                status_code=422,
+                detail=f"at most {pm.correlation_max_symbols} symbols "
+                       "(ai.pm_tools.correlation_max_symbols)")
+        if method not in ("pearson", "spearman"):
+            raise HTTPException(status_code=422,
+                                detail="method must be 'pearson' or 'spearman'")
+        chosen: CorrelationMethod = "spearman" if method == "spearman" else "pearson"
+        window_days = window if window is not None else pm.correlation_window_days
+        if not 30 <= window_days <= 250:
+            raise HTTPException(status_code=422,
+                                detail="window must be between 30 and 250 days")
+        try:
+            report = await gather_correlation_matrix(
+                kernel.router, parsed, window_days=window_days, method=chosen,
+                min_overlap=pm.correlation_min_overlap)
+        except Exception as exc:  # no coverage: report, don't fabricate
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return JSONResponse(report.as_dict())
+
     @app.get("/api/execution")
     async def execution(limit: int = 500) -> JSONResponse:
         return JSONResponse(await kernel.execution_report(limit=limit))
