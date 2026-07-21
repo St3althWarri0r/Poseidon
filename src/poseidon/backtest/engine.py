@@ -20,6 +20,7 @@ from typing import Any
 
 from ..core.models import Bar
 from ..strategy.base import Signal, Strategy
+from .stats import annualized_vol, calmar, profit_factor, safe_cagr, sortino
 
 
 @dataclass
@@ -94,15 +95,60 @@ class BacktestResult:
             return 0.0
         return sum(1 for t in closed if t.pnl > 0) / len(closed)
 
-    def summary(self) -> dict[str, float | int]:
-        return {
+    def summary(self, *, benchmark_returns: list[float] | None = None) -> dict[str, float | int]:
+        """Point metrics for the replay. When ``benchmark_returns`` (a
+        caller-aligned daily series) is provided, three benchmark-relative
+        keys are ADDED; without it they are OMITTED entirely so fold
+        spreads keep their shape."""
+        values = [v for _, v in self.equity_curve]
+        rets = self.daily_returns
+        cagr = safe_cagr(values[0] if values else 0.0, values[-1] if values else 0.0,
+                         len(values))
+        notional = 0.0
+        for t in self.trades:
+            notional += abs(t.entry_price * t.quantity)
+            if t.exit_price is not None:
+                notional += abs(t.exit_price * t.quantity)
+        mean_equity = sum(values) / len(values) if values else 0.0
+        # Dual turnover measurement: gross notional over the whole test vs
+        # its 252-day annualization (comparable across window lengths).
+        turnover_gross = notional / mean_equity if mean_equity > 0 else 0.0
+        turnover_annual = turnover_gross * 252 / max(len(values), 1)
+        out: dict[str, float | int] = {
             "total_return": round(self.total_return, 4),
             "max_drawdown": round(self.max_drawdown, 4),
             "sharpe": round(self.sharpe, 2),
             "trades": len(self.trades),
             "win_rate": round(self.win_rate, 3),
             "final_equity": round(self.equity_curve[-1][1], 2) if self.equity_curve else 0,
+            "cagr": round(cagr, 4),
+            "sortino": round(sortino(rets), 2),
+            "calmar": round(calmar(cagr, self.max_drawdown), 2),
+            "profit_factor": round(profit_factor(
+                [t.pnl for t in self.trades if t.exit_price is not None]), 2),
+            "annualized_volatility": round(annualized_vol(rets), 4),
+            "turnover_gross": round(turnover_gross, 4),
+            "turnover_annual": round(turnover_annual, 4),
         }
+        if benchmark_returns is not None:
+            compounded = 1.0
+            for r in benchmark_returns:
+                compounded *= 1 + r
+            bench_total = compounded - 1
+            n = min(len(rets), len(benchmark_returns))
+            active = [rets[len(rets) - n + i] - benchmark_returns[len(benchmark_returns) - n + i]
+                      for i in range(n)]
+            ir = 0.0
+            if n >= 2:
+                mean_a = sum(active) / n
+                var_a = sum((a - mean_a) ** 2 for a in active) / (n - 1)
+                std_a: float = var_a ** 0.5
+                if std_a > 0:
+                    ir = float(mean_a / std_a * 252 ** 0.5)
+            out["benchmark_return"] = round(bench_total, 4)
+            out["excess_return"] = round(self.total_return - bench_total, 4)
+            out["information_ratio"] = round(ir, 2)
+        return out
 
 
 class _HistoricalWindow:

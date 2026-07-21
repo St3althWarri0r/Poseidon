@@ -41,10 +41,60 @@ async def test_backtest_runs_and_reports() -> None:
     assert len(result.equity_curve) > 100
     summary = result.summary()
     assert set(summary) == {"total_return", "max_drawdown", "sharpe", "trades",
-                            "win_rate", "final_equity"}
+                            "win_rate", "final_equity", "cagr", "sortino", "calmar",
+                            "profit_factor", "annualized_volatility",
+                            "turnover_gross", "turnover_annual"}
     # Uptrending synthetic series + momentum should trade and end positive.
     assert summary["trades"] >= 1
     assert summary["final_equity"] > 0
+
+
+async def test_summary_benchmark_keys_only_when_provided() -> None:
+    history = synthetic_history()
+    result = await BacktestEngine().run(MomentumStrategy(symbols=["TEST"]), history)
+    plain = result.summary()
+    assert not {"benchmark_return", "excess_return", "information_ratio"} & set(plain)
+
+    bench = [0.001] * len(result.daily_returns)
+    with_bench = result.summary(benchmark_returns=bench)
+    assert set(with_bench) - set(plain) == {"benchmark_return", "excess_return",
+                                            "information_ratio"}
+    compounded = 1.0
+    for r in bench:
+        compounded *= 1 + r
+    assert with_bench["benchmark_return"] == round(compounded - 1, 4)
+    assert with_bench["excess_return"] == round(result.total_return - (compounded - 1), 4)
+
+
+def test_summary_turnover_golden_single_trade() -> None:
+    from datetime import date
+
+    from poseidon.backtest.engine import TradeRecord
+
+    curve = [(date(2025, 1, 6), 100_000.0), (date(2025, 1, 7), 101_000.0),
+             (date(2025, 1, 8), 102_000.0)]
+    trade = TradeRecord(symbol="A", entry_date=date(2025, 1, 6), entry_price=50.0,
+                        quantity=100.0, exit_date=date(2025, 1, 8), exit_price=60.0,
+                        reason="take_profit")
+    result = BacktestResult(equity_curve=curve, trades=[trade])
+    summary = result.summary()
+    # Notional traded 50*100 + 60*100 = 11000; mean equity 101000.
+    assert summary["turnover_gross"] == round(11_000 / 101_000, 4)
+    assert summary["turnover_annual"] == round(11_000 / 101_000 * 252 / 3, 4)
+
+    open_only = BacktestResult(equity_curve=curve, trades=[
+        TradeRecord(symbol="A", entry_date=date(2025, 1, 6), entry_price=50.0,
+                    quantity=100.0)])
+    # Open trade: only the entry leg counts.
+    assert open_only.summary()["turnover_gross"] == round(5_000 / 101_000, 4)
+    assert BacktestResult().summary()["turnover_gross"] == 0.0
+
+
+async def test_walk_forward_folds_carry_no_benchmark_keys() -> None:
+    history = synthetic_history(days=400)
+    reports = await walk_forward(lambda: MomentumStrategy(symbols=["TEST"]), history, folds=3)
+    assert reports and all("benchmark_return" not in r for r in reports)
+    assert all("cagr" in r and "turnover_gross" in r for r in reports)
 
 
 async def test_no_lookahead_first_days_have_no_trades() -> None:
