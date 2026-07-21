@@ -21,6 +21,17 @@ class _Router:
         return []  # no benchmark bars -> alpha None; reflection still proceeds
 
 
+class _RecordingRouter:
+    """Records which symbols were fetched (the benchmark-threading pin)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def bars(self, symbol, *, timeframe="1d", limit=100):
+        self.calls.append(symbol)
+        return []
+
+
 def _fills():
     return [
         FillRecord(symbol="SPY", side=OrderSide.BUY, quantity=Decimal("10"),
@@ -40,7 +51,7 @@ async def db(tmp_path):
     await d.close()
 
 
-def _service(db, *, backend, fills, is_flat=True, cfg=None):
+def _service(db, *, backend, fills, is_flat=True, cfg=None, router=None, **svc_kwargs):
     audited: list[tuple] = []
     load_calls: list[tuple] = []
 
@@ -55,9 +66,10 @@ def _service(db, *, backend, fills, is_flat=True, cfg=None):
         audited.append((actor, action, payload))
 
     svc = ReflectionService(
-        db=db, router=_Router(), config=cfg or ReflectionConfig(), model="fake",
+        db=db, router=router if router is not None else _Router(),
+        config=cfg or ReflectionConfig(), model="fake",
         get_backend=lambda: backend, load_fills=_load,
-        is_flat=lambda s: is_flat, audit_append=_audit)
+        is_flat=lambda s: is_flat, audit_append=_audit, **svc_kwargs)
     svc.audited = audited  # type: ignore[attr-defined]
     svc.load_calls = load_calls  # type: ignore[attr-defined]
     return svc
@@ -232,3 +244,59 @@ async def test_bool_confidence_is_junk_not_full_conviction(db) -> None:
     await svc.reflect_episode("SPY")
     assert await _lesson_count(db) == 1
     assert "conviction" not in backend.calls[0]["messages"][0]["content"].lower()
+
+
+# ---- benchmark threading (risk.benchmark_symbol / crypto companion) ---------
+
+
+def _crypto_fills():
+    return [
+        FillRecord(symbol="BTC/USD", side=OrderSide.BUY, quantity=Decimal("1"),
+                   price=Decimal("50000"), at=datetime(2026, 6, 1, tzinfo=UTC),
+                   strategy="mom", decision_id="d1"),
+        FillRecord(symbol="BTC/USD", side=OrderSide.SELL, quantity=Decimal("1"),
+                   price=Decimal("55000"), at=datetime(2026, 6, 4, tzinfo=UTC),
+                   strategy="mom", decision_id="d1"),
+    ]
+
+
+async def test_crypto_episode_graded_against_crypto_benchmark(db) -> None:
+    # A BTC/USD episode must fetch the crypto benchmark's bars and label its
+    # alpha accordingly — not SPY (crypto trading shipped while the benchmark
+    # stayed hardcoded).
+    router = _RecordingRouter()
+    backend = FakeBackend([text_end("Crypto lesson.")])
+    svc = _service(db, backend=backend, fills=_crypto_fills(), router=router)
+    await svc.reflect_episode("BTC/USD")
+    assert await _lesson_count(db, "BTC/USD") == 1
+    assert router.calls == ["BTC/USD"]
+    assert "Alpha vs BTC/USD" in backend.calls[0]["messages"][0]["content"]
+
+
+async def test_equity_episode_keeps_spy_fetch_and_byte_identical_label(db) -> None:
+    router = _RecordingRouter()
+    backend = FakeBackend([text_end("Equity lesson.")])
+    svc = _service(db, backend=backend, fills=_fills(), router=router)
+    await svc.reflect_episode("SPY")
+    assert router.calls == ["SPY"]
+    assert "Alpha vs SPY: n/a." in backend.calls[0]["messages"][0]["content"]
+
+
+async def test_ctor_benchmark_override_threads_to_fetch_and_label(db) -> None:
+    router = _RecordingRouter()
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_fills(), router=router,
+                   benchmark_symbol="QQQ")
+    await svc.reflect_episode("SPY")
+    assert router.calls == ["QQQ"]
+    assert "Alpha vs QQQ" in backend.calls[0]["messages"][0]["content"]
+
+
+async def test_ctor_crypto_benchmark_override(db) -> None:
+    router = _RecordingRouter()
+    backend = FakeBackend([text_end("Lesson.")])
+    svc = _service(db, backend=backend, fills=_crypto_fills(), router=router,
+                   crypto_benchmark_symbol="ETH/USD")
+    await svc.reflect_episode("BTC/USD")
+    assert router.calls == ["ETH/USD"]
+    assert "Alpha vs ETH/USD" in backend.calls[0]["messages"][0]["content"]

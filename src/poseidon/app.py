@@ -380,7 +380,13 @@ class ApplicationKernel:
             load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
             audit_append=self.audit.append,
             record_usage=lambda usage: self._record_ai_usage(usage, "reflection"),
-            over_budget=self._over_ai_budget)
+            over_budget=self._over_ai_budget,
+            # Two-class asset-to-benchmark map (equity default + crypto
+            # companion); account_scope stays call-time so broker toggles are
+            # honored exactly like _load_reflection_fills' internal scoping.
+            benchmark_symbol=self.config.risk.benchmark_symbol,
+            crypto_benchmark_symbol=self.config.risk.crypto_benchmark_symbol,
+            account_scope=lambda: self.broker.account_scope)
         self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
         # Advisory analyst firm -> debate packet (never gates risk / touches
         # orders). Packets are injected into the PM's cycle prompt only — see
@@ -1030,6 +1036,11 @@ class ApplicationKernel:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
         if self.strategy_health is not None:
             self.scheduler.register_job("strategy_health_sweep", self.strategy_health.sweep)
+        if self.reflection is not None:
+            # Both jobs self-guard on their enabled flags, so trigger_now on a
+            # disabled feature is a clean no-op.
+            self.scheduler.register_job("outcome_sweep", self.reflection.resolve_outcomes)
+            self.scheduler.register_job("behavior_sweep", self.reflection.behavior_sweep)
 
     def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
@@ -1090,6 +1101,23 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="default-strategy-health", job="strategy_health_sweep",
                                cron="0 6 * * *")  # daily pre-market
+            )
+        if self.config.ai.reflection.outcomes.enabled and not any(
+            s.job == "outcome_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                # Daily post-close ET: the freshest completed equity bar;
+                # crypto resolves 24/7 via bar counting.
+                ScheduleConfig(name="default-outcome-sweep", job="outcome_sweep",
+                               cron="20 18 * * *")
+            )
+        if self.config.ai.reflection.behavior.enabled and not any(
+            s.job == "behavior_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                # Weekly Monday pre-market — a 90-day profile moves slowly.
+                ScheduleConfig(name="default-behavior-sweep", job="behavior_sweep",
+                               cron="40 6 * * 1")
             )
         return schedules
 
