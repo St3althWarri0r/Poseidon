@@ -2,62 +2,21 @@
 
 from __future__ import annotations
 
-import random
-import statistics
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from ..core.models import Bar
 from ..strategy.base import Strategy
 from .engine import BacktestConfig, BacktestEngine, BacktestResult
-
-
-@dataclass
-class MonteCarloSummary:
-    runs: int
-    median_return: float
-    p05_return: float
-    p95_return: float
-    median_max_drawdown: float
-    p95_max_drawdown: float
-    prob_loss: float
+from .stats import MonteCarloSummary, monte_carlo_returns
 
 
 def monte_carlo(result: BacktestResult, *, runs: int = 1000,
                 seed: int | None = None) -> MonteCarloSummary:
     """Bootstrap-resample the realized daily returns to estimate the
-    distribution of outcomes and tail drawdowns."""
-    rets = result.daily_returns
-    if len(rets) < 20:
-        raise ValueError("need at least 20 daily returns for Monte Carlo")
-    rng = random.Random(seed)
-    horizon = len(rets)
-    finals: list[float] = []
-    drawdowns: list[float] = []
-    for _ in range(runs):
-        equity, peak, max_dd = 1.0, 1.0, 0.0
-        for _ in range(horizon):
-            equity *= 1 + rng.choice(rets)
-            peak = max(peak, equity)
-            max_dd = max(max_dd, (peak - equity) / peak)
-        finals.append(equity - 1)
-        drawdowns.append(max_dd)
-    finals.sort()
-    drawdowns.sort()
-
-    def pct(sorted_values: list[float], p: float) -> float:
-        idx = min(int(p * len(sorted_values)), len(sorted_values) - 1)
-        return sorted_values[idx]
-
-    return MonteCarloSummary(
-        runs=runs,
-        median_return=round(statistics.median(finals), 4),
-        p05_return=round(pct(finals, 0.05), 4),
-        p95_return=round(pct(finals, 0.95), 4),
-        median_max_drawdown=round(statistics.median(drawdowns), 4),
-        p95_max_drawdown=round(pct(drawdowns, 0.95), 4),
-        prob_loss=round(sum(1 for f in finals if f < 0) / runs, 3),
-    )
+    distribution of outcomes and tail drawdowns. Thin delegate over
+    :func:`poseidon.backtest.stats.monte_carlo_returns` (the computation
+    moved there unchanged); this import path stays public."""
+    return monte_carlo_returns(result.daily_returns, runs=runs, seed=seed)
 
 
 async def walk_forward(strategy_factory: Callable[[], Strategy],
