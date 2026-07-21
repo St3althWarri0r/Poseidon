@@ -284,6 +284,8 @@ class ApplicationKernel:
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
             sleeve_caps=self.risk.sleeve_caps,
+            benchmark_symbol=cfg.risk.benchmark_symbol,
+            eval_config=cfg.backtest,
         )
         # Bundled example algorithms: packaged inside poseidon for installed
         # builds (wheel force-include), or the repo-root examples/ for a
