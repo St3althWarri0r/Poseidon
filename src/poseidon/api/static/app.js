@@ -25,6 +25,10 @@ const { brokerBadge, brokerAccountOptions } = window.PoseidonBrokerToggle;
 const { vramHintText, modelOptions, currentLabel, precondition, chosenModel } =
   window.PoseidonModelSelector;
 
+// Pure view-logic for the Settings view and the macro strip (settings_view.js,
+// loaded before this script). Kept separate so a node unit test can cover it.
+const PS = window.PoseidonSettings;
+
 async function errDetail(res, url) {
   // Surface the server's explanation (FastAPI puts it in .detail) instead of
   // a bare status code — "limit orders need a limit_price" beats "422".
@@ -60,7 +64,7 @@ function toast(message, kind = "") {
 /* ================= routing ================= */
 
 const VIEWS = {
-  overview:    { title: "Overview",    refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshEquity(), refreshRiskMetrics(), refreshAlgorithms()]) },
+  overview:    { title: "Overview",    refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshEquity(), refreshRiskMetrics(), refreshAlgorithms(), refreshMacro()]) },
   portfolio:   { title: "Portfolio",   refresh: () => Promise.allSettled([refreshStatus(), refreshPortfolio(), refreshOrders(), refreshExitPlans()]) },
   algorithms:  { title: "Algorithms",  refresh: () => Promise.allSettled([refreshStatus(), refreshAlgorithms()]) },
   ai:          { title: "AI Desk",     refresh: () => Promise.allSettled([refreshStatus(), refreshApprovals(), refreshDecisions(), refreshAiUsage(), refreshChat()]) },
@@ -69,6 +73,7 @@ const VIEWS = {
   risk:        { title: "Risk",        refresh: () => Promise.allSettled([refreshStatus(), refreshRiskMetrics()]) },
   performance: { title: "Performance", refresh: () => Promise.allSettled([refreshPerformance(), refreshExecution()]) },
   system:      { title: "System",      refresh: () => Promise.allSettled([refreshStatus(), refreshAudit()]) },
+  settings:    { title: "Settings",    refresh: () => refreshSettings() },
 };
 
 function currentView() {
@@ -85,6 +90,146 @@ function route() {
   if (name === "overview") requestAnimationFrame(drawEquity);
 }
 window.addEventListener("hashchange", route);
+
+
+/* ================= settings ================= */
+
+// Pending edits keyed by dotted path, flushed by Save. Batching means one
+// merged validation server-side and one audit entry, instead of a POST per
+// keystroke.
+const settingsPending = new Map();
+
+function settingsBanner(text, kind) {
+  const el = $("#settings-banner");
+  if (!text) { el.hidden = true; return; }
+  el.hidden = false;
+  el.className = "banner " + (kind || "");
+  el.textContent = text;
+}
+
+function renderSettingControl(entry) {
+  const kind = PS.controlKind(entry);
+  const id = `set-${entry.path.replace(/\./g, "-")}`;
+  if (kind === "readonly") {
+    const shown = entry.kind === "list" ? "(edit in poseidon.yaml)" : String(entry.value);
+    return `<span class="setting-ro" title="read-only here">${esc(shown)}</span>`;
+  }
+  if (kind === "toggle") {
+    return `<label class="switch"><input type="checkbox" id="${id}" data-path="${esc(entry.path)}"`
+      + `${entry.value ? " checked" : ""}><span class="slider"></span></label>`;
+  }
+  if (kind === "select") {
+    const opts = (entry.constraints.enum || []).map((v) =>
+      `<option value="${esc(String(v))}"${v === entry.value ? " selected" : ""}>${esc(String(v))}</option>`
+    ).join("");
+    return `<select id="${id}" data-path="${esc(entry.path)}">${opts}</select>`;
+  }
+  const c = entry.constraints || {};
+  const bounds = [c.minimum != null ? ` min="${c.minimum}"` : "",
+                  c.maximum != null ? ` max="${c.maximum}"` : ""].join("");
+  const type = kind === "number" ? "number" : "text";
+  const step = entry.kind === "float" ? ' step="any"' : "";
+  return `<input type="${type}"${bounds}${step} id="${id}" data-path="${esc(entry.path)}"`
+    + ` value="${esc(String(entry.value))}">`;
+}
+
+function renderSettingRow(entry) {
+  const badge = PS.provenanceBadge(entry);
+  const note = PS.statusNote(entry);
+  const tierBadge = entry.tier === "guarded"
+    ? '<span class="badge badge-warn" title="has real operational consequence">guarded</span>'
+    : entry.tier === "read_only"
+      ? '<span class="badge" title="visible here, edited in poseidon.yaml">read-only</span>'
+      : "";
+  return `<div class="setting-row${entry.registered ? "" : " setting-advanced"}">
+    <div class="setting-label">
+      <div class="setting-name">${esc(entry.label)} ${tierBadge}
+        ${badge ? `<span class="badge badge-${badge.kind}">${esc(badge.text)}</span>` : ""}</div>
+      ${entry.help ? `<div class="setting-help">${esc(entry.help)}</div>` : ""}
+      <div class="setting-path"><code>${esc(entry.path)}</code>${note ? ` · ${esc(note)}` : ""}</div>
+    </div>
+    <div class="setting-control">${renderSettingControl(entry)}</div>
+  </div>`;
+}
+
+async function refreshSettings() {
+  let data;
+  try {
+    data = await getJSON("/api/settings");
+  } catch (e) {
+    $("#settings-groups").innerHTML = `<p class="muted">Could not load settings: ${esc(e.message)}</p>`;
+    return;
+  }
+  settingsPending.clear();
+  const groups = PS.groupSettings(data.settings || []);
+  $("#settings-groups").innerHTML = groups.map((g) => `
+    <section class="setting-group">
+      <h3>${esc(g.label)}</h3>
+      ${g.note ? `<p class="muted small setting-group-note">${esc(g.note)}</p>` : ""}
+      ${PS.sortWithinGroup(g.entries).map(renderSettingRow).join("")}
+    </section>`).join("")
+    + `<div class="setting-actions">
+         <button class="btn btn-primary" id="settings-save" disabled>Save changes</button>
+         <span class="muted small" id="settings-dirty"></span>
+       </div>`;
+  $("#settings-paths").textContent =
+    `config: ${data.config_path}  ·  dashboard overlay: ${data.overlay_path}`;
+
+  const byPath = new Map((data.settings || []).map((e) => [e.path, e]));
+  $$("#settings-groups [data-path]").forEach((el) => {
+    el.addEventListener("change", () => {
+      const entry = byPath.get(el.dataset.path);
+      const raw = el.type === "checkbox" ? el.checked : el.value;
+      const coerced = PS.coerce(entry, raw);
+      if (!coerced.ok) { toast(`${entry.label}: ${coerced.error}`, "err"); return; }
+      const bounded = PS.withinConstraints(entry, coerced.value);
+      if (!bounded.ok) { toast(`${entry.label}: ${bounded.error}`, "err"); return; }
+      settingsPending.set(entry.path, coerced.value);
+      $("#settings-save").disabled = settingsPending.size === 0;
+      $("#settings-dirty").textContent =
+        `${settingsPending.size} unsaved change${settingsPending.size === 1 ? "" : "s"}`;
+    });
+  });
+
+  $("#settings-save").addEventListener("click", async () => {
+    if (!settingsPending.size) return;
+    // Guarded settings each get their own confirm naming the consequence.
+    for (const [path, value] of settingsPending) {
+      const entry = byPath.get(path);
+      const msg = PS.confirmMessage(entry, value);
+      if (msg && !confirm(msg)) return;
+    }
+    try {
+      const result = await postJSON("/api/settings",
+        { updates: Object.fromEntries(settingsPending) });
+      settingsBanner(PS.savedMessage(result), result.needs_restart ? "warn" : "ok");
+      await refreshSettings();
+    } catch (e) {
+      settingsBanner(`Not saved — ${e.message}`, "err");
+    }
+  });
+}
+
+/* ================= macro strip ================= */
+
+async function refreshMacro() {
+  const host = $("#macro-strip");
+  if (!host) return;
+  let data;
+  try {
+    data = await getJSON("/api/macro");
+  } catch {
+    // Unreachable is a gap, not a zero — say so rather than showing numbers.
+    host.innerHTML = '<span class="muted small">Macro context unavailable</span>';
+    return;
+  }
+  host.innerHTML = PS.macroCells(data).map((c) => `
+    <div class="macro-cell${c.ok ? "" : " macro-gap"}">
+      <span class="macro-label">${esc(c.label)}</span>
+      <span class="macro-value">${esc(c.value)}</span>
+      <span class="macro-sub">${esc(c.sub)}</span>
+    </div>`).join("");
+}
 
 /* ================= status / topbar ================= */
 
@@ -1028,6 +1173,22 @@ $("#al-bt-period").addEventListener("change", () => {
   $("#al-bt-end").hidden = !custom;
 });
 
+
+// Fama-French block for the backtest run card. Absent (not zeroed) when the
+// feature is off or the fetch failed — `factor_attribution` is present-but-null
+// in that case, and a table of zeros would read as "no exposure, no alpha"
+// rather than "not measured".
+function renderFactorBlock(report) {
+  const rows = PS.factorRows(report);
+  if (!rows) return "";
+  return `<div class="factor-block">
+    <h4>Factor attribution <span class="hint">alpha net of market, size and value</span></h4>
+    ${rows.map((row) => `<div class="kv"><span class="k">${esc(row.label)}
+      <span class="factor-hint">${esc(row.hint)}</span></span>
+      <span class="v">${esc(row.value)}</span></div>`).join("")}
+  </div>`;
+}
+
 $("#al-backtest").addEventListener("click", async () => {
   const btn = $("#al-backtest");
   const period = $("#al-bt-period").value;
@@ -1055,6 +1216,7 @@ $("#al-backtest").addEventListener("click", async () => {
       <div class="kv"><span class="k">Final equity</span><span class="v">${fmtUsd(r.final_equity)}</span></div>
       ${yearRows}
       ${(r.symbols_skipped_no_history || []).length ? `<p class="meter-note">no history available: ${esc(r.symbols_skipped_no_history.join(", "))}</p>` : ""}
+      ${renderFactorBlock(r)}
       <p class="meter-note">${esc(r.note)}</p></div>`;
   } catch (e) {
     toast("Backtest failed: " + String(e.message).slice(0, 200), "bad");
