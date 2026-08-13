@@ -53,15 +53,26 @@ class DesktopChannel(Channel):
             return False
         urgency = {"info": "normal", "warning": "normal", "critical": "critical"}[level.value]
         try:
+            # "--" terminates option parsing. notify-send's usage is
+            # `[OPTION...] <SUMMARY> [BODY]` and GLib *permutes*, scanning for
+            # leading-"-" arguments anywhere in argv — so without this a body
+            # beginning with "-" (a negative P&L figure, most often) is parsed
+            # as an option and the notification is never delivered at all.
             process = await asyncio.create_subprocess_exec(
-                binary, "--app-name=Poseidon", f"--urgency={urgency}",
+                binary, "--app-name=Poseidon", f"--urgency={urgency}", "--",
                 f"Poseidon: {title}", body[:1000],
             )
             await process.wait()
         except OSError as exc:
             log.warning("desktop notification failed", error=str(exc))
             return False
-        return process.returncode == 0
+        if process.returncode != 0:
+            # A dropped alert must leave a trace: returning False alone left no
+            # record anywhere that the operator was never told.
+            log.warning("desktop notification rejected by notify-send",
+                        returncode=process.returncode, title=title)
+            return False
+        return True
 
 
 class EmailChannel(Channel):
