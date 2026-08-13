@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from datetime import date
 from typing import Any
 
@@ -101,7 +102,8 @@ class ToolDispatcher:
                  budget: CycleBudgetConfig | None = None,
                  fundamentals_config: FundamentalsConfig | None = None,
                  pm_tools: PMToolsConfig | None = None,
-                 screeners: dict[str, MarketScreener] | None = None) -> None:
+                 screeners: dict[str, MarketScreener] | None = None,
+                 broker_limits: Callable[[], dict[str, Any]] | None = None) -> None:
         self._router = router
         self._portfolio = portfolio
         self._risk = risk
@@ -114,6 +116,10 @@ class ToolDispatcher:
         self._fundamentals = fundamentals_config or FundamentalsConfig()  # disabled default
         self._pm_tools = pm_tools or PMToolsConfig()  # all-off default
         self._screeners = screeners or {}  # 'sp500'/'crypto' -> MarketScreener
+        # Read-only DATA about the active broker's hard per-order constraints
+        # (never the broker object itself — tools must stay unable to reach the
+        # order path). A callable so a broker hot-swap is reflected live.
+        self._broker_limits = broker_limits
         self.sources_used: set[str] = set()
         # Cumulative serialized tool-output chars this cycle; reset per cycle by
         # ``reset_cycle_budget()`` (the agent calls it alongside sources_used).
@@ -474,7 +480,13 @@ class ToolDispatcher:
         return state
 
     async def _tool_get_risk_status(self) -> dict[str, Any]:
-        return self._risk.status()
+        status = self._risk.status()
+        if self._broker_limits is not None:
+            # Broker-side per-order caps (e.g. alpaca's $200k crypto notional):
+            # the model must size each single order within them — a larger
+            # position is built across cycles, never in one oversized order.
+            status["broker_limits"] = self._broker_limits()
+        return status
 
     # -- algorithm workshop ------------------------------------------------------
 
