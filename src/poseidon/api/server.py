@@ -500,6 +500,86 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse(cached)
 
+    # -- settings ---------------------------------------------------------------
+
+    @app.get("/api/settings")
+    async def get_settings() -> JSONResponse:
+        """The settings tree: schema facts + effective value + provenance.
+
+        Provenance is resolved against the RAW parsed YAML rather than the
+        validated config, because validation fills defaults in and destroys
+        exactly the distinction the operator needs ("why didn't my toggle
+        stick?"). Secrets cannot appear: config stores credential NAMES, and
+        settings_meta excludes every ``*_credential`` path outright.
+        """
+        import yaml as _yaml
+
+        from ..core.config import default_config_dir, local_overlay_path
+        from ..core.settings_meta import describe
+
+        path = kernel.config.config_path or default_config_dir() / "poseidon.yaml"
+
+        def _read(target: Path) -> dict[str, Any]:
+            if not target.exists():
+                return {}
+            try:
+                loaded = _yaml.safe_load(target.read_text(encoding="utf-8"))
+            except _yaml.YAMLError:
+                return {}  # unreadable base/overlay degrades to "default" labels
+            return loaded if isinstance(loaded, dict) else {}
+
+        return JSONResponse({
+            "settings": describe(kernel.config, _read(path), _read(local_overlay_path(path))),
+            "config_path": str(path),
+            "overlay_path": str(local_overlay_path(path)),
+        })
+
+    @app.post("/api/settings")
+    async def post_settings(body: dict[str, Any]) -> JSONResponse:
+        """Apply dotted-path settings to the dashboard overlay.
+
+        Refusals are the point of this endpoint. Tier enforcement lives in
+        ``apply_settings`` (server-side, so a curl cannot bypass the UI), and
+        the merged configuration is validated with the SAME validator that
+        guards startup before anything is written — so this endpoint cannot
+        produce a config that fails to boot.
+        """
+        updates = body.get("updates")
+        if not isinstance(updates, dict) or not updates:
+            raise HTTPException(status_code=422,
+                                detail="updates must be a non-empty object of dotted-path -> value")
+        try:
+            result = kernel.apply_settings(updates)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ConfigError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await kernel.audit.append("human", "settings.updated",
+                                  {"paths": result["applied"],
+                                   "values": {k: updates[k] for k in result["applied"]}})
+        return JSONResponse({"ok": True, **result})
+
+    @app.get("/api/macro")
+    async def macro_context() -> JSONResponse:
+        """VIX + Treasury curve for the operator's own dashboard.
+
+        Deliberately NOT gated on ``ai.pm_tools.macro_context``: that flag
+        governs whether the AI may call the tool mid-cycle. An operator reading
+        VIX on their own screen is the same class of surface as /api/quote or
+        /api/correlation, which are likewise unconditional.
+
+        Never raises on a dead leg — the snapshot reports what it reached and
+        names what it did not, so the strip renders "unavailable" rather than a
+        misleading zero.
+        """
+        from ..data.macro import fetch_macro_snapshot
+
+        try:
+            snapshot = await fetch_macro_snapshot()
+        except Exception as exc:  # belt and braces; the snapshot degrades internally
+            raise HTTPException(status_code=503, detail=f"macro unavailable: {exc}") from exc
+        return JSONResponse(snapshot.as_dict())
+
     @app.get("/api/correlation")
     async def correlation(symbols: str, window: int | None = None,
                           method: str = "pearson") -> JSONResponse:

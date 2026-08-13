@@ -13,11 +13,14 @@ import functools
 import json
 import signal
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 import structlog
 import yaml
+from pydantic import ValidationError
 
 from . import __version__
 from .ai.agent import ClaudeAgent
@@ -41,6 +44,7 @@ from .core.config import (
     AppConfig,
     BrokerConfig,
     ScheduleConfig,
+    apply_local_overlay,
     default_config_dir,
     local_overlay_path,
 )
@@ -768,6 +772,79 @@ class ApplicationKernel:
             ai_block["utility_model"] = None
         existing["ai"] = ai_block
         self._save_overlay(overlay_file, existing)
+
+    def apply_settings(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Persist dotted-path settings to ``poseidon.local.yaml``.
+
+        The whole safety of exposing settings to a browser rests on one
+        property: the proposed change is merged over the real base config and
+        run through ``AppConfig.model_validate`` BEFORE anything is written. The
+        same validation that guards startup therefore guards this endpoint, and
+        ``extra="forbid"`` turns from a footgun into the protection — an
+        unknown key or an out-of-range value is rejected here rather than
+        bricking the next launch. An invalid overlay discovered only at boot,
+        on an armed autonomous trader, is the worst outcome this feature could
+        produce.
+
+        Tier enforcement is server-side (:func:`settings_meta.is_writable`); the
+        UI disabling a control is presentation, not security.
+
+        Returns ``{"applied": [...], "needs_restart": bool}``. Nothing here
+        reaches the running engine — it reads config at construction — so the
+        caller must tell the operator to restart, and must not imply it happened.
+        """
+        from .core.settings_meta import REGISTRY, is_writable
+
+        if not updates:
+            raise ConfigError("no settings supplied")
+        rejected = sorted(path for path in updates if not is_writable(path))
+        if rejected:
+            raise PermissionError(
+                "these settings are not writable from the dashboard: "
+                + ", ".join(rejected))
+
+        path = self.config.config_path or default_config_dir() / "poseidon.yaml"
+        overlay_file = local_overlay_path(path)
+        existing: dict[str, Any] = {}
+        if overlay_file.exists():
+            try:
+                loaded = yaml.safe_load(overlay_file.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ConfigError(
+                    f"cannot parse {overlay_file}: {exc} — fix or delete the file and retry"
+                ) from exc
+            if isinstance(loaded, dict):
+                existing = loaded
+
+        proposed = deepcopy(existing)
+        for dotted, value in updates.items():
+            node = proposed
+            parts = dotted.split(".")
+            for part in parts[:-1]:
+                nxt = node.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[part] = nxt
+                node = nxt
+            node[parts[-1]] = value
+
+        # Validate the MERGED result, exactly as startup would see it.
+        try:
+            base_raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"cannot parse {path}: {exc}") from exc
+        merged = apply_local_overlay(dict(base_raw or {}), deepcopy(proposed))
+        try:
+            AppConfig.model_validate(merged)
+        except ValidationError as exc:
+            raise ConfigError(f"rejected — the merged configuration is invalid:\n{exc}") from exc
+
+        self._save_overlay(overlay_file, proposed)
+        needs_restart = any(
+            (REGISTRY[p].restart if p in REGISTRY else True) for p in updates)
+        log.info("settings updated from the dashboard",
+                 paths=sorted(updates), needs_restart=needs_restart)
+        return {"applied": sorted(updates), "needs_restart": needs_restart}
 
     @staticmethod
     def _save_overlay(overlay_file: Path, existing: dict[str, object]) -> None:

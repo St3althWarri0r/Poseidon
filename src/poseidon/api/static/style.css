@@ -532,3 +532,47 @@ label input, label select { width: 100%; min-width: 0; }
   white-space: pre-wrap; word-break: break-word;
   border-top: 1px solid var(--border); max-height: 260px; overflow: auto;
 }
+
+/* ================= macro strip (Overview) ================= */
+/* Regime context under the tiles. A missing leg is dimmed and reads
+   "unavailable" — never a zero, which would look like a measurement. */
+.macro-strip { display: flex; gap: 18px; flex-wrap: wrap; margin: -4px 0 18px; }
+.macro-cell { display: flex; align-items: baseline; gap: 8px; padding: 6px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+.macro-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted); }
+.macro-value { font-variant-numeric: tabular-nums; font-weight: 600; }
+.macro-sub { font-size: 11px; color: var(--muted); }
+.macro-gap { opacity: .55; }
+
+/* ================= settings ================= */
+.settings-groups { display: flex; flex-direction: column; gap: 26px; margin-top: 8px; }
+.setting-group h3 { margin: 0 0 4px; font-size: 14px; }
+.setting-group-note { margin: 0 0 10px; }
+.setting-row { display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 20px; padding: 10px 0; border-top: 1px solid var(--line); }
+.setting-label { min-width: 0; flex: 1 1 auto; }
+.setting-name { font-weight: 600; display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap; }
+.setting-help { color: var(--muted); font-size: 12px; margin-top: 3px; max-width: 68ch; }
+.setting-path { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.setting-control { flex: 0 0 auto; padding-top: 2px; }
+.setting-control input[type="number"], .setting-control input[type="text"],
+.setting-control select { min-width: 140px; }
+.setting-ro { color: var(--muted); font-variant-numeric: tabular-nums; }
+/* Unregistered fields: visible for completeness, visually de-emphasised so the
+   things someone came here to change stay findable. */
+.setting-advanced { opacity: .72; }
+.setting-actions { display: flex; align-items: center; gap: 12px;
+  position: sticky; bottom: 0; padding: 12px 0; background: var(--card); }
+.badge-overlay { background: #1f3a5f; color: #cfe4ff; }
+.badge-file { background: #2a3a2a; color: #cfe8cf; }
+.badge-warn { background: #4a3a1a; color: #ffe0a3; }
+.banner { padding: 10px 12px; border-radius: 8px; margin: 10px 0;
+  border: 1px solid var(--line); }
+.banner.ok { background: #1d3320; border-color: #2f5c36; }
+.banner.warn { background: #3a3118; border-color: #6b5a24; }
+.banner.err { background: #3a1f1f; border-color: #6b2f2f; }
+.factor-block { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.factor-block h4 { margin: 0 0 6px; font-size: 13px; }
+.factor-hint { color: var(--muted); font-size: 11px; font-weight: 400; margin-left: 6px; }
