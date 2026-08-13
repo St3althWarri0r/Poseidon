@@ -35,7 +35,7 @@ from .api.server import DashboardServer
 from .brokers.base import Broker
 from .brokers.plugins.paper import PaperBroker
 from .brokers.registry import broker_catalog, create_broker
-from .core.clock import EASTERN, FreshnessPolicy, MarketClock, calendar_covers
+from .core.clock import EASTERN, FreshnessPolicy, MarketClock, calendar_covers, utc_now
 from .core.config import (
     AIConfig,
     AppConfig,
@@ -1437,9 +1437,38 @@ class ApplicationKernel:
         )
         equity_points = [(datetime.fromisoformat(r[0]), float(r[1])) for r in marks]
         trips = build_round_trips(await self._load_all_fills())
-        report = compute_performance(equity_points, trips).as_dict()
+        risk_free = await self._live_risk_free()
+        report = compute_performance(equity_points, trips,
+                                     risk_free_annual=risk_free).as_dict()
+        # Reported alongside the ratios: a Sharpe without the rate it was
+        # measured against is an unfalsifiable number.
+        report["risk_free_annual"] = round(risk_free, 6)
         report["open_exit_plans"] = await self.guardian.active_plans()
         return report
+
+    async def _live_risk_free(self) -> float:
+        """Treasury 3-month par yield for the LIVE performance ratios.
+
+        Mirrors the workshop's backtest resolution: ``auto`` reads the curve,
+        a literal float is taken as-is, and every failure degrades to 0.0 with
+        a warning rather than taking the report down.
+        """
+        configured = self.config.backtest.risk_free_annual
+        if configured != "auto":
+            return float(configured)
+        today = utc_now().date()
+        try:
+            from .data.treasury import fetch_yield_curve, risk_free_annual_on
+
+            rate = risk_free_annual_on(await fetch_yield_curve(year=today.year), today)
+            if rate == 0.0:  # early January precedes the new year's first print
+                rate = risk_free_annual_on(
+                    await fetch_yield_curve(year=today.year - 1), today)
+        except Exception as exc:
+            log.warning("risk-free rate unavailable; performance ratios revert to rf=0",
+                        error=str(exc))
+            return 0.0
+        return rate
 
     async def _load_all_fills(self) -> list[FillRecord]:
         """All filled orders as FillRecords, attributed per strategy. Fills are

@@ -40,6 +40,7 @@ _DATA_TOOL_NAMES = frozenset({
     "get_earnings_calendar", "get_economic_calendar", "get_market_snapshot",
     "get_fundamentals", "get_filings", "get_insider_transactions",
     "read_url", "screen_market", "compute_correlation_matrix",
+    "get_macro_context",
 })
 
 _SOFT_BUDGET_NOTE = (
@@ -392,6 +393,20 @@ class ToolDispatcher:
             log.warning("web page flagged for possible prompt injection",
                         host=result.host, url=result.final_url[:120])
         return payload
+
+    async def _tool_get_macro_context(self) -> dict[str, Any]:
+        if not self._pm_tools.macro_context:
+            raise DataError(
+                "get_macro_context is disabled in config "
+                "(ai.pm_tools.macro_context=false)")
+        from ..data import macro
+
+        # Never raises on a dead leg: the snapshot reports what it has and
+        # names what it could not reach. Optional regime context must not be
+        # able to cost the cycle its decision.
+        snapshot = await macro.fetch_macro_snapshot()
+        self.sources_used.add("macro:cboe+treasury")  # provenance -> data_sources
+        return snapshot.as_dict()
 
     async def _tool_screen_market(self, universe: str) -> dict[str, Any]:
         if not self._pm_tools.screen_market:

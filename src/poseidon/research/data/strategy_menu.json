@@ -1,0 +1,679 @@
+{
+ "schema": 1,
+ "description": "Published systematic-strategy candidates, screened against Poseidon's own data capabilities and tradeable universe. Reported metrics are the source papers' own published figures, not Poseidon backtests.",
+ "provenance": "Strategy names, reported Sharpe/volatility/rebalance cadence and paper URLs are factual attributes of published academic work, collected via the paperswithbacktest/awesome-systematic-trading index. No code from that repository is used or derived here; the feasibility screen, capability mapping and record structure are Poseidon's own.",
+ "strategies": [
+  {
+   "title": "Overnight Seasonality in Bitcoin",
+   "sharpe": 0.892,
+   "vol": 0.20800000000000002,
+   "rebalance": "intraday",
+   "asset_class": "Cryptos",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4081000",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "intraday seasonality needs sub-daily bars; the screener is daily"
+  },
+  {
+   "title": "Asset Growth Effect",
+   "sharpe": 0.835,
+   "vol": 0.102,
+   "rebalance": "yearly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1335524",
+   "feasible": "yes",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "total-asset growth from filed statements; SEC EDGAR serves it"
+  },
+  {
+   "title": "Short Term Reversal Effect in Stocks",
+   "sharpe": 0.816,
+   "vol": 0.214,
+   "rebalance": "weekly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1605049",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "price-only weekly reversal over the screener universe"
+  },
+  {
+   "title": "Reversal During Earnings-Announcements",
+   "sharpe": 0.785,
+   "vol": 0.257,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2275982",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "earnings"
+   ],
+   "note": "needs the earnings calendar to time the window"
+  },
+  {
+   "title": "Size Factor – Small Capitalization Stocks Premium",
+   "sharpe": 0.747,
+   "vol": 0.111,
+   "rebalance": "yearly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3177539",
+   "feasible": "partial",
+   "requires": [
+    "fundamentals",
+    "profile"
+   ],
+   "note": "needs market cap; shares-outstanding is in EDGAR but the S&P 500 universe is large-cap by construction, so the spread is compressed"
+  },
+  {
+   "title": "Low Volatility Factor Effect in Stocks",
+   "sharpe": 0.717,
+   "vol": 0.115,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=980865",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "realized-vol rank from daily bars"
+  },
+  {
+   "title": "Rebalancing Premium in Cryptocurrencies",
+   "sharpe": 0.698,
+   "vol": 0.275,
+   "rebalance": "daily",
+   "asset_class": "Cryptos",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3982120",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "crypto"
+   ],
+   "note": "pure spot-crypto rebalancing; Coinbase universe already wired"
+  },
+  {
+   "title": "Paired Switching",
+   "sharpe": 0.691,
+   "vol": 0.095,
+   "rebalance": "quarterly",
+   "asset_class": "Bonds, equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1917044",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs a bond leg to switch into"
+  },
+  {
+   "title": "How to Use Lexical Density of Company Filings",
+   "sharpe": 0.688,
+   "vol": 0.10400000000000001,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3921091",
+   "feasible": "partial",
+   "requires": [
+    "filings"
+   ],
+   "note": "needs filing TEXT; the filings capability serves metadata and links only, by design"
+  },
+  {
+   "title": "Volatility Risk Premium Effect",
+   "sharpe": 0.637,
+   "vol": 0.132,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=189840",
+   "feasible": "no",
+   "requires": [
+    "options"
+   ],
+   "note": "sells options; Poseidon holds no options positions"
+  },
+  {
+   "title": "Pairs Trading with Stocks",
+   "sharpe": 0.634,
+   "vol": 0.085,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=141615",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "cointegration on daily closes; correlation matrix already platform-side"
+  },
+  {
+   "title": "Crude Oil Predicts Equity Returns",
+   "sharpe": 0.599,
+   "vol": 0.115,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=460500",
+   "feasible": "partial",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs a crude-oil series; no commodity provider is wired"
+  },
+  {
+   "title": "Betting Against Beta Factor in Stocks",
+   "sharpe": 0.594,
+   "vol": 0.18899999999999997,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://pages.stern.nyu.edu/~lpederse/papers/BettingAgainstBeta.pdf",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "beta vs benchmark from daily bars"
+  },
+  {
+   "title": "Time Series Momentum Effect",
+   "sharpe": 0.576,
+   "vol": 0.205,
+   "rebalance": "monthly",
+   "asset_class": "Bonds, commodities, currencies, equities",
+   "paper": "https://pages.stern.nyu.edu/~lpederse/papers/TimeSeriesMomentum.pdf",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs bonds/commodities/FX; Poseidon trades US equities and spot crypto"
+  },
+  {
+   "title": "Trend-following Effect in Stocks",
+   "sharpe": 0.569,
+   "vol": 0.152,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://www.cis.upenn.edu/~mkearns/finread/trend.pdf",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "price-only trend; closest to what the screener already ranks"
+  },
+  {
+   "title": "ESG Factor Momentum Strategy",
+   "sharpe": 0.559,
+   "vol": 0.218,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://www.semanticscholar.org/paper/Can-ESG-Add-Alpha-An-Analysis-of-ESG-Tilt-and-Nagy-Kassam/64f77da4f8ce5906a73ffe4e9eec7c49c0960acc",
+   "feasible": "no",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "needs an ESG ratings vendor; none free"
+  },
+  {
+   "title": "Value (Book-to-Market) Factor",
+   "sharpe": 0.526,
+   "vol": 0.11900000000000001,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2595747",
+   "feasible": "yes",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "book-to-market from filed statements"
+  },
+  {
+   "title": "Soccer Clubs’ Stocks Arbitrage",
+   "sharpe": 0.515,
+   "vol": 0.142,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1343685",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs listed European football clubs and match results"
+  },
+  {
+   "title": "Asset Class Trend-Following",
+   "sharpe": 0.502,
+   "vol": 0.10400000000000001,
+   "rebalance": "monthly",
+   "asset_class": "Bonds, commodities, equities, REITs",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=962461",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "multi-asset-class rotation across instruments Poseidon cannot hold"
+  },
+  {
+   "title": "Synthetic Lending Rates Predict Subsequent Market Return",
+   "sharpe": 0.494,
+   "vol": 0.13699999999999998,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3976307",
+   "feasible": "no",
+   "requires": [
+    "options"
+   ],
+   "note": "synthetic lending rate is derived from option put-call parity"
+  },
+  {
+   "title": "Skewness Effect in Commodities",
+   "sharpe": 0.482,
+   "vol": 0.177,
+   "rebalance": "monthly",
+   "asset_class": "Commodities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2671165",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "commodity futures; no futures venue"
+  },
+  {
+   "title": "Option-Expiration Week Effect",
+   "sharpe": 0.452,
+   "vol": 0.05,
+   "rebalance": "weekly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1571786",
+   "feasible": "partial",
+   "requires": [
+    "bars"
+   ],
+   "note": "the calendar effect is tradeable in equities, but the edge is documented via option expiry"
+  },
+  {
+   "title": "Dispersion Trading",
+   "sharpe": 0.432,
+   "vol": 0.081,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://www.academia.edu/16327015/EQUILIBRIUM_INDEX_AND_SINGLE_STOCK_VOLATILITY_RISK_PREMIA",
+   "feasible": "no",
+   "requires": [
+    "options"
+   ],
+   "note": "trades implied vs realized dispersion via options"
+  },
+  {
+   "title": "Momentum in Mutual Fund Returns",
+   "sharpe": 0.414,
+   "vol": 0.136,
+   "rebalance": "quarterly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1462408",
+   "feasible": "no",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "needs mutual-fund return data; not a Poseidon instrument"
+  },
+  {
+   "title": "Sector Momentum – Rotational System",
+   "sharpe": 0.401,
+   "vol": 0.141,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1585517",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "sector"
+   ],
+   "note": "sector rotation; the SECTOR capability already exists"
+  },
+  {
+   "title": "Combining Smart Factors Momentum and Market Portfolio",
+   "sharpe": 0.388,
+   "vol": 0.08199999999999999,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3745517",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "factor-momentum blend over the screener universe"
+  },
+  {
+   "title": "Momentum and Reversal Combined with Volatility Effect in Stocks",
+   "sharpe": 0.375,
+   "vol": 0.17,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1679464",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "momentum/reversal/vol blend, price-only"
+  },
+  {
+   "title": "FED Model",
+   "sharpe": 0.369,
+   "vol": 0.14300000000000002,
+   "rebalance": "monthly",
+   "asset_class": "Bonds, equities",
+   "paper": "https://www.researchgate.net/publication/228267011_The_FED_Model_and_Expected_Asset_Returns",
+   "feasible": "no",
+   "requires": [
+    "bars",
+    "fundamentals"
+   ],
+   "note": "needs a bond-yield leg to switch into"
+  },
+  {
+   "title": "Market Sentiment and an Overnight Anomaly",
+   "sharpe": 0.369,
+   "vol": 0.036000000000000004,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3829582",
+   "feasible": "partial",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs the overnight (close-to-open) split; daily bars carry open and close, so it is derivable"
+  },
+  {
+   "title": "January Barometer",
+   "sharpe": 0.365,
+   "vol": 0.07400000000000001,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1436516",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "calendar rule on index returns"
+  },
+  {
+   "title": "R&D Expenditures and Stock Returns",
+   "sharpe": 0.354,
+   "vol": 0.081,
+   "rebalance": "yearly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=227564",
+   "feasible": "yes",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "R&D line item from filed statements"
+  },
+  {
+   "title": "Value Factor – CAPE Effect within Countries",
+   "sharpe": 0.351,
+   "vol": 0.20199999999999999,
+   "rebalance": "yearly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2129474",
+   "feasible": "no",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "CAPE across countries; needs multi-country index data"
+  },
+  {
+   "title": "12 Month Cycle in Cross-Section of Stocks Returns",
+   "sharpe": 0.34,
+   "vol": 0.43700000000000006,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=687022",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "seasonal cross-section from daily bars"
+  },
+  {
+   "title": "Momentum Asset Allocation Strategy",
+   "sharpe": 0.321,
+   "vol": 0.11,
+   "rebalance": "monthly",
+   "asset_class": "Bonds, commodities, equities, REITs",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1585517",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "multi-asset-class rotation across instruments Poseidon cannot hold"
+  },
+  {
+   "title": "Turn of the Month in Equity Indexes",
+   "sharpe": 0.305,
+   "vol": 0.07200000000000001,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=917884",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "pure calendar rule"
+  },
+  {
+   "title": "Payday Anomaly",
+   "sharpe": 0.269,
+   "vol": 0.038,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3257064",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "pure calendar rule"
+  },
+  {
+   "title": "Pairs Trading with Country ETFs",
+   "sharpe": 0.257,
+   "vol": 0.057,
+   "rebalance": "daily",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1958546",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs country ETFs; universe is S&P 500 constituents"
+  },
+  {
+   "title": "FX Carry Trade",
+   "sharpe": 0.254,
+   "vol": 0.078,
+   "rebalance": "monthly",
+   "asset_class": "Currencies",
+   "paper": "http://globalmarkets.db.com/new/docs/dbCurrencyReturns_March2009.pdf",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "FX pairs; no FX venue"
+  },
+  {
+   "title": "Residual Momentum Factor",
+   "sharpe": 0.24,
+   "vol": 0.09699999999999999,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2319861",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "residual momentum — the new factor_model regression computes exactly these residuals"
+  },
+  {
+   "title": "Return Asymmetry Effect in Commodity Futures",
+   "sharpe": 0.239,
+   "vol": 0.134,
+   "rebalance": "monthly",
+   "asset_class": "Commodities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3918896",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "commodity futures; no futures venue"
+  },
+  {
+   "title": "Earnings Announcement Premium",
+   "sharpe": 0.192,
+   "vol": 0.037000000000000005,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://www.nber.org/system/files/working_papers/w13090/w13090.pdf",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "earnings"
+   ],
+   "note": "earnings calendar already wired"
+  },
+  {
+   "title": "ROA Effect within Stocks",
+   "sharpe": 0.155,
+   "vol": 0.087,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://static1.squarespace.com/static/5e6033a4ea02d801f37e15bb/t/5f61583e88f43b7d5b7196b5/1600215105801/Chen_Zhang_JF.pdf",
+   "feasible": "yes",
+   "requires": [
+    "fundamentals"
+   ],
+   "note": "ROA from filed statements"
+  },
+  {
+   "title": "Value and Momentum Factors across Asset Classes",
+   "sharpe": 0.155,
+   "vol": 0.098,
+   "rebalance": "monthly",
+   "asset_class": "Bonds, equities, REITs",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1079975",
+   "feasible": "no",
+   "requires": [
+    "bars",
+    "fundamentals"
+   ],
+   "note": "needs bonds and REITs"
+  },
+  {
+   "title": "52-Weeks High Effect in Stocks",
+   "sharpe": 0.153,
+   "vol": 0.19,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1787378",
+   "feasible": "yes",
+   "requires": [
+    "bars"
+   ],
+   "note": "52-week high distance from daily bars"
+  },
+  {
+   "title": "Combining Fundamental FSCORE and Equity Short-Term Reversals",
+   "sharpe": 0.153,
+   "vol": 0.17600000000000002,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3097420",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "fundamentals"
+   ],
+   "note": "Piotroski FSCORE from statements plus a price reversal"
+  },
+  {
+   "title": "Betting Against Beta Factor in International Equities",
+   "sharpe": 0.142,
+   "vol": 0.091,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://pages.stern.nyu.edu/~lpederse/papers/BettingAgainstBeta.pdf",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "international equities; universe is US"
+  },
+  {
+   "title": "Momentum Effect in Commodities",
+   "sharpe": 0.14,
+   "vol": 0.203,
+   "rebalance": "monthly",
+   "asset_class": "Commodities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=702281",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "commodity futures; no futures venue"
+  },
+  {
+   "title": "Term Structure Effect in Commodities",
+   "sharpe": 0.128,
+   "vol": 0.231,
+   "rebalance": "monthly",
+   "asset_class": "Commodities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1127213",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs the futures term structure"
+  },
+  {
+   "title": "Dollar Carry Trade",
+   "sharpe": 0.113,
+   "vol": 0.057999999999999996,
+   "rebalance": "monthly",
+   "asset_class": "Currencies",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1541230",
+   "feasible": "no",
+   "requires": [
+    "bars"
+   ],
+   "note": "FX pairs; no FX venue"
+  },
+  {
+   "title": "Short Interest Effect – Long-Short Version",
+   "sharpe": 0.079,
+   "vol": 0.066,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://www.semanticscholar.org/paper/Why-Do-Short-Interest-Levels-Predict-Stock-Returns-Boehmer-Erturk/06418ef437dc7156229532a97d0f8392373eb297?p2df",
+   "feasible": "partial",
+   "requires": [
+    "bars"
+   ],
+   "note": "needs short interest; FINRA publishes it keylessly but no provider is wired yet"
+  },
+  {
+   "title": "Momentum Factor Combined with Asset Growth Effect",
+   "sharpe": 0.058,
+   "vol": 0.251,
+   "rebalance": "monthly",
+   "asset_class": "Equities",
+   "paper": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1684767",
+   "feasible": "yes",
+   "requires": [
+    "bars",
+    "fundamentals"
+   ],
+   "note": "momentum screen plus an asset-growth filter"
+  }
+ ]
+}

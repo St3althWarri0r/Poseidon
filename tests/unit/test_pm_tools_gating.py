@@ -18,6 +18,7 @@ from poseidon.ai.schemas import (
     CORRELATION_TOOL,
     DATA_TOOLS,
     FUNDAMENTALS_TOOLS,
+    MACRO_CONTEXT_TOOL,
     READ_URL_TOOL,
     SCREEN_MARKET_TOOL,
     SUBMIT_DECISION_TOOL,
@@ -57,6 +58,7 @@ def test_defaults_are_all_off() -> None:
     assert pm.web_read.allow_http is False
     assert pm.screen_market is False
     assert pm.correlation is False
+    assert pm.macro_context is False
     assert optional_data_tools(pm) == []
 
 
@@ -135,12 +137,60 @@ def test_trio_schemas_are_strict_and_fully_required() -> None:
     assert "advisory" in CORRELATION_TOOL["description"].lower()
 
 
-def test_budget_gate_membership_is_the_thirteen_name_contract() -> None:
+def test_budget_gate_membership_is_the_fourteen_name_contract() -> None:
     contracted = {
         "get_quote", "get_bars", "get_option_chain", "get_news",
         "get_earnings_calendar", "get_economic_calendar", "get_market_snapshot",
         "get_fundamentals", "get_filings", "get_insider_transactions",
         "read_url", "screen_market", "compute_correlation_matrix",
+        # get_macro_context fetches over the network like the rest, so it sits
+        # under the same per-cycle ceiling rather than beside it.
+        "get_macro_context",
     }
     assert set(_DATA_TOOL_NAMES) == contracted
-    assert len(contracted) == 13
+    assert len(contracted) == 14
+
+
+# ------------------------------------------------------- macro context (r3)
+
+
+def test_macro_context_is_off_by_default_and_absent_from_the_catalog() -> None:
+    pm = PMToolsConfig()
+    assert pm.macro_context is False
+    assert MACRO_CONTEXT_TOOL not in optional_data_tools(pm)
+
+
+def test_macro_context_appears_last_when_enabled() -> None:
+    pm = PMToolsConfig(web_read=WebReadConfig(enabled=True), screen_market=True,
+                       correlation=True, macro_context=True)
+    names = [t["name"] for t in optional_data_tools(pm)]
+    assert names == [*_TRIO_NAMES, "get_macro_context"]
+
+
+def test_macro_context_can_be_enabled_alone() -> None:
+    pm = PMToolsConfig(macro_context=True)
+    assert [t["name"] for t in optional_data_tools(pm)] == ["get_macro_context"]
+
+
+def test_macro_tool_disclaims_price_truth_in_its_own_description() -> None:
+    # The model reads the catalog before it ever calls the tool, so the
+    # "not a price source" contract has to be stated HERE too, not only in
+    # the payload it gets back afterwards.
+    description = MACRO_CONTEXT_TOOL["description"].lower()
+    assert "delayed" in description
+    assert "get_quote" in description
+    assert "never a price source" in description or "not a price source" in description
+
+
+async def test_disabled_macro_tool_raises_rather_than_silently_returning() -> None:
+    # dispatch() resolves any _tool_* by getattr, so catalog absence alone is
+    # not a gate: the handler must refuse on its own.
+    import json
+
+    from poseidon.ai.tools import ToolDispatcher
+
+    disp = ToolDispatcher(None, None, None,  # type: ignore[arg-type]
+                          allow_delayed_quotes=True, pm_tools=PMToolsConfig())
+    out, is_error = await disp.dispatch("get_macro_context", {})
+    assert is_error is True
+    assert "disabled in config" in json.loads(out)["error"]

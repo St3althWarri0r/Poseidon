@@ -338,10 +338,24 @@ CORRELATION_TOOL: dict[str, Any] = _simple_tool(
 )
 
 
+MACRO_CONTEXT_TOOL: dict[str, Any] = _simple_tool(
+    "get_macro_context",
+    "Market REGIME context: the CBOE VIX level (DELAYED — a daily index "
+    "print, not a live quote) plus the US Treasury par yield curve and its "
+    "10Y-3M term spread. Use it to judge the environment a name trades in, "
+    "not the name itself. Never a price source and never a trade signal — "
+    "get_quote/get_market_snapshot remain the only price truth. Either leg "
+    "may be missing; a listed gap means unavailable, never zero.",
+    {},
+    [],
+)
+
+
 def optional_data_tools(cfg: PMToolsConfig) -> list[dict[str, Any]]:
-    """The enabled subset of the config-gated pm_tools trio, in fixed order
-    (read_url, screen_market, compute_correlation_matrix). All flags default
-    off, so the default result is [] and the catalogs stay byte-identical."""
+    """The enabled subset of the config-gated pm_tools, in fixed order
+    (read_url, screen_market, compute_correlation_matrix, get_macro_context).
+    All flags default off, so the default result is [] and the catalogs stay
+    byte-identical."""
     out: list[dict[str, Any]] = []
     if cfg.web_read.enabled:
         out.append(READ_URL_TOOL)
@@ -349,4 +363,6 @@ def optional_data_tools(cfg: PMToolsConfig) -> list[dict[str, Any]]:
         out.append(SCREEN_MARKET_TOOL)
     if cfg.correlation:
         out.append(CORRELATION_TOOL)
+    if cfg.macro_context:
+        out.append(MACRO_CONTEXT_TOOL)
     return out

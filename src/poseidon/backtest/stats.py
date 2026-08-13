@@ -384,3 +384,84 @@ def equal_weight_returns(closes_by_day: dict[str, dict[date, float]],
                 moves.append(cur / prev - 1)
         rets.append(sum(moves) / len(moves) if moves else 0.0)
     return rets
+
+
+# -- multi-factor regression ---------------------------------------------------
+
+
+def _solve_symmetric(matrix: list[list[float]],
+                     rhs: list[float]) -> tuple[list[float], list[list[float]]] | None:
+    """Gauss-Jordan solve of ``matrix @ b = rhs``, also returning the inverse.
+
+    Stdlib-only by design (this module forbids numpy), with partial pivoting so
+    an ill-conditioned normal-equations matrix is detected rather than silently
+    producing garbage coefficients. Returns None when the system is singular to
+    working precision — the honest answer for collinear regressors.
+    """
+    k = len(rhs)
+    # Augment [A | I] and reduce; the right half becomes A^-1.
+    aug = [list(matrix[i]) + [1.0 if i == j else 0.0 for j in range(k)] for i in range(k)]
+    for col in range(k):
+        pivot_row = max(range(col, k), key=lambda r: abs(aug[r][col]))
+        pivot = aug[pivot_row][col]
+        if abs(pivot) < 1e-14:
+            return None  # singular: collinear or degenerate regressors
+        aug[col], aug[pivot_row] = aug[pivot_row], aug[col]
+        pivot = aug[col][col]
+        aug[col] = [v / pivot for v in aug[col]]
+        for row in range(k):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if factor != 0.0:
+                aug[row] = [v - factor * p for v, p in zip(aug[row], aug[col], strict=True)]
+    inverse = [row[k:] for row in aug]
+    beta = [sum(inverse[i][j] * rhs[j] for j in range(k)) for i in range(k)]
+    return beta, inverse
+
+
+def multi_ols(y: list[float], regressors: list[list[float]], *,
+              min_obs: int = 61) -> dict[str, Any] | None:
+    """OLS of ``y`` on several regressors with an intercept.
+
+    ``regressors`` is a list of equal-length columns. Returns the intercept
+    (``alpha_daily``), one coefficient per regressor, their t-statistics, R^2
+    and ``n_days`` — or None when there are too few observations, when the
+    shapes disagree, or when the system is singular. Mirrors
+    :func:`ols_alpha_beta`'s honesty gate (>60 aligned observations) so the
+    single- and multi-regressor paths agree on what is estimable.
+    """
+    n = len(y)
+    if not regressors or any(len(col) != n for col in regressors):
+        return None
+    k = len(regressors) + 1  # + intercept
+    if n < min_obs or n <= k:
+        return None
+    # Design matrix rows: [1, x1, x2, ...]
+    design = [[1.0, *(col[i] for col in regressors)] for i in range(n)]
+    xtx = [[sum(design[r][i] * design[r][j] for r in range(n)) for j in range(k)]
+           for i in range(k)]
+    xty = [sum(design[r][i] * y[r] for r in range(n)) for i in range(k)]
+    solved = _solve_symmetric(xtx, xty)
+    if solved is None:
+        return None
+    beta, inverse = solved
+    fitted = [sum(beta[i] * design[r][i] for i in range(k)) for r in range(n)]
+    residuals = [y[r] - fitted[r] for r in range(n)]
+    ssr = sum(e * e for e in residuals)
+    mean_y = sum(y) / n
+    sst = sum((v - mean_y) ** 2 for v in y)
+    s2 = ssr / (n - k)
+    t_stats: list[float | None] = []
+    for i in range(k):
+        var_i = s2 * inverse[i][i]
+        t_stats.append(beta[i] / var_i ** 0.5 if var_i > 0 else None)
+    return {
+        "alpha_daily": beta[0],
+        "alpha_annual": beta[0] * _TRADING_DAYS,
+        "t_alpha": t_stats[0],
+        "betas": beta[1:],
+        "t_betas": t_stats[1:],
+        "r2": 1 - ssr / sst if sst > 0 else None,
+        "n_days": n,
+    }
