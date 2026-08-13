@@ -216,4 +216,29 @@ assert.equal(S.coerce(entry({ kind: "float" }), "").ok, false);
   assert.equal(rows[rows.length - 1].value, "—");
 }
 
+// -- pending values (saved but not yet loaded) ------------------------------
+
+{
+  // The subtle failure this view exists to prevent: after a restart-required
+  // save the engine still holds the old value, so rendering `value` would snap
+  // the control back and look exactly like the save was lost.
+  const pend = entry({ value: false, pending_value: true, pending: true,
+                       provenance: "overlay" });
+  assert.equal(S.displayValue(pend), true);
+  assert.equal(S.provenanceBadge(pend).kind, "pending");
+  assert.ok(S.provenanceBadge(pend).text.includes("pending restart"));
+  const note = S.statusNote(pend);
+  assert.ok(note.includes("Saved"));
+  assert.ok(note.includes("still running"));
+}
+
+{
+  // Nothing pending: display the live value and badge normally.
+  const settled = entry({ value: true, pending_value: true, pending: false,
+                          provenance: "config file" });
+  assert.equal(S.displayValue(settled), true);
+  assert.equal(S.provenanceBadge(settled).kind, "file");
+  assert.ok(S.statusNote(settled).includes("after a restart"));
+}
+
 console.log("all assertions passed");

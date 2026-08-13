@@ -576,3 +576,4 @@ label input, label select { width: 100%; min-width: 0; }
 .factor-block { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .factor-block h4 { margin: 0 0 6px; font-size: 13px; }
 .factor-hint { color: var(--muted); font-size: 11px; font-weight: 400; margin-left: 6px; }
+.badge-pending { background: #4a3a1a; color: #ffe0a3; }
