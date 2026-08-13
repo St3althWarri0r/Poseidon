@@ -4,6 +4,65 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.16.0] — 2026-08-13
+
+Round 3 of the starred-repo cross-pollination. The sources this round —
+**OpenBB** (AGPL-3.0) and **awesome-systematic-trading** (unlicensed) — could
+not be copied from at all; everything here is implemented from each upstream
+data source's own public API, with OpenBB used only as a map of what exists.
+
+**Every new feature is off by default.**
+
+### Fixed — Sharpe and Sortino assumed a zero risk-free rate
+
+- `backtest/stats.py` hardcoded **rf = 0**, so a portfolio merely matching
+  T-bills scored a healthy positive Sharpe instead of the honest zero — and the
+  PM reads these numbers to choose trades. Both ratios now take
+  `risk_free_annual`, and Sortino measures shortfall against the rate rather
+  than against zero: a positive day that still loses to cash *is* a shortfall.
+- The **live** performance report was fixed alongside the backtest one.
+  `analytics/performance.py` had always accepted the parameter; its caller
+  passed nothing. The report now also states the rate it used, because a Sharpe
+  without its risk-free rate is an unfalsifiable number.
+- The bootstrap confidence interval and every walk-forward fold are measured on
+  the *same* rate as the headline. Left mixed, a report could print a point
+  estimate outside its own confidence interval.
+- **Three separate inline copies of the Sharpe formula** were consolidated onto
+  `stats.sharpe_ratio`.
+- A degenerate-benchmark guard (`sxx <= 0`) was interpreter-dependent: CPython
+  3.12+ compensates float summation and yields exact zero for a constant
+  series, while earlier versions leave ~1e-35 — and beta then became a division
+  *by* that residue, turning rounding noise into a plausible-looking
+  coefficient. Now gated on magnitude relative to the series' own scale.
+
+### Added — market state, which the platform never had
+
+- **`data/treasury.py`** — the US Treasury par yield curve, keyless. Serves the
+  risk-free rate and the 10Y-3M term spread. (Ken French's `RF` column was
+  measured and rejected for the rate: two decimals of a *daily* figure quantizes
+  to 2.52%/yr steps — 2023, 2024 and 2025 all report exactly 5.04%.)
+- **`data/macro.py`** — VIX plus the curve as one regime snapshot, behind
+  `ai.pm_tools.macro_context`. CBOE's feed is delayed and is labelled delayed
+  everywhere it appears. The two legs degrade independently: one source down
+  still reports the other, both down still returns a snapshot with named gaps
+  rather than costing a cycle its decision. A missing leg is a gap, never a zero.
+
+### Added — alpha net of the known factors
+
+- **`backtest/factor_model.py`** with `stats.multi_ols`: Fama-French three-factor
+  attribution behind `backtest.factor_attribution`. A strategy holding a size
+  tilt is now attributed to SMB instead of scoring "alpha" against a single
+  benchmark. Stdlib-only (normal equations via Gauss-Jordan with partial
+  pivoting), so collinear regressors are detected rather than silently fitted.
+
+### Added — a screened strategy menu
+
+- **`research/menu.py`** — 51 published systematic strategies with each source
+  paper's own reported Sharpe, volatility and cadence, screened against what
+  Poseidon can actually trade: 23 runnable, 6 partial, 22 blocked with each
+  blocker named. Reported figures are labelled the papers', never Poseidon
+  backtests.
+
 ## [2.15.0] — 2026-08-13
 
 Research-port wave 2 of the Vibe-Trading / TradingAgents cross-pollination
