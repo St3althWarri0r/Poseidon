@@ -611,3 +611,48 @@ class TestRiskFreeResolution:
 
         monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", down)
         assert await shop._resolve_risk_free(date(2026, 8, 12)) == 0.0
+
+
+class TestFactorAttributionGating:
+    """Off by default; a failed fetch omits the block rather than failing the run."""
+
+    @pytest.fixture()
+    async def shop(self, tmp_path):  # noqa: ANN001
+        db = Database(tmp_path / "fa.db")
+        await db.open()
+        yield AlgorithmWorkshop(db, StrategyEngine([], []), AuditLog(db),
+                                default_symbols=["AAPL"])
+        await db.close()
+
+    async def test_off_by_default_does_not_fetch(self, shop, monkeypatch) -> None:  # noqa: ANN001
+        async def explode(**_kwargs):  # noqa: ANN003, ANN202
+            raise AssertionError("must not fetch while the feature is off")
+
+        monkeypatch.setattr("poseidon.data.famafrench.fetch_factor_rows", explode)
+        assert await shop._resolve_factor_rows() is None
+
+    async def test_enabled_returns_rows(self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.core.config import BacktestEvalConfig
+        from poseidon.data.famafrench import FactorRow
+
+        rows = [FactorRow(day=date(2026, 1, 2), mkt_rf=0.001, smb=0.0,
+                          hml=0.0, rf=0.0001)]
+
+        async def fake(**_kwargs):  # noqa: ANN003, ANN202
+            return rows
+
+        monkeypatch.setattr("poseidon.data.famafrench.fetch_factor_rows", fake)
+        shop._eval = BacktestEvalConfig(factor_attribution=True)
+        assert await shop._resolve_factor_rows() == rows
+
+    async def test_a_failed_fetch_omits_the_block_instead_of_failing(
+            self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.core.config import BacktestEvalConfig
+        from poseidon.core.errors import DataError
+
+        async def down(**_kwargs):  # noqa: ANN003, ANN202
+            raise DataError("dartmouth unreachable")
+
+        monkeypatch.setattr("poseidon.data.famafrench.fetch_factor_rows", down)
+        shop._eval = BacktestEvalConfig(factor_attribution=True)
+        assert await shop._resolve_factor_rows() is None

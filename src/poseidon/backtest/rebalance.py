@@ -42,6 +42,7 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
                              end: date | None = None,
                              benchmark: tuple[str, dict[date, float]] | None = None,
                              risk_free_annual: float = 0.0,
+                             factor_rows: list[Any] | None = None,
                              significance_runs: int = 0,
                              bootstrap_runs: int = 0,
                              monte_carlo_runs: int = 0,
@@ -320,6 +321,23 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
             bootstrap = stats.bootstrap_sharpe(
                 rets, runs=bootstrap_runs, seed=seed,
                 risk_free_annual=risk_free_annual)
+    # Fama-French attribution: what survives market/size/value exposure. Rows
+    # are passed IN rather than fetched — this function stays pure and offline.
+    factor_block: dict[str, Any] | None = None
+    if factor_rows:
+        from .factor_model import attribute
+
+        # Keyed by DATE: the factor series skips market holidays, so a
+        # positional zip would pair different days and invent a correlation.
+        by_day = {curve_days[i + 1]: rets[i] for i in range(len(rets))
+                  if i + 1 < len(curve_days)}
+        # NB: not named `attribution` — that is the imported module.
+        factor_fit = attribute(by_day, factor_rows)
+        if factor_fit is None:
+            warnings.append("factor_attribution_insufficient_overlap")
+        else:
+            factor_block = factor_fit.as_dict()
+
     monte_carlo_block: dict[str, Any] | None = None
     if monte_carlo_runs > 0:
         if len(rets) < 20:
@@ -351,6 +369,7 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         "avg_positions": round(sum(position_days) / len(position_days), 1) if position_days else 0,
         "annualized_volatility": round(float(std * 252 ** 0.5), 4),
         "sortino": round(stats.sortino(rets, risk_free_annual=risk_free_annual), 2),
+        "factor_attribution": factor_block,
         "calmar": round(stats.calmar(cagr_value, max_dd), 2),
         "turnover_gross": round(turnover_gross, 4),
         "turnover_annual": round(turnover_annual, 4),

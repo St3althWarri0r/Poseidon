@@ -215,6 +215,24 @@ class AlgorithmWorkshop:
             "note": "dry run against live data — nothing was traded or saved",
         }
 
+    async def _resolve_factor_rows(self) -> list[Any] | None:
+        """Ken French factor rows for the backtest's attribution block.
+
+        Returns None when the feature is off (the default) or the fetch fails —
+        the backtest then simply omits the block. Optional analysis must never
+        be able to fail a run.
+        """
+        if not self._eval.factor_attribution:
+            return None
+        try:
+            from ..data.famafrench import fetch_factor_rows
+
+            return await fetch_factor_rows()
+        except Exception as exc:
+            log.warning("factor attribution unavailable; omitting the block",
+                        error=str(exc))
+            return None
+
     async def _resolve_risk_free(self, as_of: date | None) -> float:
         """Annualized risk-free rate for a backtest window.
 
@@ -350,10 +368,12 @@ class AlgorithmWorkshop:
         # confidence interval, and folds on a different basis than the
         # headline they are compared against.
         risk_free = await self._resolve_risk_free(window_end)
+        factor_rows = await self._resolve_factor_rows()
         report = await rebalance_backtest(
             algo, history, starting_cash=starting_cash,
             start=window_start, end=window_end, benchmark=benchmark,
             risk_free_annual=risk_free,
+            factor_rows=factor_rows,
             significance_runs=self._eval.significance_runs,
             bootstrap_runs=self._eval.bootstrap_runs,
             monte_carlo_runs=self._eval.monte_carlo_runs,

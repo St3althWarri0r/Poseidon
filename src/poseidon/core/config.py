@@ -488,6 +488,10 @@ class BacktestEvalConfig(StrictModel):
     # makes the ratios honest (at rf=0 a portfolio matching T-bills scores
     # a healthy positive instead of zero).
     risk_free_annual: float | Literal["auto"] = "auto"
+    # Fama-French 3-factor attribution of the backtest's own returns: what
+    # survives market/size/value exposure. OFF by default — it costs one
+    # keyless fetch of the Ken French daily file (~178 KB, cached a day).
+    factor_attribution: bool = False
 
 
 class ScreenerConfigBase(StrictModel):
