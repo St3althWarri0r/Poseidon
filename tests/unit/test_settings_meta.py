@@ -228,3 +228,37 @@ def test_a_base_file_value_already_loaded_is_not_pending() -> None:
     entry = entries["ai.pm_tools.screen_market"]
     assert entry["value"] is True
     assert entry["pending"] is False
+
+
+def test_a_decimal_setting_matching_its_yaml_is_not_reported_pending() -> None:
+    """Decimal-typed settings must not spuriously read as pending.
+
+    Money-ish limits are Decimal in the model, and the described value is
+    stringified for JSON ('10000000') while the parsed YAML holds an int
+    (10000000). Comparing those raw made every such field look saved-but-not-
+    loaded — a false "pending restart" badge on, of all things, the risk
+    limits, which is exactly the kind of untrue signal that teaches an
+    operator to ignore badges.
+    """
+    base = {"risk": {"max_order_notional": 10000000},
+            "crypto_screener": {"min_dollar_volume": 2000000}}
+    config = AppConfig.model_validate(base)
+    entries = {e["path"]: e for e in describe(config, base, {})}
+    assert entries["risk.max_order_notional"]["pending"] is False
+    assert entries["crypto_screener.min_dollar_volume"]["pending"] is False
+
+
+def test_a_numeric_setting_that_genuinely_differs_is_still_pending() -> None:
+    # The tolerance must not swallow a real change.
+    config = AppConfig.model_validate({"risk": {"max_order_notional": 10000000}})
+    overlay = {"risk": {"max_order_notional": 5000000}}
+    entries = {e["path"]: e for e in describe(config, {}, overlay)}
+    assert entries["risk.max_order_notional"]["pending"] is True
+
+
+def test_numeric_equality_ignores_int_float_spelling() -> None:
+    # 0.20 in YAML against Decimal("0.20") in the model is the same limit.
+    base = {"risk": {"max_position_pct": 0.20}}
+    config = AppConfig.model_validate(base)
+    entries = {e["path"]: e for e in describe(config, base, {})}
+    assert entries["risk.max_position_pct"]["pending"] is False
