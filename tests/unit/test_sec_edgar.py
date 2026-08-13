@@ -13,6 +13,7 @@ throttle.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import date
@@ -205,6 +206,33 @@ async def test_ticker_map_cached_across_calls(monkeypatch) -> None:
     provider = _provider(seen=seen)
     await provider.fundamentals("AAPL")
     await provider.fundamentals("aapl")  # case-insensitive; cache hit
+    ticker_fetches = [r for r in seen if r.url.path == "/files/company_tickers.json"]
+    assert len(ticker_fetches) == 1
+
+
+async def test_concurrent_cold_start_fetches_ticker_map_once(monkeypatch) -> None:
+    # Cold-start race: the cache check and the fill are separated by an await,
+    # so N coroutines arriving together each see an empty map and each fire the
+    # (large, rate-limited) tickers download. One lock, one fetch.
+    #
+    # The handler must be ASYNC and actually yield: a plain sync MockTransport
+    # handler completes without ever returning to the event loop, so the first
+    # caller fills the cache before the others run and the race silently fails
+    # to reproduce. Real network I/O always yields here.
+    _fast(monkeypatch)
+    seen: list[httpx.Request] = []
+    table = _url_payloads()
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        await asyncio.sleep(0)  # the yield a real socket would give us
+        url = str(req.url).split("?")[0]
+        return httpx.Response(200, content=json.dumps(table[url]).encode(),
+                              headers={"content-type": "application/json"})
+
+    provider = SecEdgarProvider(api_key="")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    await asyncio.gather(*(provider.fundamentals("AAPL") for _ in range(5)))
     ticker_fetches = [r for r in seen if r.url.path == "/files/company_tickers.json"]
     assert len(ticker_fetches) == 1
 

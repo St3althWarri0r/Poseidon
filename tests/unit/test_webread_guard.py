@@ -105,6 +105,9 @@ async def test_explicit_default_ports_allowed() -> None:
     "https://0.0.0.0/",
     "https://[::ffff:10.0.0.5]/",  # IPv4-mapped IPv6 smuggling a private v4
     "https://224.0.0.1/",  # multicast
+    "https://100.64.0.1/",  # RFC6598 CGNAT — carrier-grade NAT space
+    "https://100.127.255.254/",  # last CGNAT address
+    "https://[::ffff:100.64.0.1]/",  # CGNAT smuggled as IPv4-mapped IPv6
 ])
 async def test_literal_non_public_hosts_rejected_without_io(url: str) -> None:
     with pytest.raises(WebReadBlockedError):
@@ -112,7 +115,28 @@ async def test_literal_non_public_hosts_rejected_without_io(url: str) -> None:
                             transport=_tripwire_transport())
 
 
+async def test_cgnat_neighbours_stay_reachable() -> None:
+    # The block must be exactly 100.64.0.0/10 — the addresses either side of it
+    # are ordinary global unicast and must not become collateral damage.
+    transport = httpx.MockTransport(lambda _req: httpx.Response(
+        200, content=b"ok", headers={"content-type": "text/plain"}))
+    for host in ("100.63.255.255", "100.128.0.0"):
+        result = await guarded_fetch(f"https://{host}/", WebReadConfig(),
+                                     resolver=_forbid_resolver(), transport=transport)
+        assert result.status == 200
+
+
 # -------------------------------------------------------- DNS resolve-then-reject
+
+
+async def test_dns_resolved_cgnat_rejected() -> None:
+    # CGNAT is invisible to every ``ipaddress`` predicate the guard already
+    # uses — is_private/is_reserved/is_multicast are all False for 100.64/10 —
+    # so a name resolving into it would otherwise sail straight through.
+    with pytest.raises(WebReadBlockedError):
+        await guarded_fetch("https://example.com/", WebReadConfig(),
+                            resolver=_resolver({"example.com": ["100.64.12.9"]}),
+                            transport=_tripwire_transport())
 
 
 async def test_dns_resolved_private_rejected() -> None:

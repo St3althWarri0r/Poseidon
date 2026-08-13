@@ -365,8 +365,11 @@ class ToolDispatcher:
         result = await webread.guarded_fetch(url, cfg)
         # Injection scan runs on the FULL extracted text BEFORE slicing so a
         # payload split across the offset/max_chars boundary can't dodge the
-        # detector (get_news precedent). Annotate, never rewrite.
-        warning = _scan_injection(result.text)
+        # detector (get_news precedent). The <title> is scanned alongside it:
+        # it reaches the model verbatim in its own payload field, so a
+        # body-only scan would wave a payload hidden there straight through.
+        # Annotate, never rewrite — both fields stay byte-verbatim.
+        warning = _scan_injection(f"{result.title or ''}\n{result.text}")
         start = max(0, offset)
         content = result.text[start:start + cfg.max_chars]
         self.sources_used.add(f"web:{result.host}")  # provenance → Decision.data_sources

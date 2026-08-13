@@ -136,6 +136,7 @@ class SecEdgarProvider(MarketDataProvider):
         self._last_request = 0.0
         self._cik_by_ticker: dict[str, int] = {}
         self._ciks_fetched_at = 0.0
+        self._cik_lock = asyncio.Lock()
 
     def capabilities(self) -> frozenset[DataCapability]:
         return frozenset({DataCapability.FUNDAMENTALS, DataCapability.FILINGS})
@@ -150,26 +151,37 @@ class SecEdgarProvider(MarketDataProvider):
             self._last_request = time.monotonic()
         return await self._get_json(url, headers={"User-Agent": self._user_agent})
 
+    def _cache_is_cold(self) -> bool:
+        return (not self._cik_by_ticker
+                or time.monotonic() - self._ciks_fetched_at > _TICKER_CACHE_TTL)
+
     async def _cik(self, symbol: str) -> int:
         sym = symbol.strip().upper()
-        now = time.monotonic()
-        if not self._cik_by_ticker or now - self._ciks_fetched_at > _TICKER_CACHE_TTL:
-            payload = await self._get(_TICKERS_URL)
-            mapping: dict[str, int] = {}
-            rows = payload.values() if isinstance(payload, dict) else []
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                ticker = str(row.get("ticker") or "").upper()
-                try:
-                    cik_number = int(row["cik_str"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if ticker:
-                    mapping.setdefault(ticker, cik_number)
-            if mapping:
-                self._cik_by_ticker = mapping
-                self._ciks_fetched_at = now
+        # Double-checked locking (mirrors yahoo_fundamentals._handshake): the
+        # cheap read stays lock-free on the hot path, and the await that fills
+        # the cache is serialised so a cold start under concurrency downloads
+        # the multi-MB ticker map ONCE instead of once per caller — which would
+        # also burst straight through the SEC fair-access ceiling.
+        if self._cache_is_cold():
+            async with self._cik_lock:
+                if self._cache_is_cold():  # another coroutine may have filled it
+                    now = time.monotonic()
+                    payload = await self._get(_TICKERS_URL)
+                    mapping: dict[str, int] = {}
+                    rows = payload.values() if isinstance(payload, dict) else []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        ticker = str(row.get("ticker") or "").upper()
+                        try:
+                            cik_number = int(row["cik_str"])
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if ticker:
+                            mapping.setdefault(ticker, cik_number)
+                    if mapping:
+                        self._cik_by_ticker = mapping
+                        self._ciks_fetched_at = now
         cik = self._cik_by_ticker.get(sym)
         if cik is None:
             raise ProviderError(self.name, f"unknown SEC ticker {symbol!r}", retryable=False)

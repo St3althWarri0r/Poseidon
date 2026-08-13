@@ -6,7 +6,7 @@ Every hop of every fetch passes the FULL guard before any I/O:
   * no userinfo in the URL, port 80/443/default only;
   * the host must not be — literally or via ANY resolved A/AAAA record
     (IPv4-mapped IPv6 unwrapped) — private, loopback, link-local, multicast,
-    reserved, or unspecified;
+    reserved, unspecified, or RFC6598 CGNAT (100.64.0.0/10);
   * redirects are never auto-followed: each ``Location`` is re-validated from
     scratch (a public host cannot bounce the fetch into the metadata service);
   * the body is streamed and aborted past ``max_bytes``; only text-ish content
@@ -72,10 +72,19 @@ async def _default_resolver(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")  # RFC6598 carrier-grade NAT
+
+
 def _address_disallowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:  # ::ffff:10.0.0.5 is 10.0.0.5 in a v6 coat
         addr = mapped
+    # CGNAT is checked explicitly: it is neither private nor reserved to
+    # ``ipaddress``, yet it addresses the carrier's own infrastructure. Note we
+    # deliberately do NOT collapse this to ``not addr.is_global`` — multicast
+    # (224.0.0.1) reports is_global=True, so that swap would open a hole.
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT:
+        return True
     return (addr.is_private or addr.is_loopback or addr.is_link_local
             or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
 
