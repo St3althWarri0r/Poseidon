@@ -15,6 +15,7 @@ Every state change is audited.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..core.config import BacktestEvalConfig
 from ..core.errors import ConfigError
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
@@ -54,7 +56,9 @@ def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:
 class AlgorithmWorkshop:
     def __init__(self, db: Database, engine: StrategyEngine, audit: AuditLog,
                  *, default_symbols: list[str],
-                 sleeve_caps: dict[str, float] | None = None) -> None:
+                 sleeve_caps: dict[str, float] | None = None,
+                 benchmark_symbol: str = "SPY",
+                 eval_config: BacktestEvalConfig | None = None) -> None:
         self._db = db
         self._engine = engine
         self._audit = audit
@@ -62,6 +66,10 @@ class AlgorithmWorkshop:
         # Shared with the risk engine: strategy name -> fraction of equity
         # that positions from that algorithm may occupy (its sleeve).
         self._sleeve_caps = sleeve_caps if sleeve_caps is not None else {}
+        # Backtest evaluation: the benchmark reuses risk.benchmark_symbol
+        # (no separate key) and the depth knobs come from config.backtest.
+        self._benchmark_symbol = benchmark_symbol
+        self._eval = eval_config or BacktestEvalConfig()
 
     # -- queries ---------------------------------------------------------------
 
@@ -285,13 +293,105 @@ class AlgorithmWorkshop:
         if not history:
             raise ValueError("no historical bars available for any symbol the algorithm uses")
 
-        report = await rebalance_backtest(algo, history, starting_cash=starting_cash,
-                                          start=window_start, end=window_end)
+        # Benchmark closes: reuse the algorithm's own fetch when it already
+        # touched the symbol, otherwise fetch once. Under 60 bars the
+        # rebalance layer degrades to the reported equal-weight fallback.
+        bench_symbol = self._benchmark_symbol.upper()
+        bench_bars = history.get(bench_symbol)
+        bench_fetched = False
+        if bench_bars is None:
+            try:
+                bench_bars = await router.bars(bench_symbol, timeframe="1d",
+                                               limit=fetch_limit)
+                bench_fetched = True
+            except DataError:
+                bench_bars = []
+        benchmark: tuple[str, dict[date, float]] | None = None
+        if len(bench_bars) >= 60:
+            benchmark = (bench_symbol,
+                         {b.start.date(): float(b.close) for b in bench_bars})
+
+        report = await rebalance_backtest(
+            algo, history, starting_cash=starting_cash,
+            start=window_start, end=window_end, benchmark=benchmark,
+            significance_runs=self._eval.significance_runs,
+            bootstrap_runs=self._eval.bootstrap_runs,
+            monte_carlo_runs=self._eval.monte_carlo_runs,
+            seed=self._eval.seed,
+        )
+        if self._eval.walk_forward_folds > 0:
+            from ..backtest.analysis import walk_forward_rebalance
+
+            report["walk_forward"] = await walk_forward_rebalance(
+                lambda: CustomAlgorithm(algo_name=record["name"], source=record["source"],
+                                        symbols=symbols, options=record["params"]),
+                history, folds=self._eval.walk_forward_folds,
+                starting_cash=starting_cash, start=window_start, end=window_end)
+        else:
+            report["walk_forward"] = None
         report["algorithm"] = record["name"]
         report["symbols_tested"] = sorted(history)
         report["symbols_skipped_no_history"] = skipped
+
+        # Run card: canonical-JSON hashes (audit.py form) of the effective
+        # config, the exact source tested, and the sanitized result.
+        from ..backtest.stats import sanitize_json
+
+        effective_params = {
+            "starting_cash": starting_cash,
+            "slippage_pct": 0.0005,
+            "commission_per_trade": 0.0,
+            "years": years,
+            "period": period,
+            "start": start,
+            "end": end,
+            "benchmark_symbol": bench_symbol,
+            "seed": self._eval.seed,
+            "significance_runs": self._eval.significance_runs,
+            "bootstrap_runs": self._eval.bootstrap_runs,
+            "monte_carlo_runs": self._eval.monte_carlo_runs,
+            "walk_forward_folds": self._eval.walk_forward_folds,
+            "symbols_tested": sorted(history),
+        }
+        canonical_params = json.dumps(effective_params, sort_keys=True,
+                                      separators=(",", ":"), default=str)
+        config_hash = hashlib.sha256(canonical_params.encode("utf-8")).hexdigest()
+        source_sha256 = hashlib.sha256(record["source"].encode("utf-8")).hexdigest()
+        sources = {bars[0].source for bars in history.values() if bars}
+        if benchmark is not None and bench_fetched and bench_bars:
+            sources.add(bench_bars[0].source)
+
+        sanitized_report, nulled = sanitize_json(report)
+        report = dict(sanitized_report)
+        run_warnings = list(report.pop("warnings", []) or [])
+        if nulled:
+            run_warnings.append(f"non_finite_values_nulled:{nulled}")
+        result_hash = hashlib.sha256(
+            json.dumps(report, sort_keys=True, separators=(",", ":"),
+                       default=str).encode("utf-8")
+        ).hexdigest()
+        run_id = uuid.uuid4().hex[:12]
+        bench_block = report.get("benchmark") or {}
+        report["run_card"] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "engine": "rebalance_daily_close",
+            "config_hash": config_hash,
+            "source_sha256": source_sha256,
+            "result_hash": result_hash,
+            "benchmark_source": bench_block.get("source"),
+            "data_sources": sorted(sources),
+            "seed": self._eval.seed,
+            "warnings": sorted(set(run_warnings)),
+        }
+        # Audit purity (invariant 4): identifiers, sha256 digests, and one
+        # numeric metric — warnings and data sources stay OUT of the chain.
         await self._audit.append("human", "algorithm.backtested",
                                  {"id": algo_id, "name": record["name"],
+                                  "run_id": run_id, "config_hash": config_hash,
+                                  "source_sha256": source_sha256,
+                                  "result_hash": result_hash,
                                   "total_return": report["total_return"]})
         return report
 

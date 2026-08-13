@@ -57,6 +57,21 @@ ai:
     max_injected: 3
     max_render_chars: 1200
     max_symbols_per_sweep: 8
+  # --- Fundamentals, filings & insider data (opt-in; OFF by default) -------
+  # Enabling unlocks three read-only PM/chat tools (get_fundamentals,
+  # get_filings, get_insider_transactions) served through the data router,
+  # plus a filed-numbers digest as the fundamentals analyst's desk context
+  # (rides the analysis sweep above). Advisory only — never touches the risk
+  # engine or the order path. Pair it with the keyless sec_edgar provider
+  # below (and optionally yahoo_fundamentals) or Alpha Vantage.
+  #   fundamentals:
+  #     enabled: true
+  #     analyst_context: true       # fundamentals analyst gets the filed-numbers digest
+  #     max_statement_periods: 5    # statement periods per tool result
+  #     max_filings: 10             # filings per tool result (hard cap 20)
+  #     max_insider: 20             # insider rows per tool result (hard cap 50)
+  #     max_description_chars: 600  # company-description cap (scan runs on full text)
+  #     digest_max_chars: 900       # analyst digest budget
   # --- Local model (no API credit) ---------------------------------------
   # Run the portfolio manager on a local OpenAI-compatible endpoint (e.g. LM
   # Studio) instead of the Anthropic API — free and unlimited, but weaker than
@@ -100,6 +115,19 @@ data:
       credential: alphavantage_api_key
       priority: 40
     # Optional extras:
+    # SEC EDGAR (FREE, keyless) — filed fundamentals (10-K/10-Q XBRL) and
+    # filings metadata for the ai.fundamentals tools. The SEC fair-access
+    # policy asks for an identifying User-Agent: set options.user_agent to
+    # your contact. Priority above alphavantage so filed SEC numbers win the
+    # fundamentals failover.
+    # - name: sec_edgar
+    #   priority: 35
+    #   options:
+    #     user_agent: "your-name your@email"
+    # Yahoo fundamentals (FREE, keyless) — company-overview backup source
+    # (market cap, TTM revenue/EPS, ratios; no statement history).
+    # - name: yahoo_fundamentals
+    #   priority: 45
     # Alpaca market data — free real-time IEX feed with any Alpaca account,
     # reusing the same `alpaca_keys` broker credential. The simplest way to get
     # quotes fresh enough to clear real_time_max_age_seconds for live trading

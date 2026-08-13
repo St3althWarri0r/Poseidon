@@ -82,6 +82,23 @@ class DataUnavailableError(DataError):
     retryable = True
 
 
+class WebReadError(DataError):
+    """A guarded web fetch (the PM's ``read_url`` tool) failed operationally —
+    network error, HTTP error status, size cap, or redirect ceiling. A
+    :class:`DataError` so the tool dispatcher maps it to the honest data-gap
+    envelope instead of trading on a half-read page."""
+
+    retryable = True
+
+
+class WebReadBlockedError(WebReadError):
+    """The SSRF guard refused the URL by policy (scheme, userinfo, port,
+    private/loopback/metadata address, or unreadable content type). Never
+    retryable — the same URL will always be refused."""
+
+    retryable = False
+
+
 # -- Brokers ----------------------------------------------------------------
 
 

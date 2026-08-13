@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import signal
 import uuid
@@ -20,13 +21,14 @@ import yaml
 
 from . import __version__
 from .ai.agent import ClaudeAgent
+from .ai.analysis.fundamentals import fundamentals_context
 from .ai.analysis_service import AnalysisService
 from .ai.backends import ChatBackend, build_backends
 from .ai.chat import ChatService
 from .ai.hardware import DEFAULT_LM_STUDIO_URL, probe_local_models
 from .ai.reflection_service import ReflectionService
 from .ai.reports import render_decision_report
-from .ai.tools import ToolDispatcher
+from .ai.tools import ToolDispatcher, annotate_untrusted
 from .analytics.decay_service import StrategyHealthService
 from .analytics.performance import FillRecord, RoundTrip, build_round_trips, compute_performance
 from .api.server import DashboardServer
@@ -282,6 +284,8 @@ class ApplicationKernel:
             self.db, self.strategies, self.audit,
             default_symbols=cfg.all_watchlist_symbols(),
             sleeve_caps=self.risk.sleeve_caps,
+            benchmark_symbol=cfg.risk.benchmark_symbol,
+            eval_config=cfg.backtest,
         )
         # Bundled example algorithms: packaged inside poseidon for installed
         # builds (wheel force-include), or the repo-root examples/ for a
@@ -299,6 +303,9 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            fundamentals_config=cfg.ai.fundamentals,
+            pm_tools=cfg.ai.pm_tools,
+            screeners={"sp500": self.screener, "crypto": self.crypto_screener},
         )
         # Chat gets its OWN dispatcher: the review cycle clears and snapshots
         # dispatcher.sources_used into each decision's data_sources, and a
@@ -312,6 +319,9 @@ class ApplicationKernel:
             workshop=self.workshop,
             snapshot_config=cfg.ai.snapshot,
             budget=cfg.ai.budget,
+            fundamentals_config=cfg.ai.fundamentals,
+            pm_tools=cfg.ai.pm_tools,
+            screeners={"sp500": self.screener, "crypto": self.crypto_screener},
         )
         self._wire_ai(cfg.ai, dispatcher, chat_dispatcher)
         self.notifier = NotificationService(cfg.notifications, self.vault, self.bus)
@@ -372,7 +382,13 @@ class ApplicationKernel:
             load_fills=self._load_reflection_fills, is_flat=self._symbol_is_flat,
             audit_append=self.audit.append,
             record_usage=lambda usage: self._record_ai_usage(usage, "reflection"),
-            over_budget=self._over_ai_budget)
+            over_budget=self._over_ai_budget,
+            # Two-class asset-to-benchmark map (equity default + crypto
+            # companion); account_scope stays call-time so broker toggles are
+            # honored exactly like _load_reflection_fills' internal scoping.
+            benchmark_symbol=self.config.risk.benchmark_symbol,
+            crypto_benchmark_symbol=self.config.risk.crypto_benchmark_symbol,
+            account_scope=lambda: self.broker.account_scope)
         self.bus.subscribe(Topics.ACCOUNT_SYNCED, self.reflection.on_account_synced)
         # Advisory analyst firm -> debate packet (never gates risk / touches
         # orders). Packets are injected into the PM's cycle prompt only — see
@@ -382,13 +398,16 @@ class ApplicationKernel:
             get_backend=lambda: self._utility_backend,
             watchlist=lambda: self.config.all_watchlist_symbols(),
             audit_append=self.audit.append,
-            # v1: scan=None — no untrusted text flows yet (context=""); wire
-            # ai/tools.py's injection scanner here when the per-role
-            # news/fundamentals retrieval fast-follow lands.
-            scan=None,
+            # Untrusted retrieved text (the per-role desk context) flows through
+            # the shared injection scanner: annotate-never-rewrite.
+            scan=annotate_untrusted,
             record_usage=lambda usage: self._record_ai_usage(usage, "analysis"),
             over_budget=self._over_ai_budget,
-            snapshot_config=ai_cfg.snapshot)
+            snapshot_config=ai_cfg.snapshot,
+            # Best-effort fundamentals digest for the fundamentals analyst —
+            # inert ('' with zero router calls) while ai.fundamentals is off.
+            fundamentals_context=functools.partial(
+                fundamentals_context, self.router, config=ai_cfg.fundamentals))
         self.chat = ChatService(ai_cfg, self._utility_backend, chat_dispatcher, self.db)
 
     def _build_router(self) -> DataRouter:
@@ -1019,6 +1038,11 @@ class ApplicationKernel:
             self.scheduler.register_job("analysis_sweep", self.analysis.run_sweep)
         if self.strategy_health is not None:
             self.scheduler.register_job("strategy_health_sweep", self.strategy_health.sweep)
+        if self.reflection is not None:
+            # Both jobs self-guard on their enabled flags, so trigger_now on a
+            # disabled feature is a clean no-op.
+            self.scheduler.register_job("outcome_sweep", self.reflection.resolve_outcomes)
+            self.scheduler.register_job("behavior_sweep", self.reflection.behavior_sweep)
 
     def _effective_schedules(self) -> list[ScheduleConfig]:
         """Config schedules plus a default review cadence if none is defined."""
@@ -1079,6 +1103,23 @@ class ApplicationKernel:
             schedules.append(
                 ScheduleConfig(name="default-strategy-health", job="strategy_health_sweep",
                                cron="0 6 * * *")  # daily pre-market
+            )
+        if self.config.ai.reflection.outcomes.enabled and not any(
+            s.job == "outcome_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                # Daily post-close ET: the freshest completed equity bar;
+                # crypto resolves 24/7 via bar counting.
+                ScheduleConfig(name="default-outcome-sweep", job="outcome_sweep",
+                               cron="20 18 * * *")
+            )
+        if self.config.ai.reflection.behavior.enabled and not any(
+            s.job == "behavior_sweep" and s.enabled for s in schedules
+        ):
+            schedules.append(
+                # Weekly Monday pre-market — a 90-day profile moves slowly.
+                ScheduleConfig(name="default-behavior-sweep", job="behavior_sweep",
+                               cron="40 6 * * 1")
             )
         return schedules
 

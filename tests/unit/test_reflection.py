@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from poseidon.ai.reflection import REFLECTION_SYSTEM, reflect_on_position
-from poseidon.core.models import ClosedPosition
+from poseidon.ai.reflection import (
+    COUNTERFACTUAL_SYSTEM,
+    REFLECTION_SYSTEM,
+    reflect_on_outcome,
+    reflect_on_position,
+)
+from poseidon.core.models import ClosedPosition, DecisionOutcome
 
 from .backend_fakes import FakeBackend, refusal, text_end
 
@@ -105,3 +110,123 @@ async def test_whitespace_invalidation_renders_no_line() -> None:
     b = FakeBackend([text_end("Lesson.")])
     await reflect_on_position(b, pos, model="fake")
     assert "invalidation" not in b.calls[0]["messages"][0]["content"].lower()
+
+
+# ---- benchmark label parameterization ---------------------------------------
+
+
+async def test_benchmark_label_follows_position_benchmark() -> None:
+    pos = _pos().model_copy(update={"benchmark": "BTC/USD"})
+    b = FakeBackend([text_end("Lesson.")])
+    await reflect_on_position(b, pos, model="fake")
+    sent = b.calls[0]["messages"][0]["content"]
+    assert "Alpha vs BTC/USD" in sent
+    assert "Alpha vs SPY" not in sent
+
+
+async def test_default_benchmark_label_byte_identical() -> None:
+    # Legacy prompts must not shift a byte at the SPY default.
+    b = FakeBackend([text_end("Lesson.")])
+    await reflect_on_position(b, _pos(), model="fake")
+    assert "Alpha vs SPY: -2.00%." in b.calls[0]["messages"][0]["content"]
+
+
+# ---- counterfactual / hold outcome reflection -------------------------------
+
+
+def _outcome(**overrides) -> DecisionOutcome:
+    base: dict = {
+        "decision_id": "d1", "kind": "counterfactual", "symbol": "AAPL",
+        "action": "trade", "side": "buy",
+        "decided_at": datetime(2026, 6, 1, tzinfo=UTC),
+        "horizon_trading_days": 5, "forward_return": 0.08,
+        "benchmark": "SPY", "benchmark_return": 0.01, "alpha": 0.07,
+    }
+    base.update(overrides)
+    return DecisionOutcome(**base)
+
+
+def test_counterfactual_system_language() -> None:
+    # One observation vs base rates; asymmetric-evidence warnings; the risk
+    # engine stays sacrosanct; retrospective discipline.
+    low = COUNTERFACTUAL_SYSTEM.lower()
+    assert "one observation, not a pattern" in low
+    assert "base rates" in low and "too small" in low
+    assert "missed rally" in low and "dodged loss" in low
+    assert "NEVER suggest bypassing or loosening risk limits" in COUNTERFACTUAL_SYSTEM
+    assert "never assert a current market price" in low
+
+
+async def test_outcome_prompt_states_not_traded_with_full_risk_case() -> None:
+    b = FakeBackend([text_end("Lesson.")])
+    out = await reflect_on_outcome(
+        b, _outcome(blocked_status="rejected_risk", thesis="breakout setup",
+                    entry_confidence=0.7, invalidation="loses the 50dma"),
+        model="fake")
+    assert out is not None
+    sent = b.calls[0]["messages"][0]["content"]
+    assert "did NOT become a trade" in sent
+    assert "vetoed by the risk engine" in sent
+    assert "Original thesis: breakout setup" in sent
+    assert "Entry conviction: 70%." in sent
+    assert "Stated invalidation: loses the 50dma" in sent
+    assert "AAPL" in sent and "+8.00%" in sent and "+7.00%" in sent
+
+
+async def test_outcome_prompt_omits_absent_lines() -> None:
+    # Legacy/noise discipline: no thesis/conviction/invalidation lines and no
+    # blocked phrasing when nothing was recorded.
+    b = FakeBackend([text_end("Lesson.")])
+    await reflect_on_outcome(b, _outcome(), model="fake")
+    sent = b.calls[0]["messages"][0]["content"]
+    assert "thesis" not in sent.lower()
+    assert "conviction" not in sent.lower()
+    assert "invalidation" not in sent.lower()
+    assert "vetoed" not in sent and "declined" not in sent and "filled" not in sent
+
+
+async def test_outcome_prompt_blocked_status_phrasings() -> None:
+    for status, phrase in (("rejected_human", "declined by the human"),
+                           ("unfilled", "never filled")):
+        b = FakeBackend([text_end("Lesson.")])
+        await reflect_on_outcome(b, _outcome(blocked_status=status), model="fake")
+        assert phrase in b.calls[0]["messages"][0]["content"]
+
+
+async def test_hold_outcome_prompt_is_portfolio_level() -> None:
+    b = FakeBackend([text_end("Lesson.")])
+    await reflect_on_outcome(
+        b, _outcome(kind="hold", symbol="PORTFOLIO", action="hold", side="",
+                    forward_return=0.05, benchmark_return=0.02, alpha=0.03),
+        model="fake")
+    sent = b.calls[0]["messages"][0]["content"]
+    assert "no trades were proposed" in sent
+    assert "Portfolio forward return" in sent and "+5.00%" in sent
+    assert "did NOT become a trade" not in sent  # hold framing, not missed-trade
+
+
+async def test_outcome_refusal_bills_usage_and_returns_none() -> None:
+    usage: list[dict[str, int]] = []
+    out = await reflect_on_outcome(FakeBackend([refusal()]), _outcome(),
+                                   model="fake", usage=usage)
+    assert out is None
+    assert usage  # refusals still bill
+
+
+async def test_outcome_backend_error_swallowed() -> None:
+    class Boom:
+        model = "boom"
+        async def complete(self, *a, **k):
+            raise RuntimeError("down")
+        def tool_result_messages(self, results):
+            return []
+        async def aclose(self):
+            return None
+    assert await reflect_on_outcome(Boom(), _outcome(), model="boom") is None  # type: ignore[arg-type]
+
+
+async def test_outcome_lesson_collapsed_and_capped() -> None:
+    b = FakeBackend([text_end("line one\n\tline two\x00\x1b " + "x" * 700)])
+    out = await reflect_on_outcome(b, _outcome(), model="fake", max_chars=600)
+    assert out is not None and len(out) <= 600
+    assert "\n" not in out and "\t" not in out and "\x00" not in out

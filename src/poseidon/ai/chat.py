@@ -25,7 +25,7 @@ from ..core.config import AIConfig
 from ..core.errors import AgentError
 from ..storage.db import Database
 from .backends.base import ChatBackend, ToolResult
-from .schemas import DATA_TOOLS
+from .schemas import DATA_TOOLS, FUNDAMENTALS_TOOLS, optional_data_tools
 from .tools import ToolDispatcher
 
 log = structlog.get_logger(__name__)
@@ -80,6 +80,14 @@ class ChatService:
         self._dispatcher = dispatcher
         self._db = db
         self._lock = asyncio.Lock()
+        # Chat catalog: gains at most the read-only fundamentals + pm_tools
+        # trios when their gates are on; submit_decision is NEVER offered here
+        # in any flag state (chat cannot trade). The all-off default IS the
+        # DATA_TOOLS module object — object identity keeps prior behavior
+        # byte-identical.
+        extra = [*(FUNDAMENTALS_TOOLS if config.fundamentals.enabled else []),
+                 *optional_data_tools(config.pm_tools)]
+        self._tools = [*DATA_TOOLS, *extra] if extra else DATA_TOOLS
 
     @property
     def busy(self) -> bool:
@@ -138,7 +146,7 @@ class ChatService:
     async def _run_tool_loop(self, messages: list[dict[str, Any]],
                              usage: dict[str, int], tool_calls: list[str]) -> str:
         for _ in range(self._config.max_tool_iterations):
-            resp = await self._backend.complete(messages, tools=DATA_TOOLS, system=CHAT_SYSTEM_PROMPT)
+            resp = await self._backend.complete(messages, tools=self._tools, system=CHAT_SYSTEM_PROMPT)
             self._record_usage(resp.usage, usage)
             if resp.stop_reason == "refusal":
                 return "I can't help with that request."

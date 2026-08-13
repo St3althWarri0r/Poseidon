@@ -1,20 +1,35 @@
 """Finnhub provider (https://finnhub.io/docs/api).
 
 Capabilities: quotes, company & general news, earnings calendar, economic
-calendar. Authentication: token query parameter.
+calendar, sector/profile reference data, and insider transactions.
+Authentication: token query parameter.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ...core.errors import ProviderError
-from ...core.models import EarningsEvent, EconomicEvent, InstrumentProfile, NewsArticle, Quote
+from ...core.models import (
+    EarningsEvent,
+    EconomicEvent,
+    InsiderTransaction,
+    InstrumentProfile,
+    NewsArticle,
+    Quote,
+)
 from ..base import DataCapability, MarketDataProvider
 
 _BASE = "https://finnhub.io/api/v1"
+
+
+def _parse_date(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 class FinnhubProvider(MarketDataProvider):
@@ -29,6 +44,7 @@ class FinnhubProvider(MarketDataProvider):
                 DataCapability.ECONOMIC_CALENDAR,
                 DataCapability.SECTOR,
                 DataCapability.PROFILE,
+                DataCapability.INSIDER,
             }
         )
 
@@ -81,6 +97,41 @@ class FinnhubProvider(MarketDataProvider):
             raise ProviderError(self.name, f"no sector classification for {symbol}",
                                 retryable=False)
         return str(industry)
+
+    async def insider_transactions(self, symbol: str, *,
+                                   limit: int = 20) -> list[InsiderTransaction]:
+        """Reported insider transactions, newest first. An empty ``data`` list
+        means none reported — a real answer, never an error. Malformed rows are
+        skipped (news/earnings row-skip precedent), never guessed at."""
+        payload = await self._get("/stock/insider-transactions", symbol=symbol.upper())
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        now = self._now()
+        out: list[InsiderTransaction] = []
+        for row in (rows or [])[: max(0, limit)]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                change = row.get("change")
+                shares = Decimal(str(change)) if change is not None else None
+                raw_price = row.get("transactionPrice")
+                price = Decimal(str(raw_price)) if raw_price is not None else None
+            except (InvalidOperation, ValueError):
+                continue
+            if price is not None and price <= 0:
+                price = None  # 0 means no market price (e.g. grants)
+            out.append(InsiderTransaction(
+                symbol=symbol,
+                name=str(row.get("name") or "unknown"),
+                title=None,  # not served on this endpoint
+                transaction_date=_parse_date(row.get("transactionDate")),
+                filing_date=_parse_date(row.get("filingDate")),
+                code=str(row["transactionCode"]) if row.get("transactionCode") else None,
+                shares_changed=shares,
+                price=price,
+                as_of=now,
+                source=self.name,
+            ))
+        return out
 
     async def news(self, symbols: list[str] | None = None, *, limit: int = 25) -> list[NewsArticle]:
         rows: list[dict[str, Any]]

@@ -2,62 +2,24 @@
 
 from __future__ import annotations
 
-import random
-import statistics
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable
-from dataclasses import dataclass
+from datetime import date
 
 from ..core.models import Bar
 from ..strategy.base import Strategy
 from .engine import BacktestConfig, BacktestEngine, BacktestResult
-
-
-@dataclass
-class MonteCarloSummary:
-    runs: int
-    median_return: float
-    p05_return: float
-    p95_return: float
-    median_max_drawdown: float
-    p95_max_drawdown: float
-    prob_loss: float
+from .rebalance import _MIN_WARMUP_DAYS, rebalance_backtest
+from .stats import MonteCarloSummary, monte_carlo_returns
 
 
 def monte_carlo(result: BacktestResult, *, runs: int = 1000,
                 seed: int | None = None) -> MonteCarloSummary:
     """Bootstrap-resample the realized daily returns to estimate the
-    distribution of outcomes and tail drawdowns."""
-    rets = result.daily_returns
-    if len(rets) < 20:
-        raise ValueError("need at least 20 daily returns for Monte Carlo")
-    rng = random.Random(seed)
-    horizon = len(rets)
-    finals: list[float] = []
-    drawdowns: list[float] = []
-    for _ in range(runs):
-        equity, peak, max_dd = 1.0, 1.0, 0.0
-        for _ in range(horizon):
-            equity *= 1 + rng.choice(rets)
-            peak = max(peak, equity)
-            max_dd = max(max_dd, (peak - equity) / peak)
-        finals.append(equity - 1)
-        drawdowns.append(max_dd)
-    finals.sort()
-    drawdowns.sort()
-
-    def pct(sorted_values: list[float], p: float) -> float:
-        idx = min(int(p * len(sorted_values)), len(sorted_values) - 1)
-        return sorted_values[idx]
-
-    return MonteCarloSummary(
-        runs=runs,
-        median_return=round(statistics.median(finals), 4),
-        p05_return=round(pct(finals, 0.05), 4),
-        p95_return=round(pct(finals, 0.95), 4),
-        median_max_drawdown=round(statistics.median(drawdowns), 4),
-        p95_max_drawdown=round(pct(drawdowns, 0.95), 4),
-        prob_loss=round(sum(1 for f in finals if f < 0) / runs, 3),
-    )
+    distribution of outcomes and tail drawdowns. Thin delegate over
+    :func:`poseidon.backtest.stats.monte_carlo_returns` (the computation
+    moved there unchanged); this import path stays public."""
+    return monte_carlo_returns(result.daily_returns, runs=runs, seed=seed)
 
 
 async def walk_forward(strategy_factory: Callable[[], Strategy],
@@ -99,6 +61,62 @@ async def walk_forward(strategy_factory: Callable[[], Strategy],
         result = await engine.run(strategy, segment, start=start)
         reports.append({"fold": i + 1, "start": start.isoformat(),
                         "end": end.isoformat(), **result.summary()})
+    return reports
+
+
+async def walk_forward_rebalance(strategy_factory: Callable[[], Strategy],
+                                 history: dict[str, list[Bar]], *,
+                                 folds: int = 3,
+                                 starting_cash: float = 100_000.0,
+                                 slippage_pct: float = 0.0005,
+                                 commission_per_trade: float = 0.0,
+                                 start: date | None = None,
+                                 end: date | None = None) -> list[dict[str, object]]:
+    """Sequential out-of-sample folds for REBALANCE-mode algorithms: the
+    evaluable region (after the shared 210-day warmup / requested window) is
+    split into contiguous segments, each replayed with a FRESH strategy from
+    the factory via ``rebalance_backtest`` (which itself enforces the
+    anti-lookahead window and warmup). Mirrors the trade-engine walk_forward's
+    40-day fold minimum; fewer than 2 viable folds -> [] (a one-fold "spread"
+    is just the full backtest again). Fold entries carry point metrics only —
+    no equity curves — so the payload stays small. Never raises for short
+    history: a fold that cannot evaluate reports an ``insufficient_data``
+    entry instead."""
+    all_dates = sorted({b.start.date() for bars in history.values() for b in bars})
+    if not all_dates:
+        return []
+    eval_from = _MIN_WARMUP_DAYS
+    if start is not None:
+        eval_from = max(_MIN_WARMUP_DAYS, bisect_left(all_dates, start))
+    end_index = len(all_dates) - 1
+    if end is not None:
+        end_index = bisect_right(all_dates, end) - 1
+    eval_days = end_index - eval_from + 1
+    folds_effective = min(folds, eval_days // 40) if eval_days > 0 else 0
+    if folds_effective < 2:
+        return []
+    fold_size = eval_days // folds_effective
+    reports: list[dict[str, object]] = []
+    for i in range(folds_effective):
+        start_idx = eval_from + i * fold_size
+        # Last fold absorbs the remainder so the most recent days are tested.
+        end_idx = (end_index if i == folds_effective - 1
+                   else eval_from + (i + 1) * fold_size - 1)
+        fold_start, fold_end = all_dates[start_idx], all_dates[end_idx]
+        entry: dict[str, object] = {"fold": i + 1, "start": fold_start.isoformat(),
+                                    "end": fold_end.isoformat()}
+        strategy: Strategy = strategy_factory()
+        try:
+            report = await rebalance_backtest(
+                strategy, history, starting_cash=starting_cash,
+                slippage_pct=slippage_pct, commission_per_trade=commission_per_trade,
+                start=fold_start, end=fold_end)
+        except ValueError:
+            entry["error"] = "insufficient_data"
+        else:
+            for key in ("days_tested", "total_return", "cagr", "sharpe", "max_drawdown"):
+                entry[key] = report[key]
+        reports.append(entry)
     return reports
 
 

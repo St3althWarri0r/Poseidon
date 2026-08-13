@@ -37,6 +37,56 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class OutcomeResolutionConfig(StrictModel):
+    """Decision outcome resolution (advisory, OFF by default).
+
+    A scheduled sweep grades decisions that never became trades — HOLDs,
+    risk-vetoed and human-rejected proposals, never-filled orders — at a fixed
+    forward horizon (counted in DAILY BARS, so equity weekends and 24/7 crypto
+    are both exact) and mints counterfactual/hold lessons for the material
+    ones. Purely advisory: resolution markers and lessons never gate the risk
+    engine or touch the order path.
+    """
+
+    enabled: bool = False
+    horizon_trading_days: int = Field(default=5, ge=1, le=60)
+    max_decisions_per_sweep: int = Field(default=25, ge=1, le=200)
+    max_lessons_per_sweep: int = Field(default=3, ge=0)
+    min_abs_alpha: float = Field(default=0.02, ge=0)  # materiality gate for lessons
+    max_age_days: int = Field(default=45, ge=1)  # unresolvable after this many days
+
+    @model_validator(mode="after")
+    def _age_covers_horizon(self) -> OutcomeResolutionConfig:
+        # N trading bars span >= N calendar days (weekends/holidays stretch
+        # them to ~2N): a tighter max_age would age every decision out before
+        # its forward bars can even exist.
+        if self.max_age_days < 2 * self.horizon_trading_days:
+            raise ValueError(
+                f"max_age_days ({self.max_age_days}) must be >= 2 * "
+                f"horizon_trading_days ({self.horizon_trading_days})"
+            )
+        return self
+
+
+class BehaviorConfig(StrictModel):
+    """Behavioral self-assessment (advisory, OFF by default).
+
+    A scheduled deterministic sweep over the platform's own closed round trips
+    computes bias diagnostics (hold-time asymmetry, trade frequency vs marginal
+    PnL, entry-after-runup share, re-entry proximity) and refreshes ONE
+    advisory bias-profile lesson. No LLM is ever involved; flags are advisory
+    prose only and never tune risk, sizing, or cadence.
+    """
+
+    enabled: bool = False
+    window_days: int = Field(default=90, ge=7)  # named to avoid clashing with lookback_days
+    min_trades: int = Field(default=10, ge=2)  # sample-size guard
+    runup_days: int = Field(default=5, ge=1)
+    runup_threshold: float = Field(default=0.05, gt=0)
+    reentry_days: int = Field(default=3, ge=1)
+    max_bar_symbols: int = Field(default=20, ge=0)  # bar fan-out bound
+
+
 class ReflectionConfig(StrictModel):
     """Post-trade reflection → lesson-memory loop (advisory).
 
@@ -53,6 +103,8 @@ class ReflectionConfig(StrictModel):
     per_symbol: int = Field(default=2, ge=0)
     global_n: int = Field(default=3, ge=0)
     lookback_days: int = Field(default=120, ge=1)
+    outcomes: OutcomeResolutionConfig = Field(default_factory=OutcomeResolutionConfig)
+    behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
 
 
 class StrategyHealthConfig(StrictModel):
@@ -129,6 +181,64 @@ class CycleBudgetConfig(StrictModel):
     hard_cycle_tool_chars: int = Field(default=64000, ge=2000)  # cumulative last-resort backstop
 
 
+class FundamentalsConfig(StrictModel):
+    """Fundamentals, filings & insider data surface for the AI (tools + analyst
+    context).
+
+    OFF by default — the ship-OFF invariant: enabling adds three read-only
+    PM/chat tools (get_fundamentals / get_filings / get_insider_transactions)
+    and the fundamentals analyst's retrieval digest, a new AI-facing surface
+    with live provider cost, so it must be a deliberate operator choice.
+    Advisory only: filed/reported reference data upstream of the PM — it never
+    touches the risk engine or the order path.
+    """
+
+    enabled: bool = False
+    analyst_context: bool = True  # inert while enabled=False (the parent gate)
+    max_statement_periods: int = Field(default=5, ge=1, le=12)
+    max_filings: int = Field(default=10, ge=1, le=20)
+    max_insider: int = Field(default=20, ge=1, le=50)
+    max_description_chars: int = Field(default=600, ge=0)
+    digest_max_chars: int = Field(default=900, ge=200)
+
+
+class WebReadConfig(StrictModel):
+    """Guarded web-read (``read_url``) tool for the PM/chat.
+
+    OFF by default — the ship-OFF invariant: enabling gives the AI a bounded,
+    SSRF-guarded fetch of PUBLIC pages (https only unless ``allow_http``), a
+    new AI-facing surface that must be a deliberate operator choice. Advisory
+    only: page text is untrusted third-party data upstream of the PM — never
+    instructions, never a live-price source, never near the order path.
+    """
+
+    enabled: bool = False
+    timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    max_bytes: int = Field(default=2_000_000, ge=10_000)  # streamed-body abort cap
+    max_chars: int = Field(default=8000, ge=500)  # per-call extracted-text slice
+    max_redirects: int = Field(default=3, ge=0, le=10)
+    allow_http: bool = False  # plain http:// (still IP-guarded) only if opted in
+
+
+class PMToolsConfig(StrictModel):
+    """Optional research-tool breadth for the PM/chat (all OFF by default).
+
+    Each flag adds one read-only, advisory tool to the AI catalogs: a guarded
+    web read (``read_url``), a view over the platform screener cache
+    (``screen_market``), and a date-aligned correlation matrix
+    (``compute_correlation_matrix``). Advisory only — data upstream of the PM;
+    nothing here touches the risk engine or the order path, and with every
+    flag off the catalogs are byte-identical to today's.
+    """
+
+    web_read: WebReadConfig = Field(default_factory=WebReadConfig)
+    screen_market: bool = False
+    correlation: bool = False
+    correlation_max_symbols: int = Field(default=12, ge=2, le=30)
+    correlation_window_days: int = Field(default=120, ge=30, le=250)
+    correlation_min_overlap: int = Field(default=30, ge=3)
+
+
 class AIConfig(StrictModel):
     model: str = "claude-opus-4-8"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
@@ -156,6 +266,12 @@ class AIConfig(StrictModel):
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     # Per-cycle token bounds for the user turn + tool loop (see CycleBudgetConfig).
     budget: CycleBudgetConfig = Field(default_factory=CycleBudgetConfig)
+    # Fundamentals/filings/insider tools + analyst digest (OFF by default; see
+    # FundamentalsConfig).
+    fundamentals: FundamentalsConfig = Field(default_factory=FundamentalsConfig)
+    # Optional PM research tools: guarded web read, screener view, correlation
+    # matrix (all OFF by default; see PMToolsConfig).
+    pm_tools: PMToolsConfig = Field(default_factory=PMToolsConfig)
     # Optional cheap/fast "utility" model for auxiliary roles (operator chat +
     # reflection). Same backend + endpoint as the primary, model swapped. None =
     # no tiering (all roles use the primary). The trading decision always uses
@@ -226,6 +342,11 @@ class RiskConfig(StrictModel):
     # enabled, fresh risk metrics are REQUIRED before opening new risk.
     max_portfolio_var_pct: float = Field(default=0.0, ge=0, le=1)
     benchmark_symbol: str = "SPY"  # beta/correlation benchmark for risk metrics
+    # Two-class asset-to-benchmark map (equity default + crypto override):
+    # crypto pairs are reflection-graded/labeled against this instead of the
+    # equity benchmark; anything that is not a crypto pair falls back to
+    # benchmark_symbol.
+    crypto_benchmark_symbol: str = "BTC/USD"
     # Vol-targeted sizing: per-position daily risk budget as a fraction of
     # equity (0.005 = a position sized so one typical day moves it by
     # ~0.5% of account equity). Advisory input to the AI's sizing tool.
@@ -343,6 +464,22 @@ class ResearchConfig(StrictModel):
     n_groups: int = Field(default=5, ge=2)  # quantile buckets for group-equity layering
 
 
+class BacktestEvalConfig(StrictModel):
+    """Evaluation depth for the operator-triggered workshop backtest
+    (dashboard endpoint + audit only — NO AI surface consumes backtests; no
+    backtest tool exists in ``ai/tools.py``). ON by default under the
+    :class:`SnapshotConfig` precedent: zero LLM cost, fully deterministic,
+    and every failure degrades to an explicit null + warning. Each heavy
+    knob is individually disabled by setting it to 0. The benchmark symbol
+    is NOT configured here — the workshop reuses ``risk.benchmark_symbol``."""
+
+    significance_runs: int = Field(default=1000, ge=0, le=20000)  # sign-flip/permutation draws
+    bootstrap_runs: int = Field(default=1000, ge=0, le=20000)  # Sharpe CI resamples
+    monte_carlo_runs: int = Field(default=1000, ge=0, le=20000)  # outcome-distribution paths
+    walk_forward_folds: int = Field(default=3, ge=0, le=10)  # 0 disables the fold spread
+    seed: int = 42  # explicit seed — never wall-clock; mirrors research.null_base_seed
+
+
 class ScreenerConfigBase(StrictModel):
     """Fields shared by every screener (equity + crypto). The :class:`MarketScreener`
     types against this base and is reused verbatim for both universes — the only
@@ -408,6 +545,7 @@ class AppConfig(StrictModel):
     strategy_health: StrategyHealthConfig = Field(default_factory=StrategyHealthConfig)
     screener: ScreenerConfig = Field(default_factory=ScreenerConfig)
     crypto_screener: CryptoScreenerConfig = Field(default_factory=CryptoScreenerConfig)
+    backtest: BacktestEvalConfig = Field(default_factory=BacktestEvalConfig)
 
     @model_validator(mode="after")
     def _validate_brokers(self) -> AppConfig:

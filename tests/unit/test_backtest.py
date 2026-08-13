@@ -41,10 +41,60 @@ async def test_backtest_runs_and_reports() -> None:
     assert len(result.equity_curve) > 100
     summary = result.summary()
     assert set(summary) == {"total_return", "max_drawdown", "sharpe", "trades",
-                            "win_rate", "final_equity"}
+                            "win_rate", "final_equity", "cagr", "sortino", "calmar",
+                            "profit_factor", "annualized_volatility",
+                            "turnover_gross", "turnover_annual"}
     # Uptrending synthetic series + momentum should trade and end positive.
     assert summary["trades"] >= 1
     assert summary["final_equity"] > 0
+
+
+async def test_summary_benchmark_keys_only_when_provided() -> None:
+    history = synthetic_history()
+    result = await BacktestEngine().run(MomentumStrategy(symbols=["TEST"]), history)
+    plain = result.summary()
+    assert not {"benchmark_return", "excess_return", "information_ratio"} & set(plain)
+
+    bench = [0.001] * len(result.daily_returns)
+    with_bench = result.summary(benchmark_returns=bench)
+    assert set(with_bench) - set(plain) == {"benchmark_return", "excess_return",
+                                            "information_ratio"}
+    compounded = 1.0
+    for r in bench:
+        compounded *= 1 + r
+    assert with_bench["benchmark_return"] == round(compounded - 1, 4)
+    assert with_bench["excess_return"] == round(result.total_return - (compounded - 1), 4)
+
+
+def test_summary_turnover_golden_single_trade() -> None:
+    from datetime import date
+
+    from poseidon.backtest.engine import TradeRecord
+
+    curve = [(date(2025, 1, 6), 100_000.0), (date(2025, 1, 7), 101_000.0),
+             (date(2025, 1, 8), 102_000.0)]
+    trade = TradeRecord(symbol="A", entry_date=date(2025, 1, 6), entry_price=50.0,
+                        quantity=100.0, exit_date=date(2025, 1, 8), exit_price=60.0,
+                        reason="take_profit")
+    result = BacktestResult(equity_curve=curve, trades=[trade])
+    summary = result.summary()
+    # Notional traded 50*100 + 60*100 = 11000; mean equity 101000.
+    assert summary["turnover_gross"] == round(11_000 / 101_000, 4)
+    assert summary["turnover_annual"] == round(11_000 / 101_000 * 252 / 3, 4)
+
+    open_only = BacktestResult(equity_curve=curve, trades=[
+        TradeRecord(symbol="A", entry_date=date(2025, 1, 6), entry_price=50.0,
+                    quantity=100.0)])
+    # Open trade: only the entry leg counts.
+    assert open_only.summary()["turnover_gross"] == round(5_000 / 101_000, 4)
+    assert BacktestResult().summary()["turnover_gross"] == 0.0
+
+
+async def test_walk_forward_folds_carry_no_benchmark_keys() -> None:
+    history = synthetic_history(days=400)
+    reports = await walk_forward(lambda: MomentumStrategy(symbols=["TEST"]), history, folds=3)
+    assert reports and all("benchmark_return" not in r for r in reports)
+    assert all("cagr" in r and "turnover_gross" in r for r in reports)
 
 
 async def test_no_lookahead_first_days_have_no_trades() -> None:
@@ -88,6 +138,70 @@ async def test_stress_scenarios() -> None:
     assert {r["scenario"] for r in reports} >= {"black_monday_1987", "covid_mar_2020"}
     for report in reports:
         assert 0 < report["total_drawdown"] < 1
+
+
+def _rebalance_history(days: int) -> dict[str, list[Bar]]:
+    history: dict[str, list[Bar]] = {}
+    start = datetime(2022, 1, 3, tzinfo=UTC)
+    for symbol, drift in (("A", 1.0008), ("B", 0.9996)):
+        price, bars = 100.0, []
+        for i in range(days):
+            day = start + timedelta(days=i)
+            price *= drift
+            bars.append(Bar(symbol=symbol, open=Decimal(str(round(price, 4))),
+                            high=Decimal(str(round(price * 1.01, 4))),
+                            low=Decimal(str(round(price * 0.99, 4))),
+                            close=Decimal(str(round(price, 4))), volume=1_000_000,
+                            start=day, end=day, source="synthetic"))
+        history[symbol] = bars
+    return history
+
+
+async def test_walk_forward_rebalance_sequential_point_metric_folds() -> None:
+    from poseidon.backtest.analysis import walk_forward_rebalance
+    from poseidon.strategy.base import Signal, Strategy
+
+    class _HoldA(Strategy):
+        name = "hold_a"
+
+        async def scan(self, router, portfolio):  # type: ignore[no-untyped-def]
+            return [Signal(strategy=self.name, symbol="A", direction="long",
+                           strength=1.0, evidence={"target_weight": 1.0})]
+
+    history = _rebalance_history(900)
+    reports = await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]), history, folds=3)
+    assert len(reports) == 3
+    for i, entry in enumerate(reports):
+        assert entry["fold"] == i + 1
+        # Point metrics only — no equity_curve/attribution/annual_returns bloat.
+        assert set(entry) == {"fold", "start", "end", "days_tested", "total_return",
+                              "cagr", "sharpe", "max_drawdown"}
+    # Sequential, non-overlapping windows.
+    assert reports[0]["end"] < reports[1]["start"]
+    assert reports[1]["end"] < reports[2]["start"]
+    # 900 days - 210 warmup = 690 eval days over 3 folds.
+    assert reports[0]["days_tested"] == 230
+    assert reports[1]["days_tested"] == 230
+
+
+async def test_walk_forward_rebalance_insufficient_history_returns_empty() -> None:
+    from poseidon.backtest.analysis import walk_forward_rebalance
+    from poseidon.strategy.base import Signal, Strategy
+
+    class _HoldA(Strategy):
+        name = "hold_a"
+
+        async def scan(self, router, portfolio):  # type: ignore[no-untyped-def]
+            return [Signal(strategy=self.name, symbol="A", direction="long",
+                           strength=1.0, evidence={"target_weight": 1.0})]
+
+    # 260 days: only 50 eval days -> one 40-day fold maximum -> no spread.
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]),
+                                        _rebalance_history(260), folds=3) == []
+    # folds=0 is inert.
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]),
+                                        _rebalance_history(900), folds=0) == []
+    assert await walk_forward_rebalance(lambda: _HoldA(symbols=["A"]), {}, folds=3) == []
 
 
 async def test_rebalance_gap_day_does_not_crater_equity() -> None:

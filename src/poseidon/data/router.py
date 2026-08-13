@@ -35,6 +35,9 @@ from ..core.models import (
     Bar,
     EarningsEvent,
     EconomicEvent,
+    Filing,
+    FundamentalsReport,
+    InsiderTransaction,
     InstrumentProfile,
     NewsArticle,
     OptionChain,
@@ -108,6 +111,14 @@ _SECTOR_UNKNOWN = ""  # cached negative result (e.g. ETFs have no sector)
 _PROFILE_TTL = 7 * 86400.0  # instrument identity changes on corporate-action timescales
 _PROFILE_NEGATIVE_TTL = 3600.0  # unresolved retries hourly (may be transient outage)
 
+# Fundamentals-family reference data: positive-only TTL caches (successes are
+# cached — including an EMPTY insider list, which is a real "none reported"
+# answer; failures always propagate as DataError and are never cached, so the
+# tool path emits its data_gaps instruction and the next call retries live).
+_FUNDAMENTALS_TTL = 6 * 3600.0  # filed statements move on reporting timescales
+_FILINGS_TTL = 3600.0
+_INSIDER_TTL = 3600.0
+
 
 class DataRouter:
     def __init__(self, providers: list[tuple[MarketDataProvider, int]],
@@ -118,6 +129,11 @@ class DataRouter:
         self._freshness = freshness
         self._sector_cache: dict[str, tuple[str, float]] = {}
         self._profile_cache: dict[str, tuple[InstrumentProfile | None, float]] = {}
+        self._fundamentals_cache: dict[str, tuple[FundamentalsReport, float]] = {}
+        # list caches remember the limit they were fetched with: a smaller ask
+        # is served by slicing, a larger one refetches.
+        self._filings_cache: dict[str, tuple[list[Filing], int, float]] = {}
+        self._insider_cache: dict[str, tuple[list[InsiderTransaction], int, float]] = {}
 
     @property
     def freshness(self) -> FreshnessPolicy:
@@ -382,6 +398,56 @@ class DataRouter:
             return None
         self._profile_cache[symbol] = (prof, time.monotonic())
         return prof
+
+    @staticmethod
+    def _no_crypto(symbol: str, what: str) -> str:
+        """Fundamentals-family requests are equity-only: a crypto pair has no
+        filed statements/filings/insiders. Short-circuit BEFORE any provider
+        call — this is a permanent fact about the symbol, not an outage."""
+        if is_crypto_symbol(symbol):
+            raise DataUnavailableError(f"no {what} data for crypto pairs ({symbol.upper()})")
+        return symbol.upper()
+
+    async def fundamentals(self, symbol: str) -> FundamentalsReport:
+        """Filed/reported fundamentals via provider failover. Slow-moving
+        reference data (like sector/profile): successes cached 6h, failures
+        never cached and always propagated as DataError (no FreshnessPolicy
+        grading — honesty rides the as_of/source/filed fields)."""
+        symbol = self._no_crypto(symbol, "fundamentals")
+        cached = self._fundamentals_cache.get(symbol)
+        if cached is not None and time.monotonic() - cached[1] < _FUNDAMENTALS_TTL:
+            return cached[0]
+        report = await self._route(DataCapability.FUNDAMENTALS,
+                                   lambda p: p.fundamentals(symbol))
+        self._fundamentals_cache[symbol] = (report, time.monotonic())
+        return report
+
+    async def filings(self, symbol: str, *, limit: int = 10) -> list[Filing]:
+        """Recent filing metadata via provider failover; successes cached 1h."""
+        symbol = self._no_crypto(symbol, "filings")
+        cached = self._filings_cache.get(symbol)
+        if (cached is not None and limit <= cached[1]
+                and time.monotonic() - cached[2] < _FILINGS_TTL):
+            return cached[0][:limit]
+        filings = await self._route(DataCapability.FILINGS,
+                                    lambda p: p.filings(symbol, limit=limit))
+        self._filings_cache[symbol] = (filings, limit, time.monotonic())
+        return filings
+
+    async def insider_transactions(self, symbol: str, *,
+                                   limit: int = 20) -> list[InsiderTransaction]:
+        """Recent reported insider transactions via provider failover. An empty
+        list from a provider is a SUCCESS ("none reported") and is cached like
+        any other answer; a raising provider fails over per _route semantics."""
+        symbol = self._no_crypto(symbol, "insider-transaction")
+        cached = self._insider_cache.get(symbol)
+        if (cached is not None and (limit <= cached[1] or len(cached[0]) < cached[1])
+                and time.monotonic() - cached[2] < _INSIDER_TTL):
+            return cached[0][:limit]
+        rows = await self._route(DataCapability.INSIDER,
+                                 lambda p: p.insider_transactions(symbol, limit=limit))
+        self._insider_cache[symbol] = (rows, limit, time.monotonic())
+        return rows
 
     # -- routing core -------------------------------------------------------------
 
