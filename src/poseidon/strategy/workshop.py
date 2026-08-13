@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -215,6 +215,39 @@ class AlgorithmWorkshop:
             "note": "dry run against live data — nothing was traded or saved",
         }
 
+    async def _resolve_risk_free(self, as_of: date | None) -> float:
+        """Annualized risk-free rate for a backtest window.
+
+        ``auto`` (the default) reads the Treasury 3-month par yield in effect
+        at the window's end; any number is taken literally, and 0.0 explicitly
+        opts out. Every failure degrades to 0.0 with a warning rather than
+        taking the run down — the workshop's standing contract is that a
+        missing input becomes an explicit null, never an exception. The degrade
+        is logged because it silently restores the overstated rf=0 Sharpe.
+        """
+        configured = self._eval.risk_free_annual
+        if configured != "auto":
+            return float(configured)
+        day: date = as_of or datetime.now(UTC).date()
+        try:
+            from ..data.treasury import fetch_yield_curve, risk_free_annual_on
+
+            rows = await fetch_yield_curve(year=day.year)
+            rate = risk_free_annual_on(rows, day)
+            if rate == 0.0:
+                # A window ending in the first days of January precedes that
+                # year's first publication; the prior year holds the curve.
+                rows = await fetch_yield_curve(year=day.year - 1)
+                rate = risk_free_annual_on(rows, day)
+        except Exception as exc:
+            log.warning("risk-free rate unavailable; Sharpe/Sortino revert to rf=0",
+                        error=str(exc))
+            return 0.0
+        if rate == 0.0:
+            log.warning("no Treasury curve on or before the window end; using rf=0",
+                        as_of=str(day))
+        return rate
+
     async def backtest(self, algo_id: str, router: DataRouter, portfolio: PortfolioState,
                        *, years: int = 5, starting_cash: float = 100_000.0,
                        period: str | None = None, start: str | None = None,
@@ -314,6 +347,7 @@ class AlgorithmWorkshop:
         report = await rebalance_backtest(
             algo, history, starting_cash=starting_cash,
             start=window_start, end=window_end, benchmark=benchmark,
+            risk_free_annual=await self._resolve_risk_free(window_end),
             significance_runs=self._eval.significance_runs,
             bootstrap_runs=self._eval.bootstrap_runs,
             monte_carlo_runs=self._eval.monte_carlo_runs,

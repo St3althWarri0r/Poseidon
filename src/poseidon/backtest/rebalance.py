@@ -41,6 +41,7 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
                              start: date | None = None,
                              end: date | None = None,
                              benchmark: tuple[str, dict[date, float]] | None = None,
+                             risk_free_annual: float = 0.0,
                              significance_runs: int = 0,
                              bootstrap_runs: int = 0,
                              monte_carlo_runs: int = 0,
@@ -206,7 +207,9 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
     rets = [values[i] / values[i - 1] - 1 for i in range(1, len(values)) if values[i - 1] > 0]
     mean = sum(rets) / len(rets) if rets else 0.0
     std = (sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5 if len(rets) > 1 else 0.0
-    sharpe_value = float(mean / std * 252 ** 0.5) if std > 0 else 0.0
+    # Delegated rather than re-derived: this was a third inline copy of the
+    # Sharpe formula, and the rf term has to reach every one of them.
+    sharpe_value = stats.sharpe_ratio(rets, risk_free_annual=risk_free_annual)
     peak, max_dd = float("-inf"), 0.0
     for v in values:
         peak = max(peak, v)
@@ -345,7 +348,7 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         "orders_simulated": trades,
         "avg_positions": round(sum(position_days) / len(position_days), 1) if position_days else 0,
         "annualized_volatility": round(float(std * 252 ** 0.5), 4),
-        "sortino": round(stats.sortino(rets), 2),
+        "sortino": round(stats.sortino(rets, risk_free_annual=risk_free_annual), 2),
         "calmar": round(stats.calmar(cagr_value, max_dd), 2),
         "turnover_gross": round(turnover_gross, 4),
         "turnover_annual": round(turnover_annual, 4),

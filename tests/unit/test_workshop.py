@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -539,3 +539,75 @@ def test_vanguard_is_an_explicit_stub() -> None:
     registry = broker_registry()
     assert "vanguard" in registry
     assert issubclass(registry["vanguard"], UnsupportedBroker)
+
+
+class TestRiskFreeResolution:
+    """The rate that makes Sharpe/Sortino honest — and its degrade path.
+
+    Backtest evaluation is allowed to lose an input, but it must never lose
+    one SILENTLY here: falling back to 0.0 restores exactly the overstatement
+    the rate was introduced to remove, so the fallback is logged.
+    """
+
+    @pytest.fixture()
+    async def shop(self, tmp_path):  # noqa: ANN001
+        db = Database(tmp_path / "rf.db")
+        await db.open()
+        yield AlgorithmWorkshop(db, StrategyEngine([], []), AuditLog(db),
+                                default_symbols=["AAPL"])
+        await db.close()
+
+    async def test_explicit_rate_is_taken_literally_without_fetching(
+            self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.core.config import BacktestEvalConfig
+
+        async def explode(**_kwargs):  # noqa: ANN003, ANN202
+            raise AssertionError("an explicit rate must not hit the network")
+
+        monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", explode)
+        shop._eval = BacktestEvalConfig(risk_free_annual=0.037)
+        assert await shop._resolve_risk_free(date(2026, 8, 12)) == pytest.approx(0.037)
+
+    async def test_explicit_zero_opts_out(self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.core.config import BacktestEvalConfig
+
+        async def explode(**_kwargs):  # noqa: ANN003, ANN202
+            raise AssertionError("an explicit rate must not hit the network")
+
+        monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", explode)
+        shop._eval = BacktestEvalConfig(risk_free_annual=0.0)
+        assert await shop._resolve_risk_free(date(2026, 8, 12)) == 0.0
+
+    async def test_auto_reads_the_treasury_three_month_yield(
+            self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.data.treasury import YieldCurveRow
+
+        rows = [YieldCurveRow(day=date(2026, 8, 12), yields={"3M": 0.0387})]
+
+        async def fake(*, year, **_kwargs):  # noqa: ANN001, ANN003, ANN202
+            return rows if year == 2026 else []
+
+        monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", fake)
+        assert await shop._resolve_risk_free(date(2026, 8, 12)) == pytest.approx(0.0387)
+
+    async def test_auto_falls_back_to_the_prior_year_at_a_january_boundary(
+            self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.data.treasury import YieldCurveRow
+
+        async def fake(*, year, **_kwargs):  # noqa: ANN001, ANN003, ANN202
+            if year == 2025:
+                return [YieldCurveRow(day=date(2025, 12, 31), yields={"3M": 0.0421})]
+            return []  # the new year has published nothing yet
+
+        monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", fake)
+        assert await shop._resolve_risk_free(date(2026, 1, 1)) == pytest.approx(0.0421)
+
+    async def test_unreachable_treasury_degrades_to_zero_not_an_exception(
+            self, shop, monkeypatch) -> None:  # noqa: ANN001
+        from poseidon.core.errors import DataError
+
+        async def down(**_kwargs):  # noqa: ANN003, ANN202
+            raise DataError("Treasury yield-curve fetch failed")
+
+        monkeypatch.setattr("poseidon.data.treasury.fetch_yield_curve", down)
+        assert await shop._resolve_risk_free(date(2026, 8, 12)) == 0.0
