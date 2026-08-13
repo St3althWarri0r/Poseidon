@@ -4,6 +4,66 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.15.0] — 2026-08-13
+
+Research-port wave 2 of the Vibe-Trading / TradingAgents cross-pollination
+(ranks 4–7). **Every feature here is off by default** — with no config change
+the review cycle behaves exactly as it did in 2.14.0.
+
+### Added — fundamentals, filings and insider data (rank 4)
+
+- Two keyless providers: **SEC EDGAR** (`companyfacts` fundamentals + filing
+  metadata, identified User-Agent and polite pacing per SEC fair-access
+  policy) and **Yahoo fundamentals**. New `FUNDAMENTALS`, `FILINGS` and
+  `INSIDER` data capabilities route through `DataRouter` with reference
+  caches, so a provider that cannot serve a class degrades instead of failing
+  the cycle.
+- Filing metadata only — never document text. Statements are curated to
+  10-K/10-Q, USD-family units, newest-first, and carried as `Decimal(str(v))`.
+- The PM gains fundamentals tools and a fundamentals analyst context; both are
+  config-gated and absent from the catalog when disabled.
+
+### Added — PM research tool breadth (rank 6)
+
+- **`read_url`**: an SSRF-guarded web fetch. Scheme allowlist, no userinfo,
+  ports 80/443 only, and no request may reach a private, loopback,
+  link-local, multicast, reserved, unspecified or RFC6598 CGNAT address —
+  literally, via any resolved A/AAAA record, or behind a redirect (each hop
+  is re-validated). Page text is quarantined: scanned for prompt injection
+  and annotated, never rewritten, and flagged to the model as data that is
+  never a price source.
+- **`screen_market`** and an NxN date-aligned **`correlation`** matrix, plus a
+  `GET /api/correlation` operator endpoint.
+
+### Added — outcome resolution and behavioural diagnostics (rank 5)
+
+- Decisions carry resolution markers and a lesson `kind`; reflection grades
+  the realized `forward_return` against a benchmark and writes
+  counterfactual, kind-aware lessons into the cycle prompt.
+- `analytics/behavior.py` sweeps closed round-trips for behavioural biases
+  (entry-after-runup and friends) — advisory only, never a trade veto.
+
+### Added — backtest evaluation depth (rank 7)
+
+- A stdlib-only stats toolkit: safe CAGR, OLS alpha/beta, bootstrap
+  confidence intervals, and randomization significance — **sign-flip for
+  Sharpe** (which is order-invariant) and order-permutation for max drawdown.
+- Engine summaries gain CAGR, Sortino, Calmar, profit factor and dual
+  turnover; rebalance mode gains walk-forward folds, benchmark/OLS
+  attribution and a wipeout guard. The strategy workshop reports a backtest
+  run card with a hash-pure audit entry.
+
+### Security
+
+- `read_url`'s injection scan now covers the page `<title>`, which reaches the
+  model verbatim in its own payload field and was previously unscanned.
+- The SSRF guard blocks RFC6598 CGNAT (100.64.0.0/10). Python's `ipaddress`
+  reports `is_private`, `is_reserved` and `is_multicast` all false for that
+  block, so it evaded every predicate the guard used.
+- SEC EDGAR's ticker→CIK cache uses double-checked locking. The check and the
+  fill straddled an await, so concurrent cold-start callers each downloaded
+  the multi-megabyte ticker map and burst through the fair-access ceiling.
+
 ## [2.14.0] — 2026-07-20
 
 ### Fixed — manual trading unblocked (#27)
