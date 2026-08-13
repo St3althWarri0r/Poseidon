@@ -190,3 +190,41 @@ def test_restart_is_the_default_because_the_engine_reads_config_at_boot() -> Non
 def test_basic_tier_covers_the_ordinary_feature_flags() -> None:
     assert tier_for("ai.pm_tools.macro_context") == TIER_BASIC
     assert tier_for("screener.enabled") == TIER_BASIC
+
+
+# --------------------------------------------- pending values (saved, not live)
+
+
+def test_a_saved_value_the_engine_has_not_loaded_is_marked_pending() -> None:
+    """The failure this whole view exists to prevent, in its subtlest form.
+
+    Save a restart-required setting and the running config still holds the old
+    value, so a UI rendering `value` alone snaps the toggle back to off on the
+    next refresh — indistinguishable from "it didn't save". The described entry
+    therefore carries what WILL be in effect, flagged as pending.
+    """
+    overlay = {"ai": {"pm_tools": {"macro_context": True}}}
+    entries = {e["path"]: e for e in describe(AppConfig(), {}, overlay)}
+    macro = entries["ai.pm_tools.macro_context"]
+    assert macro["value"] is False          # what the engine is running
+    assert macro["pending_value"] is True   # what the files now say
+    assert macro["pending"] is True
+    assert macro["provenance"] == "overlay"
+
+
+def test_nothing_is_pending_when_the_files_agree_with_the_engine() -> None:
+    entries = {e["path"]: e for e in describe(AppConfig(), {}, {})}
+    assert all(e["pending"] is False for e in entries.values())
+    macro = entries["ai.pm_tools.macro_context"]
+    assert macro["pending_value"] == macro["value"]
+
+
+def test_a_base_file_value_already_loaded_is_not_pending() -> None:
+    # The common case: the engine booted FROM the file, so file and running
+    # value agree and there is nothing to flag.
+    config = AppConfig.model_validate({"ai": {"pm_tools": {"screen_market": True}}})
+    base = {"ai": {"pm_tools": {"screen_market": True}}}
+    entries = {e["path"]: e for e in describe(config, base, {})}
+    entry = entries["ai.pm_tools.screen_market"]
+    assert entry["value"] is True
+    assert entry["pending"] is False

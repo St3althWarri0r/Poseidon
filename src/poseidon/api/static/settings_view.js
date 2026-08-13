@@ -96,8 +96,19 @@
 
   // Badge describing where the effective value came from. "default" is the
   // quiet case and gets no badge — only a value someone SET is worth marking.
+  // The value a control should display: what the files say, not what the
+  // engine happens to be running. Rendering the live value after a
+  // restart-required save snaps the toggle back and looks like a failed save.
+  function displayValue(entry) {
+    if (!entry) return null;
+    return entry.pending ? entry.pending_value : entry.value;
+  }
+
   function provenanceBadge(entry) {
     if (!entry) return null;
+    if (entry.pending) {
+      return { text: "saved · pending restart", kind: "pending" };
+    }
     if (entry.provenance === "overlay") {
       return { text: "set in dashboard", kind: "overlay" };
     }
@@ -123,7 +134,11 @@
   function statusNote(entry) {
     if (!entry || !entry.writable) return "";
     const bits = [];
-    bits.push(entry.restart ? "Takes effect after a restart" : "Applies immediately");
+    if (entry.pending) {
+      bits.push(`Saved — the engine is still running ${JSON.stringify(entry.value)} until you restart`);
+    } else {
+      bits.push(entry.restart ? "Takes effect after a restart" : "Applies immediately");
+    }
     if (entry.requires) bits.push(`Needs ${entry.requires}`);
     return bits.join(" · ");
   }
@@ -243,6 +258,7 @@
   const api = {
     groupSettings,
     sortWithinGroup,
+    displayValue,
     provenanceBadge,
     controlKind,
     statusNote,

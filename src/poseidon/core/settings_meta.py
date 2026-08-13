@@ -406,6 +406,19 @@ def current_value(config: AppConfig, path: str) -> Any:
     return _jsonable(node)
 
 
+def raw_value(path: str, base_raw: dict[str, Any],
+              overlay_raw: dict[str, Any]) -> tuple[bool, Any]:
+    """``(found, value)`` for a path in the merged raw files, overlay winning.
+
+    This is what the NEXT start will load, as distinct from what the running
+    engine currently holds.
+    """
+    found, value = _dig(overlay_raw or {}, path)
+    if found:
+        return True, value
+    return _dig(base_raw or {}, path)
+
+
 def describe(config: AppConfig, base_raw: dict[str, Any],
              overlay_raw: dict[str, Any]) -> list[dict[str, Any]]:
     """The full settings tree the dashboard renders.
@@ -420,9 +433,18 @@ def describe(config: AppConfig, base_raw: dict[str, Any],
         if _is_excluded(path):
             continue
         meta = REGISTRY.get(path)
+        live = None if leaf["kind"] == "list" else current_value(config, path)
+        # What the files say versus what the engine is running. They differ
+        # exactly when a restart-required setting has been saved but not yet
+        # loaded — and a UI that rendered only the live value would snap the
+        # control back, which is indistinguishable from "it did not save".
+        found, pending_raw = raw_value(path, base_raw, overlay_raw)
+        pending = bool(found) and leaf["kind"] != "list" and _jsonable(pending_raw) != live
         described.append({
             **leaf,
-            "value": None if leaf["kind"] == "list" else current_value(config, path),
+            "value": live,
+            "pending_value": _jsonable(pending_raw) if pending else live,
+            "pending": pending,
             "provenance": provenance(path, base_raw, overlay_raw),
             "tier": tier_for(path),
             "writable": is_writable(path) and leaf["kind"] != "list",

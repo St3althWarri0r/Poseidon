@@ -110,17 +110,19 @@ function settingsBanner(text, kind) {
 function renderSettingControl(entry) {
   const kind = PS.controlKind(entry);
   const id = `set-${entry.path.replace(/\./g, "-")}`;
+  // Always the value the files hold — see PS.displayValue.
+  const shownValue = PS.displayValue(entry);
   if (kind === "readonly") {
-    const shown = entry.kind === "list" ? "(edit in poseidon.yaml)" : String(entry.value);
+    const shown = entry.kind === "list" ? "(edit in poseidon.yaml)" : String(shownValue);
     return `<span class="setting-ro" title="read-only here">${esc(shown)}</span>`;
   }
   if (kind === "toggle") {
     return `<label class="switch"><input type="checkbox" id="${id}" data-path="${esc(entry.path)}"`
-      + `${entry.value ? " checked" : ""}><span class="slider"></span></label>`;
+      + `${shownValue ? " checked" : ""}><span class="slider"></span></label>`;
   }
   if (kind === "select") {
     const opts = (entry.constraints.enum || []).map((v) =>
-      `<option value="${esc(String(v))}"${v === entry.value ? " selected" : ""}>${esc(String(v))}</option>`
+      `<option value="${esc(String(v))}"${v === shownValue ? " selected" : ""}>${esc(String(v))}</option>`
     ).join("");
     return `<select id="${id}" data-path="${esc(entry.path)}">${opts}</select>`;
   }
@@ -130,7 +132,7 @@ function renderSettingControl(entry) {
   const type = kind === "number" ? "number" : "text";
   const step = entry.kind === "float" ? ' step="any"' : "";
   return `<input type="${type}"${bounds}${step} id="${id}" data-path="${esc(entry.path)}"`
-    + ` value="${esc(String(entry.value))}">`;
+    + ` value="${esc(String(shownValue))}">`;
 }
 
 function renderSettingRow(entry) {
