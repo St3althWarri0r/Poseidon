@@ -20,7 +20,7 @@ from typing import Any
 
 from ..core.models import Bar
 from ..strategy.base import Signal, Strategy
-from .stats import annualized_vol, calmar, profit_factor, safe_cagr, sortino
+from .stats import annualized_vol, calmar, profit_factor, safe_cagr, sharpe_ratio, sortino
 
 
 @dataclass
@@ -80,13 +80,11 @@ class BacktestResult:
 
     @property
     def sharpe(self) -> float:
-        rets = self.daily_returns
-        if len(rets) < 2:
-            return 0.0
-        mean = sum(rets) / len(rets)
-        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-        std = var ** 0.5
-        return (mean / std) * (252 ** 0.5) if std > 0 else 0.0
+        """Excess-free Sharpe, kept for callers that read the bare property.
+        Delegates to ``stats.sharpe_ratio`` rather than re-deriving the formula
+        — the inline copy that used to live here was a drift risk. Pass a rate
+        via :meth:`summary` to get the honest, rf-adjusted number."""
+        return sharpe_ratio(self.daily_returns)
 
     @property
     def win_rate(self) -> float:
@@ -95,11 +93,16 @@ class BacktestResult:
             return 0.0
         return sum(1 for t in closed if t.pnl > 0) / len(closed)
 
-    def summary(self, *, benchmark_returns: list[float] | None = None) -> dict[str, float | int]:
+    def summary(self, *, benchmark_returns: list[float] | None = None,
+                risk_free_annual: float = 0.0) -> dict[str, float | int]:
         """Point metrics for the replay. When ``benchmark_returns`` (a
         caller-aligned daily series) is provided, three benchmark-relative
         keys are ADDED; without it they are OMITTED entirely so fold
-        spreads keep their shape."""
+        spreads keep their shape.
+
+        ``risk_free_annual`` defaults to 0.0 for backward compatibility, but
+        Sharpe and Sortino both overstate at that setting — pass the real rate
+        (``data.treasury``) whenever the summary is read as strategy quality."""
         values = [v for _, v in self.equity_curve]
         rets = self.daily_returns
         cagr = safe_cagr(values[0] if values else 0.0, values[-1] if values else 0.0,
@@ -117,12 +120,12 @@ class BacktestResult:
         out: dict[str, float | int] = {
             "total_return": round(self.total_return, 4),
             "max_drawdown": round(self.max_drawdown, 4),
-            "sharpe": round(self.sharpe, 2),
+            "sharpe": round(sharpe_ratio(rets, risk_free_annual=risk_free_annual), 2),
             "trades": len(self.trades),
             "win_rate": round(self.win_rate, 3),
             "final_equity": round(self.equity_curve[-1][1], 2) if self.equity_curve else 0,
             "cagr": round(cagr, 4),
-            "sortino": round(sortino(rets), 2),
+            "sortino": round(sortino(rets, risk_free_annual=risk_free_annual), 2),
             "calmar": round(calmar(cagr, self.max_drawdown), 2),
             "profit_factor": round(profit_factor(
                 [t.pnl for t in self.trades if t.exit_price is not None]), 2),

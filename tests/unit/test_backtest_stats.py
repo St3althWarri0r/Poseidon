@@ -171,6 +171,51 @@ def test_sortino_calmar_profit_factor_match_analytics_performance() -> None:
     pnls = [float(t.pnl) for t in trips]
     assert profit_factor(pnls) == report.profit_factor
 
+    # ...and the parity must survive a NONZERO risk-free rate, which is the
+    # only setting that actually exercises the rf terms in both surfaces.
+    rf = 0.0425
+    report_rf = compute_performance(points, trips, risk_free_annual=rf)
+    assert sharpe_ratio(rets, risk_free_annual=rf) == report_rf.sharpe
+    assert sortino(rets, risk_free_annual=rf) == report_rf.sortino
+
+
+# ------------------------------------------------------------ risk-free rate
+
+
+def test_risk_free_rate_defaults_to_zero_preserving_prior_values() -> None:
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005]
+    assert sharpe_ratio(rets, risk_free_annual=0.0) == sharpe_ratio(rets)
+    assert sortino(rets, risk_free_annual=0.0) == sortino(rets)
+
+
+def test_risk_free_rate_lowers_sharpe_and_sortino() -> None:
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005]
+    assert sharpe_ratio(rets, risk_free_annual=0.045) < sharpe_ratio(rets)
+    assert sortino(rets, risk_free_annual=0.045) < sortino(rets)
+
+
+def test_earning_exactly_the_risk_free_rate_scores_zero_sharpe() -> None:
+    # The headline defect rf=0 hid: a portfolio that merely matches T-bills is
+    # producing no excess return and must score 0, not a healthy positive.
+    rf = 0.04
+    daily = rf / 252.0
+    rets = [daily + (0.001 if i % 2 else -0.001) for i in range(60)]
+    assert sharpe_ratio(rets) > 0.5  # what rf=0 used to report
+    assert abs(sharpe_ratio(rets, risk_free_annual=rf)) < 1e-9
+
+
+def test_sortino_downside_is_measured_against_the_risk_free_threshold() -> None:
+    # Every day here is positive but BELOW rf_daily, so the portfolio loses to
+    # cash on all 20 days. With rf=0 there is no strictly-negative day at all,
+    # so the old code took the undefined path and reported a flattering 0.0.
+    # Against the real threshold every day is a shortfall and the score is
+    # negative, which is the truth.
+    rf = 0.05
+    rf_daily = rf / 252.0
+    rets = [rf_daily * 0.5] * 12 + [rf_daily * 0.4] * 8
+    assert sortino(rets) == 0.0
+    assert sortino(rets, risk_free_annual=rf) < 0.0
+
 
 def test_profit_factor_no_loss_cap_is_99_never_inf() -> None:
     assert profit_factor([10.0, 5.0]) == 99.0
@@ -189,6 +234,22 @@ def test_significance_constant_positive_returns_is_significant() -> None:
     assert r["method_sharpe"] == "sign_flip"
     assert r["method_maxdd"] == "order_permutation"
     assert r["runs"] == 200 and r["seed"] == 1
+
+
+def test_bootstrap_ci_brackets_the_headline_at_the_same_risk_free_rate() -> None:
+    # The interval must bracket the Sharpe it is reported next to. Resampling
+    # at rf=0 beside an rf-adjusted headline puts the point estimate OUTSIDE
+    # its own confidence interval in a single payload.
+    rf = 0.0387  # the live Treasury 3M at the time of writing
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005, 0.002, -0.004] * 6
+    r = bootstrap_sharpe(rets, runs=400, seed=11, risk_free_annual=rf)
+    assert r is not None
+    lo, hi = r["sharpe_ci_95"]
+    assert lo <= sharpe_ratio(rets, risk_free_annual=rf) <= hi
+    # ...and the rate genuinely moves the interval, so this is not vacuous.
+    bare = bootstrap_sharpe(rets, runs=400, seed=11)
+    assert bare is not None
+    assert bare["sharpe_ci_95"] != r["sharpe_ci_95"]
 
 
 def test_significance_symmetric_zero_mean_is_not_significant() -> None:

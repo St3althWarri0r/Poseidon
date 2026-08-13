@@ -25,7 +25,8 @@ def monte_carlo(result: BacktestResult, *, runs: int = 1000,
 async def walk_forward(strategy_factory: Callable[[], Strategy],
                        history: dict[str, list[Bar]], *,
                        folds: int = 4, warmup_days: int = 210,
-                       config: BacktestConfig | None = None
+                       config: BacktestConfig | None = None,
+                       risk_free_annual: float = 0.0
                        ) -> list[dict[str, object]]:
     """Split the history into sequential folds and evaluate each out-of-sample
     segment with a strategy built fresh per fold (factory gets no data — the
@@ -60,7 +61,8 @@ async def walk_forward(strategy_factory: Callable[[], Strategy],
         strategy: Strategy = strategy_factory()
         result = await engine.run(strategy, segment, start=start)
         reports.append({"fold": i + 1, "start": start.isoformat(),
-                        "end": end.isoformat(), **result.summary()})
+                        "end": end.isoformat(),
+                        **result.summary(risk_free_annual=risk_free_annual)})
     return reports
 
 
@@ -71,7 +73,9 @@ async def walk_forward_rebalance(strategy_factory: Callable[[], Strategy],
                                  slippage_pct: float = 0.0005,
                                  commission_per_trade: float = 0.0,
                                  start: date | None = None,
-                                 end: date | None = None) -> list[dict[str, object]]:
+                                 end: date | None = None,
+                                 risk_free_annual: float = 0.0
+                                 ) -> list[dict[str, object]]:
     """Sequential out-of-sample folds for REBALANCE-mode algorithms: the
     evaluable region (after the shared 210-day warmup / requested window) is
     split into contiguous segments, each replayed with a FRESH strategy from
@@ -110,7 +114,7 @@ async def walk_forward_rebalance(strategy_factory: Callable[[], Strategy],
             report = await rebalance_backtest(
                 strategy, history, starting_cash=starting_cash,
                 slippage_pct=slippage_pct, commission_per_trade=commission_per_trade,
-                start=fold_start, end=fold_end)
+                start=fold_start, end=fold_end, risk_free_annual=risk_free_annual)
         except ValueError:
             entry["error"] = "insufficient_data"
         else:

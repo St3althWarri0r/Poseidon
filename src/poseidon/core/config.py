@@ -478,6 +478,11 @@ class BacktestEvalConfig(StrictModel):
     monte_carlo_runs: int = Field(default=1000, ge=0, le=20000)  # outcome-distribution paths
     walk_forward_folds: int = Field(default=3, ge=0, le=10)  # 0 disables the fold spread
     seed: int = 42  # explicit seed — never wall-clock; mirrors research.null_base_seed
+    # Annualized risk-free rate for Sharpe/Sortino. 0.0 keeps the pre-2.16
+    # numbers; `auto` fetches the Treasury 3-month par yield, which is what
+    # makes the ratios honest (at rf=0 a portfolio matching T-bills scores
+    # a healthy positive instead of zero).
+    risk_free_annual: float | Literal["auto"] = "auto"
 
 
 class ScreenerConfigBase(StrictModel):

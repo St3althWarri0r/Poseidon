@@ -34,14 +34,23 @@ _TRADING_DAYS = 252.0
 # -- core ratios --------------------------------------------------------------
 
 
-def sharpe_ratio(rets: list[float]) -> float:
-    """Annualized Sharpe (rf=0); 0.0 when undefined (n<2 or zero variance)."""
+def sharpe_ratio(rets: list[float], *, risk_free_annual: float = 0.0) -> float:
+    """Annualized Sharpe over ``risk_free_annual``; 0.0 when undefined (n<2 or
+    zero variance).
+
+    ``risk_free_annual`` defaults to 0.0 so existing callers are unchanged, but
+    leaving it there overstates every result: a portfolio merely matching
+    T-bills scores a healthy positive instead of the honest zero. Pass a real
+    rate — ``data.treasury.risk_free_annual_on`` serves the 3-month par yield —
+    wherever the number is read as strategy quality.
+    """
     if len(rets) < 2:
         return 0.0
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
     std: float = var ** 0.5
-    return float(mean / std * _TRADING_DAYS ** 0.5) if std > 0 else 0.0
+    rf_daily = risk_free_annual / _TRADING_DAYS
+    return float((mean - rf_daily) / std * _TRADING_DAYS ** 0.5) if std > 0 else 0.0
 
 
 def annualized_vol(rets: list[float]) -> float:
@@ -54,21 +63,27 @@ def annualized_vol(rets: list[float]) -> float:
     return float(std * _TRADING_DAYS ** 0.5)
 
 
-def sortino(rets: list[float]) -> float:
-    """Target-downside-deviation Sortino (rf=0) mirroring analytics/performance:
-    squared shortfalls divided by the TOTAL sample (n-1) — up days count as
-    zero shortfall. Undefined -> 0.0 (same convention as sharpe)."""
+def sortino(rets: list[float], *, risk_free_annual: float = 0.0) -> float:
+    """Target-downside-deviation Sortino mirroring analytics/performance:
+    squared shortfalls divided by the TOTAL sample (n-1) — days at or above the
+    target count as zero shortfall. Undefined -> 0.0 (same convention as
+    sharpe).
+
+    The target is ``risk_free_annual / 252``, not zero: a day returning less
+    than cash IS a shortfall even when it is positive.
+    """
     if len(rets) < 2:
         return 0.0
     mean = sum(rets) / len(rets)
-    downside = [r for r in rets if r < 0.0]
+    rf_daily = risk_free_annual / _TRADING_DAYS
+    downside = [r for r in rets if r < rf_daily]
     if not downside:
         return 0.0
-    dvar = sum((r - 0.0) ** 2 for r in downside) / (len(rets) - 1)
+    dvar = sum((r - rf_daily) ** 2 for r in downside) / (len(rets) - 1)
     dstd: float = dvar ** 0.5
     if dstd <= 0:
         return 0.0
-    return float((mean - 0.0) / dstd * _TRADING_DAYS ** 0.5)
+    return float((mean - rf_daily) / dstd * _TRADING_DAYS ** 0.5)
 
 
 def calmar(cagr: float, max_dd: float) -> float:
@@ -197,6 +212,11 @@ def permutation_significance(rets: list[float], *, runs: int,
     honest null for drawdown clustering is the ORDER permutation of the same
     multiset. Both use the add-one convention p = (1 + hits) / (runs + 1), so
     p is never exactly 0. Returns None below 20 observations or with runs<=0.
+
+    Deliberately takes NO risk-free rate. These p-values answer "is the edge
+    distinguishable from zero", and the sign-flip null is symmetry about zero;
+    subtracting a rate would silently redefine the null to "beats cash", which
+    is a different question and would need its own null construction.
     """
     if len(rets) < 20 or runs <= 0:
         return None
@@ -236,11 +256,16 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
-def bootstrap_sharpe(rets: list[float], *, runs: int,
-                     seed: int) -> dict[str, Any] | None:
+def bootstrap_sharpe(rets: list[float], *, runs: int, seed: int,
+                     risk_free_annual: float = 0.0) -> dict[str, Any] | None:
     """IID bootstrap (resample daily returns with replacement) of the Sharpe
     ratio: 95% CI plus the probability the resampled Sharpe is positive.
-    Returns None below 20 observations or with runs<=0."""
+    Returns None below 20 observations or with runs<=0.
+
+    ``risk_free_annual`` MUST match the rate used for the headline Sharpe this
+    interval brackets. Resampling at rf=0 beside an rf-adjusted headline puts
+    the reported point estimate outside its own confidence interval.
+    """
     if len(rets) < 20 or runs <= 0:
         return None
     rng = random.Random(seed)
@@ -248,7 +273,7 @@ def bootstrap_sharpe(rets: list[float], *, runs: int,
     sharpes: list[float] = []
     for _ in range(runs):
         sample = [rng.choice(rets) for _ in range(n)]
-        sharpes.append(sharpe_ratio(sample))
+        sharpes.append(sharpe_ratio(sample, risk_free_annual=risk_free_annual))
     sharpes.sort()
     return {
         "sharpe_ci_95": [round(_percentile(sharpes, 0.025), 4),
