@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import typing
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from pydantic import BaseModel
@@ -406,6 +407,27 @@ def current_value(config: AppConfig, path: str) -> Any:
     return _jsonable(node)
 
 
+def _comparable(value: Any) -> Any:
+    """Normalise a value for the running-vs-saved comparison.
+
+    Decimal-typed settings are stringified for JSON transport ('10000000')
+    while parsed YAML holds a number (10000000), so a raw comparison marks
+    every one of them pending. Numeric-looking values are compared AS numbers;
+    everything else falls through unchanged, so a genuine change is still
+    caught.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — keep it distinct
+        return value
+    if isinstance(value, int | float | Decimal):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        try:
+            return Decimal(value)
+        except (InvalidOperation, ValueError):
+            return value
+    return value
+
+
 def raw_value(path: str, base_raw: dict[str, Any],
               overlay_raw: dict[str, Any]) -> tuple[bool, Any]:
     """``(found, value)`` for a path in the merged raw files, overlay winning.
@@ -439,7 +461,8 @@ def describe(config: AppConfig, base_raw: dict[str, Any],
         # loaded — and a UI that rendered only the live value would snap the
         # control back, which is indistinguishable from "it did not save".
         found, pending_raw = raw_value(path, base_raw, overlay_raw)
-        pending = bool(found) and leaf["kind"] != "list" and _jsonable(pending_raw) != live
+        pending = (bool(found) and leaf["kind"] != "list"
+                   and _comparable(_jsonable(pending_raw)) != _comparable(live))
         described.append({
             **leaf,
             "value": live,
