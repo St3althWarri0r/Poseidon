@@ -236,6 +236,22 @@ def test_significance_constant_positive_returns_is_significant() -> None:
     assert r["runs"] == 200 and r["seed"] == 1
 
 
+def test_bootstrap_ci_brackets_the_headline_at_the_same_risk_free_rate() -> None:
+    # The interval must bracket the Sharpe it is reported next to. Resampling
+    # at rf=0 beside an rf-adjusted headline puts the point estimate OUTSIDE
+    # its own confidence interval in a single payload.
+    rf = 0.0387  # the live Treasury 3M at the time of writing
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005, 0.002, -0.004] * 6
+    r = bootstrap_sharpe(rets, runs=400, seed=11, risk_free_annual=rf)
+    assert r is not None
+    lo, hi = r["sharpe_ci_95"]
+    assert lo <= sharpe_ratio(rets, risk_free_annual=rf) <= hi
+    # ...and the rate genuinely moves the interval, so this is not vacuous.
+    bare = bootstrap_sharpe(rets, runs=400, seed=11)
+    assert bare is not None
+    assert bare["sharpe_ci_95"] != r["sharpe_ci_95"]
+
+
 def test_significance_symmetric_zero_mean_is_not_significant() -> None:
     rets = [0.01, -0.01] * 50
     r = permutation_significance(rets, runs=400, seed=2)

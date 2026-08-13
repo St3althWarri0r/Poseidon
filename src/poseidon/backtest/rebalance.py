@@ -317,7 +317,9 @@ async def rebalance_backtest(strategy: Strategy, history: dict[str, list[Bar]], 
         if len(rets) < 20:
             warnings.append("bootstrap_insufficient_returns")
         else:
-            bootstrap = stats.bootstrap_sharpe(rets, runs=bootstrap_runs, seed=seed)
+            bootstrap = stats.bootstrap_sharpe(
+                rets, runs=bootstrap_runs, seed=seed,
+                risk_free_annual=risk_free_annual)
     monte_carlo_block: dict[str, Any] | None = None
     if monte_carlo_runs > 0:
         if len(rets) < 20:

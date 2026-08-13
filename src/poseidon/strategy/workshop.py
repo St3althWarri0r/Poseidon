@@ -344,10 +344,16 @@ class AlgorithmWorkshop:
             benchmark = (bench_symbol,
                          {b.start.date(): float(b.close) for b in bench_bars})
 
+        # Resolved ONCE: the headline, its bootstrap CI and every walk-forward
+        # fold must be measured against the same rate, or the report
+        # contradicts itself — a point estimate sitting outside its own
+        # confidence interval, and folds on a different basis than the
+        # headline they are compared against.
+        risk_free = await self._resolve_risk_free(window_end)
         report = await rebalance_backtest(
             algo, history, starting_cash=starting_cash,
             start=window_start, end=window_end, benchmark=benchmark,
-            risk_free_annual=await self._resolve_risk_free(window_end),
+            risk_free_annual=risk_free,
             significance_runs=self._eval.significance_runs,
             bootstrap_runs=self._eval.bootstrap_runs,
             monte_carlo_runs=self._eval.monte_carlo_runs,
@@ -360,7 +366,8 @@ class AlgorithmWorkshop:
                 lambda: CustomAlgorithm(algo_name=record["name"], source=record["source"],
                                         symbols=symbols, options=record["params"]),
                 history, folds=self._eval.walk_forward_folds,
-                starting_cash=starting_cash, start=window_start, end=window_end)
+                starting_cash=starting_cash, start=window_start, end=window_end,
+                risk_free_annual=risk_free)
         else:
             report["walk_forward"] = None
         report["algorithm"] = record["name"]

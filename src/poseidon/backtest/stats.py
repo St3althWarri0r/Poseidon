@@ -212,6 +212,11 @@ def permutation_significance(rets: list[float], *, runs: int,
     honest null for drawdown clustering is the ORDER permutation of the same
     multiset. Both use the add-one convention p = (1 + hits) / (runs + 1), so
     p is never exactly 0. Returns None below 20 observations or with runs<=0.
+
+    Deliberately takes NO risk-free rate. These p-values answer "is the edge
+    distinguishable from zero", and the sign-flip null is symmetry about zero;
+    subtracting a rate would silently redefine the null to "beats cash", which
+    is a different question and would need its own null construction.
     """
     if len(rets) < 20 or runs <= 0:
         return None
@@ -251,11 +256,16 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
 
 
-def bootstrap_sharpe(rets: list[float], *, runs: int,
-                     seed: int) -> dict[str, Any] | None:
+def bootstrap_sharpe(rets: list[float], *, runs: int, seed: int,
+                     risk_free_annual: float = 0.0) -> dict[str, Any] | None:
     """IID bootstrap (resample daily returns with replacement) of the Sharpe
     ratio: 95% CI plus the probability the resampled Sharpe is positive.
-    Returns None below 20 observations or with runs<=0."""
+    Returns None below 20 observations or with runs<=0.
+
+    ``risk_free_annual`` MUST match the rate used for the headline Sharpe this
+    interval brackets. Resampling at rf=0 beside an rf-adjusted headline puts
+    the reported point estimate outside its own confidence interval.
+    """
     if len(rets) < 20 or runs <= 0:
         return None
     rng = random.Random(seed)
@@ -263,7 +273,7 @@ def bootstrap_sharpe(rets: list[float], *, runs: int,
     sharpes: list[float] = []
     for _ in range(runs):
         sample = [rng.choice(rets) for _ in range(n)]
-        sharpes.append(sharpe_ratio(sample))
+        sharpes.append(sharpe_ratio(sample, risk_free_annual=risk_free_annual))
     sharpes.sort()
     return {
         "sharpe_ci_95": [round(_percentile(sharpes, 0.025), 4),
