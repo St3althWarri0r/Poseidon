@@ -78,6 +78,37 @@ def test_ols_flat_benchmark_is_none_not_a_crash() -> None:
     assert r["beta"] is None and r["t_alpha"] is None and r["n_days"] == 100
 
 
+def test_ols_rejects_a_benchmark_whose_variance_is_only_float_noise() -> None:
+    """Version-independent pin for the degenerate-benchmark guard.
+
+    ``sxx <= 0`` was a float-equality test in disguise. For a constant series
+    CPython 3.12+ compensates its summation and yields exactly 0.0, but
+    earlier versions leave a ~1e-35 residue that slipped past the guard — and
+    beta is then a division BY that residue, i.e. rounding noise amplified
+    into a plausible-looking number. (This is precisely how the constant-x
+    case above passed locally on 3.14 while failing CI on 3.11 and 3.12.)
+
+    Rather than depend on the interpreter's summation, this constructs a
+    benchmark whose variance is genuinely nonzero but negligible against its
+    own scale — the same pathology, reproducible everywhere.
+    """
+    y = [0.001 * math.sin(i) for i in range(100)]
+    x = [0.001] * 99 + [0.001 + 1e-12]
+    sxx = sum((xi - sum(x) / len(x)) ** 2 for xi in x)
+    assert sxx > 0, "fixture must have strictly positive variance to be a real test"
+    r = ols_alpha_beta(y, x)
+    assert r["beta"] is None and r["t_alpha"] is None and r["n_days"] == 100
+
+
+def test_ols_still_estimates_a_genuinely_low_variance_benchmark() -> None:
+    # The guard must not swallow real signal: a small but honest variation is
+    # ~24 orders of magnitude above the noise floor and stays estimable.
+    x = [0.001 + 1e-6 * math.sin(i) for i in range(100)]
+    y = [0.0002 + 0.5 * xi for xi in x]
+    r = ols_alpha_beta(y, x)
+    assert r["beta"] == pytest.approx(0.5, abs=1e-6)
+
+
 # -- safe_cagr ----------------------------------------------------------------
 
 

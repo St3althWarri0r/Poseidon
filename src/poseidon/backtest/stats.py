@@ -136,7 +136,16 @@ def ols_alpha_beta(strategy_rets: list[float],
     mean_x = sum(x) / n
     mean_y = sum(y) / n
     sxx = sum((xi - mean_x) ** 2 for xi in x)
-    if sxx <= 0:
+    # A benchmark with no real variation is unestimable — but `sxx <= 0` is a
+    # float-equality test in disguise. Exact zero only survives when the
+    # interpreter's summation happens to be exact: CPython 3.12+ compensates
+    # (Neumaier) and yields 0.0 for a constant series, while earlier versions
+    # leave a ~1e-35 residue. Dividing by that residue turns pure rounding
+    # noise into a plausible-looking beta. Gate on sxx being negligible
+    # RELATIVE to the series' own scale, which is version-independent: a
+    # constant series lands near 1e-31, any real series is many orders above.
+    scale = sum(xi * xi for xi in x)
+    if sxx <= 0 or (scale > 0 and sxx / scale < 1e-14):
         return empty
     sxy = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
     syy = sum((yi - mean_y) ** 2 for yi in y)
