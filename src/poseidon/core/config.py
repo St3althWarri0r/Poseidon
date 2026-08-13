@@ -225,14 +225,19 @@ class PMToolsConfig(StrictModel):
 
     Each flag adds one read-only, advisory tool to the AI catalogs: a guarded
     web read (``read_url``), a view over the platform screener cache
-    (``screen_market``), and a date-aligned correlation matrix
-    (``compute_correlation_matrix``). Advisory only — data upstream of the PM;
-    nothing here touches the risk engine or the order path, and with every
-    flag off the catalogs are byte-identical to today's.
+    (``screen_market``), a date-aligned correlation matrix
+    (``compute_correlation_matrix``), and keyless macro regime context
+    (``get_macro_context`` — delayed VIX plus the Treasury par yield curve).
+    Advisory only — data upstream of the PM; nothing here touches the risk
+    engine or the order path, and with every flag off the catalogs are
+    byte-identical to today's.
     """
 
     web_read: WebReadConfig = Field(default_factory=WebReadConfig)
     screen_market: bool = False
+    # Macro is CONTEXT, never price truth: the tool's payload says so, and the
+    # VIX leg is labelled delayed because CBOE's public feed is.
+    macro_context: bool = False
     correlation: bool = False
     correlation_max_symbols: int = Field(default=12, ge=2, le=30)
     correlation_window_days: int = Field(default=120, ge=30, le=250)
