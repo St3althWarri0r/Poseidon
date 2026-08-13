@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -142,6 +144,33 @@ class WebsocketHub:
             self._clients.discard(ws)
 
 
+@lru_cache(maxsize=1)
+def asset_stamp() -> str:
+    """Cache-busting stamp for the dashboard's JS/CSS URLs.
+
+    Derived from the CONTENT of the served assets, not the release version.
+    Version-stamping looked equivalent and is not: the common case is a
+    dashboard-only change that ships without a version bump, leaving
+    ``app.js?v=2.16.0`` byte-identical to the URL already in the browser's
+    cache. That is exactly how the Settings view shipped invisible in the app
+    window (its own Chromium profile) while looking fine in a cold browser.
+
+    The version is kept as a prefix so the stamp still says which release you
+    are looking at in devtools. Cached per process: assets cannot change under
+    a running server without a restart, which recomputes it.
+    """
+    from .. import __version__
+
+    digest = hashlib.sha256(__version__.encode())
+    for path in sorted(STATIC_DIR.rglob("*")):
+        # Only what the markup actually versions. Hashing images or fonts would
+        # invalidate every client's cache for a change no page load can see.
+        if path.is_file() and path.suffix in {".js", ".css"}:
+            digest.update(path.relative_to(STATIC_DIR).as_posix().encode())
+            digest.update(path.read_bytes())
+    return f"{__version__}-{digest.hexdigest()[:12]}"
+
+
 def build_app(kernel: ApplicationKernel) -> FastAPI:
     app = FastAPI(title="Poseidon", docs_url=None, redoc_url=None, openapi_url=None)
     hub = WebsocketHub(kernel.bus)
@@ -253,13 +282,12 @@ def build_app(kernel: ApplicationKernel) -> FastAPI:
 
     @app.get("/")
     async def index() -> Response:
-        # Version-stamp the asset URLs (?v=x.y.z) so a browser can never pair
-        # a new backend with cached old JS/CSS — the "I updated but see the
-        # old dashboard" class of confusion.
-        from .. import __version__
-
+        # Content-stamp the asset URLs so a browser can never pair a new
+        # backend with cached old JS/CSS — the "I updated but see the old
+        # dashboard" class of confusion. See asset_stamp() for why this is
+        # keyed on asset content rather than the release version.
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html.replace("__V__", __version__),
+        return HTMLResponse(html.replace("__V__", asset_stamp()),
                             headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/status")
