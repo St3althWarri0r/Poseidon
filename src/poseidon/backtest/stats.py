@@ -34,14 +34,23 @@ _TRADING_DAYS = 252.0
 # -- core ratios --------------------------------------------------------------
 
 
-def sharpe_ratio(rets: list[float]) -> float:
-    """Annualized Sharpe (rf=0); 0.0 when undefined (n<2 or zero variance)."""
+def sharpe_ratio(rets: list[float], *, risk_free_annual: float = 0.0) -> float:
+    """Annualized Sharpe over ``risk_free_annual``; 0.0 when undefined (n<2 or
+    zero variance).
+
+    ``risk_free_annual`` defaults to 0.0 so existing callers are unchanged, but
+    leaving it there overstates every result: a portfolio merely matching
+    T-bills scores a healthy positive instead of the honest zero. Pass a real
+    rate (``data.famafrench`` serves one) wherever the number is read as
+    strategy quality.
+    """
     if len(rets) < 2:
         return 0.0
     mean = sum(rets) / len(rets)
     var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
     std: float = var ** 0.5
-    return float(mean / std * _TRADING_DAYS ** 0.5) if std > 0 else 0.0
+    rf_daily = risk_free_annual / _TRADING_DAYS
+    return float((mean - rf_daily) / std * _TRADING_DAYS ** 0.5) if std > 0 else 0.0
 
 
 def annualized_vol(rets: list[float]) -> float:
@@ -54,21 +63,27 @@ def annualized_vol(rets: list[float]) -> float:
     return float(std * _TRADING_DAYS ** 0.5)
 
 
-def sortino(rets: list[float]) -> float:
-    """Target-downside-deviation Sortino (rf=0) mirroring analytics/performance:
-    squared shortfalls divided by the TOTAL sample (n-1) — up days count as
-    zero shortfall. Undefined -> 0.0 (same convention as sharpe)."""
+def sortino(rets: list[float], *, risk_free_annual: float = 0.0) -> float:
+    """Target-downside-deviation Sortino mirroring analytics/performance:
+    squared shortfalls divided by the TOTAL sample (n-1) — days at or above the
+    target count as zero shortfall. Undefined -> 0.0 (same convention as
+    sharpe).
+
+    The target is ``risk_free_annual / 252``, not zero: a day returning less
+    than cash IS a shortfall even when it is positive.
+    """
     if len(rets) < 2:
         return 0.0
     mean = sum(rets) / len(rets)
-    downside = [r for r in rets if r < 0.0]
+    rf_daily = risk_free_annual / _TRADING_DAYS
+    downside = [r for r in rets if r < rf_daily]
     if not downside:
         return 0.0
-    dvar = sum((r - 0.0) ** 2 for r in downside) / (len(rets) - 1)
+    dvar = sum((r - rf_daily) ** 2 for r in downside) / (len(rets) - 1)
     dstd: float = dvar ** 0.5
     if dstd <= 0:
         return 0.0
-    return float((mean - 0.0) / dstd * _TRADING_DAYS ** 0.5)
+    return float((mean - rf_daily) / dstd * _TRADING_DAYS ** 0.5)
 
 
 def calmar(cagr: float, max_dd: float) -> float:

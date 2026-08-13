@@ -171,6 +171,51 @@ def test_sortino_calmar_profit_factor_match_analytics_performance() -> None:
     pnls = [float(t.pnl) for t in trips]
     assert profit_factor(pnls) == report.profit_factor
 
+    # ...and the parity must survive a NONZERO risk-free rate, which is the
+    # only setting that actually exercises the rf terms in both surfaces.
+    rf = 0.0425
+    report_rf = compute_performance(points, trips, risk_free_annual=rf)
+    assert sharpe_ratio(rets, risk_free_annual=rf) == report_rf.sharpe
+    assert sortino(rets, risk_free_annual=rf) == report_rf.sortino
+
+
+# ------------------------------------------------------------ risk-free rate
+
+
+def test_risk_free_rate_defaults_to_zero_preserving_prior_values() -> None:
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005]
+    assert sharpe_ratio(rets, risk_free_annual=0.0) == sharpe_ratio(rets)
+    assert sortino(rets, risk_free_annual=0.0) == sortino(rets)
+
+
+def test_risk_free_rate_lowers_sharpe_and_sortino() -> None:
+    rets = [0.004, -0.002, 0.006, 0.001, -0.003, 0.005]
+    assert sharpe_ratio(rets, risk_free_annual=0.045) < sharpe_ratio(rets)
+    assert sortino(rets, risk_free_annual=0.045) < sortino(rets)
+
+
+def test_earning_exactly_the_risk_free_rate_scores_zero_sharpe() -> None:
+    # The headline defect rf=0 hid: a portfolio that merely matches T-bills is
+    # producing no excess return and must score 0, not a healthy positive.
+    rf = 0.04
+    daily = rf / 252.0
+    rets = [daily + (0.001 if i % 2 else -0.001) for i in range(60)]
+    assert sharpe_ratio(rets) > 0.5  # what rf=0 used to report
+    assert abs(sharpe_ratio(rets, risk_free_annual=rf)) < 1e-9
+
+
+def test_sortino_downside_is_measured_against_the_risk_free_threshold() -> None:
+    # Every day here is positive but BELOW rf_daily, so the portfolio loses to
+    # cash on all 20 days. With rf=0 there is no strictly-negative day at all,
+    # so the old code took the undefined path and reported a flattering 0.0.
+    # Against the real threshold every day is a shortfall and the score is
+    # negative, which is the truth.
+    rf = 0.05
+    rf_daily = rf / 252.0
+    rets = [rf_daily * 0.5] * 12 + [rf_daily * 0.4] * 8
+    assert sortino(rets) == 0.0
+    assert sortino(rets, risk_free_annual=rf) < 0.0
+
 
 def test_profit_factor_no_loss_cap_is_99_never_inf() -> None:
     assert profit_factor([10.0, 5.0]) == 99.0
