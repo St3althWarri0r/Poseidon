@@ -41,8 +41,8 @@ def sharpe_ratio(rets: list[float], *, risk_free_annual: float = 0.0) -> float:
     ``risk_free_annual`` defaults to 0.0 so existing callers are unchanged, but
     leaving it there overstates every result: a portfolio merely matching
     T-bills scores a healthy positive instead of the honest zero. Pass a real
-    rate (``data.famafrench`` serves one) wherever the number is read as
-    strategy quality.
+    rate — ``data.treasury.risk_free_annual_on`` serves the 3-month par yield —
+    wherever the number is read as strategy quality.
     """
     if len(rets) < 2:
         return 0.0

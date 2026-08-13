@@ -1,17 +1,20 @@
-"""Ken French Data Library loader — keyless risk-free rate and factor returns.
+"""Ken French Data Library loader — canonical factor returns.
 
-Two things Poseidon had no source for:
+Source for the **Mkt-RF / SMB / HML factor returns**, which let the factor lab
+report a candidate's *residual* alpha: the return that market, size and value
+exposure do not already explain. Keyless, published by Dartmouth (Fama/French).
+We fetch it at runtime and never vendor it — the series are factual return
+data, but the file itself stays upstream where it is kept current.
 
-  * a **real risk-free rate**. ``backtest/stats.py`` assumed rf=0, so a
-    portfolio merely matching T-bills scored a healthy positive Sharpe
-    instead of the honest zero;
-  * the **canonical Mkt-RF / SMB / HML factor returns**, which let the factor
-    lab report a candidate's *residual* alpha — the return the market, size
-    and value factors do not already explain.
-
-Both come from one keyless file published by Dartmouth (Fama/French). We fetch
-it at runtime and never vendor it: the series are factual return data, but the
-file itself stays upstream where it is kept current.
+**This module is not Poseidon's risk-free rate.** The ``RF`` column looks like
+the obvious source and was measured before being rejected: it carries two
+decimals of a DAILY rate, so it quantizes to 2.52%/yr steps and 2023, 2024 and
+2025 all report exactly 5.04%. :mod:`poseidon.data.treasury` serves the rate
+from the 3-month par yield instead, at ±0.005pp. ``RF`` is still exported here
+because factor regressions need excess returns computed against the *same* RF
+that Mkt-RF was constructed with — internal consistency beats absolute
+accuracy in that one context, and 1bp/day rounding is second-order against
+daily factor moves of ~1%.
 
 File shape (verified against the live file, 202606 CRSP build):
 
@@ -104,12 +107,17 @@ def parse_factor_csv(text: str) -> list[FactorRow]:
 
 
 def risk_free_annual_on(rows: list[FactorRow], on: date) -> float:
-    """Annualized risk-free rate in effect on ``on``.
+    """Annualized risk-free rate from the ``RF`` column.
 
-    Returns the most recent row at or before ``on``, carried forward — the
-    library's publication lag means live-adjacent dates are always past the
-    end of the series. Before the series begins there is genuinely no data, so
-    the answer is 0.0.
+    **Degrade path only.** :func:`poseidon.data.treasury.risk_free_annual_on`
+    is the primary rate; this exists so an unreachable Treasury feed falls back
+    to a coarse-but-real rate rather than to 0.0, which is the bug the rate was
+    introduced to fix. Quantized to 2.52%/yr steps — see the module docstring.
+
+    Returns the most recent row at or before ``on``, carried forward: the
+    library publishes ~6 weeks in arrears, so live-adjacent dates are always
+    past the end of the series. Before the series begins there is genuinely no
+    data, so the answer is 0.0.
     """
     best: FactorRow | None = None
     for row in rows:  # rows are sorted; the last match at-or-before wins
