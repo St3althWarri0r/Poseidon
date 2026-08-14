@@ -40,6 +40,7 @@ from ..core.enums import (
 from ..core.errors import DataError
 from ..core.events import Topics
 from ..core.models import Decision, ExitPlan, Order, ProposedTrade, TradeRationale
+from ..core.symbols import is_crypto_symbol
 from ..storage.db import Database
 
 log = structlog.get_logger(__name__)
@@ -166,8 +167,16 @@ class PositionGuardian:
         if not self._config.enabled:
             return
         kernel = self._kernel
-        if kernel.clock.session() is not MarketSession.REGULAR:  # type: ignore[attr-defined]
-            return
+        # The session gate is PER SYMBOL, not per sweep. It used to return here
+        # before reading a single row, and MarketClock.session() is US-equity-
+        # only — so crypto stops went unenforced outside 09:30-16:00 ET, up to
+        # 65 hours over a weekend, while the rest of the system correctly
+        # treats crypto as 24/7 (MarketOpenRule exempts AssetClass.CRYPTO; the
+        # review cycle ranks crypto unconditionally). An armed-and-unwatched
+        # stop is worse than none, because it substitutes for one.
+        equities_tradeable = (
+            kernel.clock.session() is MarketSession.REGULAR  # type: ignore[attr-defined]
+        )
         # Broker-scoped: a plan armed for another brokerage's position must
         # never fire here. Legacy rows (broker='') still match the active
         # broker so pre-upgrade plans keep protecting their positions.
@@ -177,6 +186,8 @@ class PositionGuardian:
             (kernel.broker.name,),  # type: ignore[attr-defined]
         )
         for symbol, decision_id, stop_raw, target_raw in rows:
+            if not equities_tradeable and not is_crypto_symbol(symbol):
+                continue  # an equity exit genuinely cannot execute while closed
             position = kernel.portfolio.position_for(symbol)  # type: ignore[attr-defined]
             if position is None or position.quantity <= 0:
                 await self._maybe_deactivate(symbol, "position no longer held")

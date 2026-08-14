@@ -48,7 +48,12 @@ def test_screener_universe_matches_research_copy() -> None:
 def test_load_crypto_base_usd_pairs() -> None:
     """``crypto`` universe: upcased BASE/USD pairs, de-duped, ``/`` preserved, all crypto."""
     symbols = load_universe("crypto")
-    assert len(symbols) >= 40  # ~40 canonical liquid Coinbase USD pairs
+    # ~39 canonical liquid Coinbase USD pairs. Was 40 until DYDX/USD was
+    # removed: verified HTTP 404 against the public Coinbase candles endpoint
+    # during the 2026-08 audit, while BTC/MKR/RNDR all returned 200. Every entry
+    # must actually be fetchable — a delisted pair burns a request per screener
+    # refresh and makes the guardian skip that symbol's stop check.
+    assert len(symbols) >= 39
     assert len(set(symbols)) == len(symbols)  # de-duped
     assert all(s == s.upper() for s in symbols)  # uppercased
     assert all("/" in s for s in symbols)  # slash preserved

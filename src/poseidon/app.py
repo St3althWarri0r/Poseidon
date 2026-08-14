@@ -1148,9 +1148,14 @@ class ApplicationKernel:
             s.job == "position_guardian" and s.enabled for s in schedules
         ):
             schedules.append(
+                # 24/7 on purpose: crypto stops must be enforced around the
+                # clock. check_all() applies the equity session gate PER SYMBOL,
+                # so equity plans are still only acted on during REGULAR hours —
+                # gating the whole job here as well left crypto positions
+                # unwatched for up to 65 hours over a weekend.
                 ScheduleConfig(name="position-guardian", job="position_guardian",
                                every_seconds=self.config.guardian.interval_seconds,
-                               only_market_hours=True)
+                               only_market_hours=False)
             )
         if self.config.reports.daily_summary and not any(
             s.job == "daily_report" and s.enabled for s in schedules

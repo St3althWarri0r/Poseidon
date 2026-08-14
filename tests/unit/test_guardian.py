@@ -146,6 +146,56 @@ async def test_guardian_take_profit_keeps_the_passive_limit(tmp_path) -> None:
     assert trade.limit_price == Decimal("121"), "take-profit prices at the level, not through it"
 
 
+async def test_crypto_stops_are_enforced_while_the_equity_market_is_closed(tmp_path) -> None:
+    """Crypto trades 24/7, so its stops must be watched 24/7.
+
+    The guardian used to return at the top of check_all whenever the NYSE
+    session was not REGULAR — before reading a single exit_plans row — and
+    MarketClock.session() has no crypto awareness. Everything else in the
+    system already exempts crypto from the equity session (MarketOpenRule,
+    the cycle's crypto ranking), so a position opened at 21:00 with a stop
+    armed went unwatched until 09:30 ET: up to 65 hours over a weekend.
+    """
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="94.50", position_qty="10")
+    kernel.clock = SimpleNamespace(session=lambda: MarketSession.CLOSED)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy(symbol="BTC/USD"))
+    await guardian.check_all()
+    await guardian.drain()
+
+    assert len(kernel.executed_decisions) == 1, "a crypto stop must fire outside RTH"
+    assert kernel.executed_decisions[0].trades[0].symbol == "BTC/USD"
+    await db.close()
+
+
+async def test_equity_stops_are_still_gated_on_the_session(tmp_path) -> None:
+    """The equity gate is physically correct and must survive: an equity exit
+    cannot execute when the exchange is closed."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="94.50", position_qty="10")
+    kernel.clock = SimpleNamespace(session=lambda: MarketSession.CLOSED)
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())  # AAPL
+    await guardian.check_all()
+    await guardian.drain()
+
+    assert kernel.executed_decisions == [], "an equity exit must not fire while closed"
+    await db.close()
+
+
+async def test_both_classes_are_enforced_during_regular_hours(tmp_path) -> None:
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="94.50", position_qty="10")
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)  # REGULAR by default
+    await guardian.on_order_filled("order.filled", filled_buy(symbol="ETH/USD"))
+    await guardian.check_all()
+    await guardian.drain()
+
+    assert len(kernel.executed_decisions) == 1
+    await db.close()
+
+
 async def test_no_plan_when_nothing_enforceable(tmp_path) -> None:
     db = await _db_with_decision(tmp_path, stop=None, target=None)
     kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="100", position_qty="10")
