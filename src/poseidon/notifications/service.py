@@ -56,6 +56,7 @@ class NotificationService:
             Topics.BROKER_RECONNECTED: self._on_reconnect,
             Topics.APPROVAL_REQUESTED: self._on_approval,
             Topics.SYSTEM_ERROR: self._on_system_error,
+            Topics.HEALTH_CHANGED: self._on_health,
             Topics.NOTIFY: self._on_direct,
         }
         for topic, handler in bindings.items():
@@ -145,6 +146,38 @@ class NotificationService:
             f"Confidence: {rationale.get('confidence', '?')} — approve in the dashboard "
             f"within {int(payload.get('expires_in_seconds', 900)) // 60} minutes.",
             dedupe_key=f"approval:{order.get('id')}",
+        )
+
+    async def _on_health(self, _topic: str, payload: Any) -> None:
+        """Escalate component health transitions.
+
+        HealthMonitor publishes only on a CHANGE of state, so this cannot spam:
+        one message per transition, per component. Until this binding existed
+        the topic had NO subscribers at all — a failing broker ping, every data
+        provider entering the penalty box, or portfolio sync going stale (which
+        makes FreshPortfolioRule refuse orders, exits included, after 120s)
+        produced a log line and nothing more.
+
+        Recovery is reported too: silence after a critical is ambiguous.
+        """
+        if not isinstance(payload, dict):
+            return
+        name = str(payload.get("name") or "component")
+        state = str(payload.get("state") or "unknown")
+        detail = str(payload.get("detail") or "")
+        level = {
+            "unhealthy": NotificationLevel.CRITICAL,
+            "degraded": NotificationLevel.WARNING,
+        }.get(state, NotificationLevel.INFO)
+        verb = "recovered" if level is NotificationLevel.INFO else f"is {state.upper()}"
+        await self.notify(
+            level, f"Health: {name} {verb}",
+            f"{detail}\nComponent '{name}' -> {state}. "
+            + ("Trading may be blocked while this persists; check the System view."
+               if level is NotificationLevel.CRITICAL else "Check the System view."),
+            # Keyed on component AND state so a flap re-alerts on each direction
+            # rather than being swallowed by the dedupe window.
+            dedupe_key=f"health:{name}:{state}",
         )
 
     async def _on_system_error(self, _topic: str, payload: Any) -> None:
