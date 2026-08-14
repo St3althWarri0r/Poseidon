@@ -139,6 +139,7 @@ broker** — nothing can trade until you deliberately change both.
 | [docs/developer-guide.md](docs/developer-guide.md) | Codebase tour, testing, conventions |
 | [docs/plugin-development.md](docs/plugin-development.md) | Writing broker/provider/strategy plugins |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Diagnostics and common failures |
+| [docs/runbook.md](docs/runbook.md) | Operator procedures: backup/restore, passphrase rotation, audit-chain recovery, broker and model outages, HALT |
 
 ## Disclaimer
 
