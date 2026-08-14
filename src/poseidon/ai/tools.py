@@ -24,7 +24,7 @@ from ..core.config import (
     SnapshotConfig,
 )
 from ..core.errors import ConfigError, DataError
-from ..core.symbols import is_crypto_symbol
+from ..core.symbols import crypto_form_hint, is_crypto_symbol
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
 from ..risk.engine import RiskEngine
@@ -203,6 +203,14 @@ class ToolDispatcher:
     # -- data tools --------------------------------------------------------------
 
     async def _tool_get_quote(self, symbol: str) -> dict[str, Any]:
+        # A bare crypto base ("ADA") routes as an equity ticker, finds nothing,
+        # and yields a data gap saying "unavailable" — true but useless, since
+        # the data exists and only the SHAPE was wrong. Name the right form so
+        # the model can retry this cycle. Deliberately not rewritten: an equity
+        # ticker could share the name, and guessing is what a tool must not do.
+        hint = crypto_form_hint(symbol)
+        if hint is not None:
+            raise DataError(hint)
         quote = await self._router.quote(symbol, allow_delayed=self._allow_delayed)
         self.sources_used.add(quote.source)
         return quote.model_dump(mode="json")
@@ -224,6 +232,16 @@ class ToolDispatcher:
 
     async def _tool_get_option_chain(self, underlying: str,
                                      expiration: str | None) -> dict[str, Any]:
+        # Crypto has no listed options at any supported broker. Without this the
+        # model burns cycle after cycle on "option_chain_unavailable_for_AAVE/USD"
+        # while an options strategy is enabled, and never learns why.
+        if is_crypto_symbol(underlying) or crypto_form_hint(underlying):
+            raise DataError(
+                f"{underlying} is crypto — there are no listed options on it. "
+                "Options strategies (covered calls, protective puts, volatility "
+                "income) apply to equities/ETFs only; for a crypto candidate use "
+                "a directional strategy or record it as unsuitable and move on."
+            )
         exp = date.fromisoformat(expiration) if expiration else None
         chain = await self._router.option_chain(underlying, expiration=exp,
                                                 allow_delayed=self._allow_delayed)

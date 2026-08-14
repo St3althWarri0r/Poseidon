@@ -87,6 +87,14 @@ def _rolling_vols(closes: list[float], window: int = _VOL_WINDOW) -> list[float]
     return vols
 
 
+# Absolute annualized-volatility anchors for the regime's volatility legs.
+# SPY sits near 10-14% in calm markets and 25%+ under genuine stress, so these
+# separate "quiet year, slightly less quiet week" from real turbulence. They are
+# floors, not triggers: the percentile must ALSO be unusual.
+_ELEVATED_VOL = 0.18
+_STRESS_VOL = 0.28
+
+
 def compute_regime(closes: list[float], *, benchmark: str) -> RegimeReport:
     now = datetime.now(UTC)
     if len(closes) < _MIN_BARS:
@@ -118,8 +126,19 @@ def compute_regime(closes: list[float], *, benchmark: str) -> RegimeReport:
     else:
         trend = "sideways"
 
-    high_vol = vol_pct is not None and vol_pct >= 0.70
-    extreme_vol = vol_pct is not None and vol_pct >= 0.90
+    # A percentile alone cannot tell "unusually volatile FOR A QUIET YEAR" from
+    # "actually volatile": it ranks today against the trailing year, so in a calm
+    # year the 72nd percentile of a calm distribution is still calm. Observed
+    # live on SPY: uptrend, 0% drawdown, 13.5% annualized vol, percentile 0.72 ->
+    # "risk_off", while the platform's own macro read said VIX 14.6, regime low.
+    # A synthetic calm series reached "stress" at 11.5% annualized.
+    #
+    # So the volatility legs need BOTH an unusual percentile AND a meaningful
+    # ABSOLUTE level. The trend and drawdown legs are already absolute and are
+    # deliberately left alone.
+    vol_abs = current_vol if current_vol is not None else 0.0
+    high_vol = vol_pct is not None and vol_pct >= 0.70 and vol_abs >= _ELEVATED_VOL
+    extreme_vol = vol_pct is not None and vol_pct >= 0.90 and vol_abs >= _STRESS_VOL
     if extreme_vol or drawdown >= 0.15:
         state = "stress"
     elif trend == "downtrend" or high_vol or drawdown >= 0.08:

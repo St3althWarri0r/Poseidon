@@ -189,7 +189,21 @@ class AlpacaBroker(Broker):
                     )
         return None
 
-    async def submit_order(self, order: Order) -> Order:
+    @staticmethod
+    def _order_body(order: Order) -> dict[str, Any]:
+        """Build the /v2/orders body.
+
+        Price fields follow the order TYPE, not merely what the order carries.
+        Attaching them by presence sent a limit order with a stop price, which
+        Alpaca refuses outright:
+
+            {"code":40010001,"message":"limit orders require no stop price"}
+
+        Observed live on the first order the AI placed after the sizing fix
+        (ADA/USD, rejected_broker). Alpaca's contract: market -> neither,
+        limit -> limit_price, stop -> stop_price, stop_limit -> both,
+        trailing_stop -> neither (it uses trail_price/trail_percent).
+        """
         # Crypto rejects the equity order fields: the day/opg/cls TIFs return
         # HTTP 422 42210000, and extended_hours is equity-only. Remap a
         # non-crypto TIF to gtc and drop extended_hours; equities are unchanged.
@@ -212,10 +226,16 @@ class AlpacaBroker(Broker):
             OrderType.STOP_LIMIT: "stop_limit", OrderType.TRAILING_STOP: "trailing_stop",
         }[order.order_type]
         body["qty"] = str(order.quantity)  # fractional supported for market/day
-        if order.limit_price is not None:
+        wants_limit = order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT)
+        wants_stop = order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
+        if wants_limit and order.limit_price is not None:
             body["limit_price"] = str(order.limit_price)
-        if order.stop_price is not None:
+        if wants_stop and order.stop_price is not None:
             body["stop_price"] = str(order.stop_price)
+        return body
+
+    async def submit_order(self, order: Order) -> Order:
+        body = self._order_body(order)
         # idempotent=False: client_order_id LOOKS like a server-enforced
         # idempotency key, but it is not one. A true idempotency key returns the
         # ORIGINAL resource on replay; Alpaca rejects the replay:
