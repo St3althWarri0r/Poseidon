@@ -232,6 +232,25 @@ def cmd_research(args: argparse.Namespace) -> int:
     return asyncio.run(main())
 
 
+def _listed_model_ids(response: httpx.Response) -> set[str]:
+    """Model ids from an OpenAI-compatible ``/v1/models`` body.
+
+    Returns an empty set when the body is not the expected shape, so a server
+    that shapes its listing differently degrades to a plain reachability check
+    rather than reporting a false failure.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return set()
+    return {m["id"] for m in data if isinstance(m, dict) and isinstance(m.get("id"), str)}
+
+
 def probe_model_backend(
     ai: AIConfig,
     api_key: str | None,
@@ -248,8 +267,21 @@ def probe_model_backend(
         base = (ai.base_url or "").rstrip("/")
         try:
             with httpx.Client(timeout=5.0, transport=transport) as c:
-                c.get(f"{base}/models").raise_for_status()
-            return True, f"reachable at {base}"
+                response = c.get(f"{base}/models")
+                response.raise_for_status()
+            # Reachability alone is a FALSE GREEN. /v1/models lists the models
+            # the server has DOWNLOADED, not the one it has LOADED — so a
+            # backend whose VRAM is held by a different model still answers 200
+            # and lists the configured id, while every completion returns 400.
+            # Observed live: doctor reported OK while no cycle could run.
+            served = _listed_model_ids(response)
+            if served and ai.model not in served:
+                return False, (
+                    f"backend reachable at {base} but it is not serving "
+                    f"{ai.model!r} — available: {', '.join(sorted(served)[:6])}. "
+                    "Load the configured model (or change ai.model)"
+                )
+            return True, f"reachable at {base}, serving {ai.model!r}"
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Connect phase failed — nothing is listening. Actionable: start it.
             return False, (
