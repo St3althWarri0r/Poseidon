@@ -216,8 +216,20 @@ class AlpacaBroker(Broker):
             body["limit_price"] = str(order.limit_price)
         if order.stop_price is not None:
             body["stop_price"] = str(order.stop_price)
+        # idempotent=False: client_order_id LOOKS like a server-enforced
+        # idempotency key, but it is not one. A true idempotency key returns the
+        # ORIGINAL resource on replay; Alpaca rejects the replay:
+        #     HTTP 422 {"code":42210000,"message":"client_order_id must be unique"}
+        # (verified against the live paper API, 2026-08). So a timeout or 5xx on
+        # submit has an UNKNOWN outcome and must be raised ambiguous rather than
+        # auto-retried — a retry resubmits the same client_order_id, earns that
+        # 422, and the manager then marks the order REJECTED_BROKER and releases
+        # its reservation while submit #1 is LIVE at the broker: no poller, no
+        # ORDER_FILLED, so the guardian never arms a stop, and
+        # _reconcile_ambiguous_orders (APPROVED/ERROR only) never repairs it.
         response = await self._request(
-            "POST", f"{self._base}/v2/orders", headers=self._headers, json_body=body
+            "POST", f"{self._base}/v2/orders", headers=self._headers, json_body=body,
+            idempotent=False,
         )
         order.broker = self.name
         order.broker_order_id = response["id"]
