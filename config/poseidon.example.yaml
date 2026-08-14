@@ -198,6 +198,14 @@ risk:
   news_blackout_minutes_before_econ: 10
   volatility_halt_daily_move_pct: 0.08
   slippage_limit_pct: 0.01
+  # How far a RISK-REDUCING order may price through the book, as a multiple of
+  # slippage_limit_pct (so 0.01 x 3 = 3% here). Exits need a wider band than
+  # entries: the tight entry band refuses precisely when a stop matters most —
+  # a gapping, one-sided book — which would leave the position unprotected.
+  # The guardian prices a breached stop through the book by this much so the
+  # exit crosses and fills, with the fill still bounded. Never set it so wide
+  # that a fat-fingered exit passes.
+  exit_slippage_multiple: 3.0
   # Portfolio VaR halt (0 = off). When set, new risk requires fresh risk
   # metrics and is blocked while 1-day VaR(95) exceeds this % of equity.
   max_portfolio_var_pct: 0

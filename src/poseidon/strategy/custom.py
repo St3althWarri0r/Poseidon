@@ -85,8 +85,22 @@ _UNSAFE_BUILTINS = {
 _SAFE_IMPORT_MODULES = {
     "math", "statistics", "cmath", "decimal", "fractions", "numbers", "random",
     "datetime", "itertools", "functools", "collections", "json", "re", "string",
-    "typing", "dataclasses", "enum", "bisect", "heapq", "operator", "textwrap",
+    "typing", "dataclasses", "enum", "bisect", "heapq", "textwrap",
 }
+# ``operator`` is deliberately NOT allowlisted. attrgetter/itemgetter/
+# methodcaller take their path as a STRING, which the AST screen cannot inspect
+# (a string literal is not an ast.Attribute node, and _has_format_traversal only
+# matches {...} format fields). So
+# ``operator.attrgetter("quote.__func__.__globals__")(ctx.router)`` reaches a
+# real module's globals, whose __builtins__ is the genuine builtins dict —
+# arbitrary in-process code execution, past both the screen and the restricted
+# builtins. Verified by execution during the 2026-08 audit.
+#
+# Removing it closes the demonstrated vector, NOT the class: any allowlisted
+# module offering string-driven attribute access reopens it. The module
+# docstring above is wrong that restricted builtins contain this — they govern
+# only the algorithm's own namespace. The real boundary is out-of-process
+# execution, which strategy/engine.py concedes does not exist yet.
 
 
 def _guarded_import(name: str, globals: Any = None, locals: Any = None,  # noqa: A002
@@ -157,14 +171,20 @@ def validate_algorithm(source: str) -> list[str]:
         problems.append("`scan` must take exactly one argument (ctx)")
 
     for node in ast.walk(tree):
+        # Mirror the RUNTIME allowlist (_guarded_import), not a denylist. These
+        # had diverged: the screen denied a fixed set while the runtime admitted
+        # a fixed set, so a module in neither list — `operator`, the sandbox
+        # escape vector — validated clean and only failed on execution. A draft
+        # that can never run must not save clean, and an allowlist here cannot
+        # silently miss a newly dangerous module the way a denylist does.
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root in _FORBIDDEN_IMPORTS:
+                if root not in _SAFE_IMPORT_MODULES:
                     problems.append(f"import of '{alias.name}' is not allowed in an algorithm")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if root in _FORBIDDEN_IMPORTS:
+            if node.level != 0 or root not in _SAFE_IMPORT_MODULES:
                 problems.append(f"import from '{node.module}' is not allowed in an algorithm")
         elif isinstance(node, ast.Call):
             fn = node.func

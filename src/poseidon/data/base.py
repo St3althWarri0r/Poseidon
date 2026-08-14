@@ -174,6 +174,18 @@ class MarketDataProvider(abc.ABC):
             raise ProviderRateLimitError(
                 self.name, self._parse_retry_after(response.headers.get("Retry-After"))
             )
+        if response.status_code in (404, 410):
+            # A missing/gone RESOURCE is a permanent fact about this symbol, not
+            # an outage of the provider. DataRouter._route skips a provider on a
+            # non-retryable error but calls record_failure on a retryable one —
+            # and the penalty box is keyed on the provider, NOT on
+            # (provider, capability). So a delisted crypto pair classified as
+            # retryable penalises that provider for every capability it serves,
+            # including equity QUOTES.
+            raise ProviderError(
+                self.name, f"HTTP {response.status_code}: {response.text[:300]}",
+                retryable=False,
+            )
         if response.status_code >= 400:
             raise ProviderError(self.name, f"HTTP {response.status_code}: {response.text[:300]}")
         try:

@@ -345,9 +345,13 @@ class FakeKernel:
                 "avg_slippage_bps_by_side": {"buy": 2.1, "sell": 0.7},
                 "avg_slippage_bps_by_symbol": {}, "avg_seconds_to_fill": 11.3}
 
-    async def set_mode(self, mode):  # noqa: ANN001
+    async def set_mode(self, mode, *, expires_at=None):  # noqa: ANN001
+        # expires_at mirrors ApplicationKernel.set_mode's autonomy consent
+        # bound; /api/mode always passes it, so the stub must accept it or
+        # every mode change through this harness 500s.
         self.mode = mode
         self.order_manager.mode = mode
+        self.autonomous_expires_at = expires_at
 
     async def run_review_cycle(self):
         return None

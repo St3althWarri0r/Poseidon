@@ -376,14 +376,23 @@ class OrderNotionalRule(RiskRule):
     name = "order_notional_bounds"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            # BOTH bounds are entry filters. Neither may apply to an exit.
+            #
+            # The min bound never did: an under-min exit cannot be restructured
+            # to pass, so a sub-min position could never be closed.
+            #
+            # The max bound used to, on the reasoning that "an over-max exit can
+            # be split" — but nothing in the tree splits one. The guardian sizes
+            # to the whole position (guardian.py:201 -> :246-248) and
+            # _build_flatten_exit does the same (manager.py:866), so a position
+            # above max_order_notional was structurally un-closable: the stop
+            # re-armed and re-rejected every tick, and flatten_all refused it
+            # too, which also disarmed the halt kill-switch for that position.
+            # Reachable at ordinary account sizes via a dedicated sleeve.
+            return
         if ctx.notional > ctx.config.max_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} exceeds max {ctx.config.max_order_notional}")
-        if ctx.order.side.is_risk_reducing:
-            # The min bound is an anti-churn entry filter. It must not apply to
-            # exits: unlike an over-max exit (which can be split), an under-min
-            # exit cannot be restructured to pass, so a sub-min position could
-            # never be closed — guardian stops included.
-            return
         if ctx.notional < ctx.config.min_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} below min {ctx.config.min_order_notional}")
 
@@ -440,6 +449,14 @@ class SlippageProtectionRule(RiskRule):
 
     def check(self, ctx: RiskContext) -> None:
         band = Decimal(str(ctx.config.slippage_limit_pct))
+        # Exits price through the book on purpose. Holding them to the entry
+        # band refused the guardian's stop-loss on exactly the gapping,
+        # one-sided book a stop exists for, leaving the position unprotected;
+        # the exit band is wider but still bounded, so a fat-fingered exit is
+        # refused just the same. Never remove the bound entirely — see
+        # risk/CLAUDE.md invariant 1, and note ReduceOnlyRule stays unexempted.
+        if ctx.order.side.is_risk_reducing:
+            band *= Decimal(str(ctx.config.exit_slippage_multiple))
         reference = ctx.reference_price
         if ctx.order.limit_price is not None:
             deviation = abs(ctx.order.limit_price - reference) / reference
@@ -447,11 +464,11 @@ class SlippageProtectionRule(RiskRule):
                 raise RiskViolation(
                     self.name,
                     f"limit {ctx.order.limit_price} is {float(deviation):.2%} from live price "
-                    f"{reference:.2f} (band {ctx.config.slippage_limit_pct:.2%})",
+                    f"{reference:.2f} (band {float(band):.2%})",
                 )
         elif ctx.order.order_type.value == "market":
             spread = ctx.quote.spread_pct
-            if spread is None or float(spread) > ctx.config.slippage_limit_pct:
+            if spread is None or Decimal(str(spread)) > band:
                 raise RiskViolation(self.name, "market order refused: spread too wide or book one-sided")
 
 
@@ -550,6 +567,10 @@ class OrdersPerDayRule(RiskRule):
     name = "max_orders_per_day"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return  # a daily cap throttles new risk, never an exit: without
+            # this, hitting the cap trapped every open position until the
+            # Eastern-midnight counter roll, guardian stop-losses included.
         if ctx.orders_today >= ctx.config.max_orders_per_day:
             raise RiskViolation(self.name, f"{ctx.orders_today} orders today, limit {ctx.config.max_orders_per_day}")
 
