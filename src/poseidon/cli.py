@@ -2,7 +2,7 @@
 
     poseidon run                    start the platform (24/7 service entry point)
     poseidon doctor                 self-diagnostics
-    poseidon vault init|unlock-check|set|rm|list
+    poseidon vault init|unlock-check|set|rm|rekey|list
     poseidon config validate|example
     poseidon audit verify|tail
     poseidon update check|apply
@@ -410,6 +410,19 @@ def cmd_vault(args: argparse.Namespace) -> int:
     elif action == "rm":
         vault.delete(args.name)
         print(f"Removed credential '{args.name}'.")
+    elif action == "rekey":
+        # _unlock above already proved the OLD passphrase, so this rotates a
+        # vault the operator can currently open — it can never recover a
+        # forgotten one.
+        p1 = getpass.getpass("New vault passphrase (min 8 chars): ")
+        p2 = getpass.getpass("Repeat: ")
+        if p1 != p2:
+            print("Passphrases do not match.", file=sys.stderr)
+            return 2
+        vault.rekey(p1)
+        print(f"Vault re-encrypted under the new passphrase "
+              f"({len(vault.names())} credential(s) preserved).")
+        print("Update POSEIDON_VAULT_PASSPHRASE / the passphrase file if you use one.")
     elif action == "list":
         for name in vault.names():
             print(name)
@@ -564,6 +577,8 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser.add_argument("value", nargs="?", help="omit to enter interactively (hidden)")
     rm_parser = vault_sub.add_parser("rm")
     rm_parser.add_argument("name")
+    vault_sub.add_parser(
+        "rekey", help="change the vault passphrase (re-encrypts in place)")
     vault_sub.add_parser("list")
     vault.set_defaults(func=cmd_vault)
 

@@ -36,6 +36,9 @@ _SALT_LEN = 16
 _SCRYPT_N = 2**15
 _SCRYPT_R = 8
 _SCRYPT_P = 1
+# Shared by create() and rekey(): rotation must not be allowed to weaken a
+# vault below the bar creation enforces.
+_MIN_PASSPHRASE_LEN = 8
 
 
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
@@ -63,8 +66,10 @@ class Vault:
     def create(self, passphrase: str) -> None:
         if self.exists:
             raise VaultError(f"vault already exists at {self._path}")
-        if len(passphrase) < 8:
-            raise VaultError("vault passphrase must be at least 8 characters")
+        if len(passphrase) < _MIN_PASSPHRASE_LEN:
+            raise VaultError(
+                f"vault passphrase must be at least {_MIN_PASSPHRASE_LEN} characters"
+            )
         self._salt = os.urandom(_SALT_LEN)
         self._key = _derive_key(passphrase, self._salt)
         self._secrets = {}
@@ -138,6 +143,42 @@ class Vault:
         secrets = self._require_unlocked()
         secrets.pop(name, None)
         self._persist()
+
+    def rekey(self, new_passphrase: str) -> None:
+        """Re-encrypt the SAME secrets under a new passphrase.
+
+        The vault must already be unlocked with the old passphrase — this
+        rotates the key, it cannot recover a forgotten one.
+
+        A **fresh random salt** is drawn: re-deriving under the existing salt
+        would leave the new key related to the old one, defeating the point of
+        rotating after an exposure. The scrypt parameters and the header layout
+        are deliberately untouched — this package's CLAUDE.md records that they
+        are load-bearing and that any format change must be a versioned
+        migration, which this is not.
+
+        Validation happens BEFORE any state is mutated, so a rejected rotation
+        leaves the vault exactly as it was and the old passphrase still opens
+        it. The write is the usual ``_persist``: 0600 temp file, fsync of both
+        the file and the parent directory, atomic replace — so a crash
+        mid-rotation leaves either the old vault or the new one, never a
+        corrupt hybrid.
+        """
+        self._require_unlocked()
+        if len(new_passphrase) < _MIN_PASSPHRASE_LEN:
+            raise VaultError(
+                f"vault passphrase must be at least {_MIN_PASSPHRASE_LEN} characters"
+            )
+        previous_salt, previous_key = self._salt, self._key
+        self._salt = os.urandom(_SALT_LEN)
+        self._key = _derive_key(new_passphrase, self._salt)
+        try:
+            self._persist()
+        except BaseException:
+            # Keep this handle consistent with what is actually on disk; the
+            # secrets themselves were never touched.
+            self._salt, self._key = previous_salt, previous_key
+            raise
 
     def names(self) -> list[str]:
         """Credential names only — values are never enumerable."""
