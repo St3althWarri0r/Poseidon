@@ -255,6 +255,15 @@ class AIConfig(StrictModel):
     backend: Literal["anthropic", "openai_compatible"] = "anthropic"
     base_url: str | None = None  # required when backend == "openai_compatible"
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)  # openai_compatible path only
+    # Send `strict` (grammar-constrained decoding) on the openai_compatible
+    # path. OFF by default: not every server/model pair can honour it, and a
+    # server that cannot fails the whole request rather than degrading — LM
+    # Studio + gpt-oss-20b returns "The model produced output that does not
+    # match the expected peg-native format" and every cycle dies. Turn it on
+    # only if your server enforces JSON-schema decoding reliably; the strict
+    # guarantee described in ai/schemas.py is only real when it does. The
+    # Anthropic backend always sends strict and is unaffected by this.
+    strict_tools: bool = False
     max_tool_iterations: int = Field(default=24, ge=1, le=100)
     review_interval_seconds: int = Field(default=300, ge=30)
     # Metering (USD per million tokens; defaults match claude-opus-4-8).

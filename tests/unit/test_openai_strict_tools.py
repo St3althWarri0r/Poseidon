@@ -24,11 +24,17 @@ from poseidon.ai.backends.openai_backend import _to_openai_tools
 from poseidon.ai.schemas import ALL_TOOLS, SUBMIT_DECISION_TOOL
 
 
-def test_strict_reaches_the_wire_for_submit_decision() -> None:
-    fn = _to_openai_tools([SUBMIT_DECISION_TOOL])[0]["function"]
+def test_strict_reaches_the_wire_when_enabled() -> None:
+    """Originally this asserted strict travelled UNCONDITIONALLY. That shipped
+    and broke live trading: LM Studio + gpt-oss-20b cannot honour
+    grammar-constrained decoding and failed every request with "The model
+    produced output that does not match the expected peg-native format". The
+    guarantee is only available where the server can provide it, so it is now
+    opt-in (ai.strict_tools) — see test_strict_tools_opt_in.py."""
+    fn = _to_openai_tools([SUBMIT_DECISION_TOOL], strict=True)[0]["function"]
     assert fn.get("strict") is True, (
-        "submit_decision declares strict: True; dropping it in translation means "
-        "the local model gets no schema enforcement on the decision payload"
+        "with ai.strict_tools enabled, submit_decision's strict flag must reach "
+        "the wire — otherwise the setting silently does nothing"
     )
 
 
@@ -36,7 +42,8 @@ def test_strict_is_only_set_where_the_source_tool_declares_it() -> None:
     """Read-only data tools are not strict, and must not silently become so —
     strict + additionalProperties:false on a loose schema would reject valid
     calls rather than accept invalid ones."""
-    for src, out in zip(ALL_TOOLS, _to_openai_tools(ALL_TOOLS), strict=True):
+    for src, out in zip(ALL_TOOLS, _to_openai_tools(ALL_TOOLS, strict=True),
+                        strict=True):
         assert out["function"].get("strict") == src.get("strict"), src["name"]
 
 

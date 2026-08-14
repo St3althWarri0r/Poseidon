@@ -234,6 +234,14 @@ REGISTRY: dict[str, FieldMeta] = {
         label="Flatten positions on halt",
         help="Whether tripping a halt also closes open positions.",
         tier=TIER_READ_ONLY),
+    "ai.strict_tools": FieldMeta(
+        label="Strict tool schemas (local backend)",
+        help=("Ask an OpenAI-compatible server for grammar-constrained decoding. "
+              "Off by default: a server that cannot honour it fails the whole "
+              "request rather than degrading — LM Studio with gpt-oss-20b returns "
+              "\"output that does not match the expected peg-native format\" and "
+              "every review cycle dies. The Anthropic backend is unaffected."),
+        tier=TIER_READ_ONLY),
     "risk.allow_live_crypto": FieldMeta(
         label="Allow crypto on a LIVE broker",
         help=("Off by default: crypto orders are refused on a real-money broker. "
