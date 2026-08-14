@@ -234,6 +234,13 @@ REGISTRY: dict[str, FieldMeta] = {
         label="Flatten positions on halt",
         help="Whether tripping a halt also closes open positions.",
         tier=TIER_READ_ONLY),
+    "risk.allow_live_crypto": FieldMeta(
+        label="Allow crypto on a LIVE broker",
+        help=("Off by default: crypto orders are refused on a real-money broker. "
+              "The docs long described crypto as paper-only, but nothing enforced it — "
+              "both live brokers advertise the crypto capability. Enable only to "
+              "deliberately trade crypto with real money."),
+        tier=TIER_READ_ONLY),
 }
 
 

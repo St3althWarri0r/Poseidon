@@ -348,6 +348,13 @@ class RiskConfig(StrictModel):
     # stop matters most — a gapping, one-sided book — which would leave the
     # position unprotected. Still a band: a fat-fingered exit is refused.
     exit_slippage_multiple: float = Field(default=3.0, ge=1.0)
+    # Crypto on a LIVE brokerage. The docs long stated crypto was "paper-only
+    # today", but nothing enforced it: the only broker-side check is the CRYPTO
+    # capability, which the live alpaca and public_com brokers both advertise —
+    # so a crypto order on a live account was submitted. Default False makes the
+    # documented promise real; set True to deliberately trade crypto with real
+    # money (paper brokers are never affected).
+    allow_live_crypto: bool = False
     # Portfolio VaR halt: block NEW risk when the book's 1-day historical
     # VaR(95) exceeds this fraction of equity. 0 disables the rule. When
     # enabled, fresh risk metrics are REQUIRED before opening new risk.
