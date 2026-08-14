@@ -440,6 +440,14 @@ class SlippageProtectionRule(RiskRule):
 
     def check(self, ctx: RiskContext) -> None:
         band = Decimal(str(ctx.config.slippage_limit_pct))
+        # Exits price through the book on purpose. Holding them to the entry
+        # band refused the guardian's stop-loss on exactly the gapping,
+        # one-sided book a stop exists for, leaving the position unprotected;
+        # the exit band is wider but still bounded, so a fat-fingered exit is
+        # refused just the same. Never remove the bound entirely — see
+        # risk/CLAUDE.md invariant 1, and note ReduceOnlyRule stays unexempted.
+        if ctx.order.side.is_risk_reducing:
+            band *= Decimal(str(ctx.config.exit_slippage_multiple))
         reference = ctx.reference_price
         if ctx.order.limit_price is not None:
             deviation = abs(ctx.order.limit_price - reference) / reference
@@ -447,11 +455,11 @@ class SlippageProtectionRule(RiskRule):
                 raise RiskViolation(
                     self.name,
                     f"limit {ctx.order.limit_price} is {float(deviation):.2%} from live price "
-                    f"{reference:.2f} (band {ctx.config.slippage_limit_pct:.2%})",
+                    f"{reference:.2f} (band {float(band):.2%})",
                 )
         elif ctx.order.order_type.value == "market":
             spread = ctx.quote.spread_pct
-            if spread is None or float(spread) > ctx.config.slippage_limit_pct:
+            if spread is None or Decimal(str(spread)) > band:
                 raise RiskViolation(self.name, "market order refused: spread too wide or book one-sided")
 
 
@@ -550,6 +558,10 @@ class OrdersPerDayRule(RiskRule):
     name = "max_orders_per_day"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            return  # a daily cap throttles new risk, never an exit: without
+            # this, hitting the cap trapped every open position until the
+            # Eastern-midnight counter roll, guardian stop-losses included.
         if ctx.orders_today >= ctx.config.max_orders_per_day:
             raise RiskViolation(self.name, f"{ctx.orders_today} orders today, limit {ctx.config.max_orders_per_day}")
 

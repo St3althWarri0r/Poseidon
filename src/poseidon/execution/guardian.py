@@ -227,13 +227,25 @@ class PositionGuardian:
         # unprotected exactly when the stop mattered most. Take-profit keeps
         # the limit (no urgency; never sell a spike for less than the target).
         is_stop = reason.startswith("stop loss")
+        # A stop is priced THROUGH the book rather than sent as a raw market
+        # order. A raw market order is refused by SlippageProtectionRule
+        # whenever the spread exceeds the band or the book is one-sided —
+        # exactly the disorderly conditions a stop exists for, so the stop
+        # could not execute when it mattered. A limit this far through the
+        # market is marketable (it crosses and fills like a market order) while
+        # still bounding the fill. Take-profit keeps the passive limit at the
+        # level: no urgency, and never sell a spike for less than the target.
+        risk = self._kernel.config.risk  # type: ignore[attr-defined]
+        exit_band = (Decimal(str(risk.slippage_limit_pct))
+                     * Decimal(str(risk.exit_slippage_multiple)))
+        limit_price = price * (Decimal(1) - exit_band) if is_stop else price
         decision = Decision(
             action=DecisionAction.SELL,
             trades=[ProposedTrade(
                 symbol=symbol, side=OrderSide.SELL,
-                order_type=OrderType.MARKET if is_stop else OrderType.LIMIT,
+                order_type=OrderType.LIMIT,
                 quantity=quantity,
-                limit_price=None if is_stop else price,
+                limit_price=limit_price,
                 strategy="guardian",
             )],
             rationale=TradeRationale(

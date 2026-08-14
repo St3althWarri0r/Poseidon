@@ -9,12 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from poseidon.core.config import GuardianConfig
+from poseidon.core.config import GuardianConfig, RiskConfig
 from poseidon.core.enums import (
     DecisionAction,
     MarketSession,
     OrderSide,
     OrderStatus,
+    OrderType,
     TradingMode,
 )
 from poseidon.core.models import Order, Position, Quote
@@ -33,6 +34,11 @@ class KernelStub:
         self.notifications: list[dict] = []
         self.audit_entries: list[tuple[str, str]] = []
 
+        # The REAL RiskConfig, not a hand-rolled stand-in: the guardian prices
+        # its stop exits off slippage_limit_pct x exit_slippage_multiple, and a
+        # stub with invented defaults would drift from the shipped ones exactly
+        # the way tools/ui_verify.py's FakeKernel drifted from set_mode.
+        self.config = SimpleNamespace(risk=RiskConfig())
         self.clock = SimpleNamespace(session=lambda: MarketSession.REGULAR)
         self.broker = SimpleNamespace(name="paper")  # plans are broker-scoped
         self.order_manager = SimpleNamespace(
@@ -96,6 +102,48 @@ async def test_fill_arms_exit_plan(tmp_path) -> None:
     assert plans == [pytest.approx(plans[0])]  # exactly one
     assert plans[0]["symbol"] == "AAPL" and plans[0]["stop_loss"] == "95"
     await db.close()
+
+
+async def test_guardian_stop_is_a_marketable_limit_not_a_raw_market_order(tmp_path) -> None:
+    """A breached stop must still exit on a disorderly book.
+
+    It used to go out as a raw MARKET order, which SlippageProtectionRule
+    refuses whenever the spread exceeds the band or the book is one-sided —
+    i.e. exactly the conditions a stop exists for, so the stop could not
+    execute. It now prices *through* the book by the exit band: marketable, so
+    it crosses and fills like a market order, but the fill is bounded.
+    """
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="94.50", position_qty="10")
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    await guardian.check_all()
+    await guardian.drain()
+
+    trade = kernel.executed_decisions[0].trades[0]
+    assert trade.order_type is OrderType.LIMIT, "a raw MARKET stop is refused on a wide book"
+    assert trade.limit_price is not None
+    # priced through the book by slippage_limit_pct x exit_slippage_multiple
+    risk = kernel.config.risk
+    band = Decimal(str(risk.slippage_limit_pct)) * Decimal(str(risk.exit_slippage_multiple))
+    assert trade.limit_price == Decimal("94.50") * (Decimal(1) - band)
+    # ...and it is BELOW the market, or it would rest instead of crossing
+    assert trade.limit_price < Decimal("94.50")
+
+
+async def test_guardian_take_profit_keeps_the_passive_limit(tmp_path) -> None:
+    """Only the stop is urgent. A take-profit must not be priced through the
+    book — that would sell a spike for less than the target."""
+    db = await _db_with_decision(tmp_path, stop="95", target="120")
+    kernel = KernelStub(mode=TradingMode.AUTONOMOUS, price="121", position_qty="10")
+    guardian = PositionGuardian(GuardianConfig(), db, kernel)
+    await guardian.on_order_filled("order.filled", filled_buy())
+    await guardian.check_all()
+    await guardian.drain()
+
+    trade = kernel.executed_decisions[0].trades[0]
+    assert trade.order_type is OrderType.LIMIT
+    assert trade.limit_price == Decimal("121"), "take-profit prices at the level, not through it"
 
 
 async def test_no_plan_when_nothing_enforceable(tmp_path) -> None:

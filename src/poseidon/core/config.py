@@ -342,6 +342,12 @@ class RiskConfig(StrictModel):
     circuit_breaker_window_seconds: int = Field(default=300, ge=10)
     circuit_breaker_cooldown_seconds: int = Field(default=1800, ge=60)
     slippage_limit_pct: float = Field(default=0.01, gt=0)  # market-order protection band
+    # How far a RISK-REDUCING order may price through the book, as a multiple
+    # of slippage_limit_pct. An exit is refused only beyond this. The band has
+    # to widen for exits because the tight entry band refuses precisely when a
+    # stop matters most — a gapping, one-sided book — which would leave the
+    # position unprotected. Still a band: a fat-fingered exit is refused.
+    exit_slippage_multiple: float = Field(default=3.0, ge=1.0)
     # Portfolio VaR halt: block NEW risk when the book's 1-day historical
     # VaR(95) exceeds this fraction of equity. 0 disables the rule. When
     # enabled, fresh risk metrics are REQUIRED before opening new risk.
