@@ -62,6 +62,27 @@ async def test_a_transient_generation_failure_is_retried_once() -> None:
     assert len(calls) == 2, "the transient failure should have been retried exactly once"
 
 
+async def test_the_retry_resamples_instead_of_replaying() -> None:
+    """Measured in production: the retry fired and the second attempt failed
+    too. At temperature 0.2 an identical prompt reproduces a near-identical
+    generation, so replaying the exact request re-earns the exact failure. The
+    retry must explore a different path to be worth making."""
+    seen: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        seen.append(_json.loads(request.content)["temperature"])
+        return (httpx.Response(400, text=PEG) if len(seen) == 1
+                else httpx.Response(200, json=GOOD))
+
+    cfg = AIConfig(backend="openai_compatible", base_url="http://x/v1", model="m",
+                   temperature=0.2)
+    backend = OpenAICompatibleBackend(cfg, transport=httpx.MockTransport(handler))
+    await backend.complete([{"role": "user", "content": "hi"}], tools=[], system="s")
+    assert seen[0] == 0.2, "the first attempt must use the configured temperature"
+    assert seen[1] > seen[0], "the retry must resample, not replay"
+
+
 async def test_it_gives_up_after_one_retry() -> None:
     backend, calls = _backend([httpx.Response(400, text=PEG)])
     with pytest.raises(AgentError, match="peg-native|predict stream"):

@@ -103,6 +103,16 @@ class OpenAICompatibleBackend:
         own model's output. Any other status is re-raised for the caller's
         classifier."""
         for attempt in (0, 1):
+            if attempt:
+                # Resample rather than replay. Measured in production: the retry
+                # fired and the SECOND attempt failed too, because at
+                # temperature 0.2 an identical prompt reproduces a near-identical
+                # generation — including the one the runtime cannot parse. The
+                # retry only buys anything if it explores a different path, so
+                # nudge temperature for the retry alone. The request is
+                # otherwise byte-identical, and the first attempt keeps the
+                # operator's configured temperature.
+                payload = {**payload, "temperature": max(self._cfg.temperature, 0.7)}
             r = await self._client.post("/chat/completions", json=payload)
             try:
                 r.raise_for_status()
