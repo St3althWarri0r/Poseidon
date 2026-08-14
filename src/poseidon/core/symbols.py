@@ -71,7 +71,40 @@ def canonical_crypto_pair(symbol: str) -> str:
     s = symbol.strip().upper()
     if "/" in s:
         return s
+    # Coinbase's own product form is BASE-QUOTE. Splitting it on the quote
+    # suffix alone left the separator attached ("ADA-USD" -> "ADA-/USD"), a
+    # shape nothing can route. Normalise the separator first.
+    if "-" in s:
+        base, _, quote = s.rpartition("-")
+        if base and quote in SUPPORTED_CRYPTO_QUOTES:
+            return f"{base}/{quote}"
     for quote in SUPPORTED_CRYPTO_QUOTES:
         if s.endswith(quote) and len(s) > len(quote):
             return f"{s[:-len(quote)]}/{quote}"
     return s
+
+
+def crypto_form_hint(symbol: str) -> str | None:
+    """Guidance when ``symbol`` looks like a BARE crypto base (``ADA``, ``AAVE``).
+
+    A bare base is deliberately NOT rewritten: an equity ticker could share the
+    name, and silently resolving one to the other is exactly the guessing a tool
+    must never do. Instead the caller can put this in the error, so the model
+    learns the shape and can retry in the same cycle rather than recording an
+    "unavailable" data gap about data that exists.
+
+    Returns None for anything already pair-shaped, or not a known crypto base.
+    """
+    s = symbol.strip().upper()
+    if "/" in s or "-" in s:
+        return None
+    from ..data.universe import load_universe
+
+    try:
+        bases = {p.split("/")[0] for p in load_universe("crypto")}
+    except Exception:  # noqa: BLE001 - guidance must never break a data path
+        return None
+    if s not in bases:
+        return None
+    return (f"{s} is a crypto BASE, not a tradeable symbol here — use the "
+            f"BASE/QUOTE form, i.e. {s}/USD")
