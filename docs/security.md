@@ -80,7 +80,10 @@ that alters a record breaks every subsequent hash.
   `POSEIDON_DASHBOARD_TOKEN_FILE` — this is how the Docker image
   authenticates; prefer the `_FILE` form so the token is not exposed in the
   process environment. The token is checked (constant-time) on every API
-  request and websocket connect; static assets only are exempt. Prefer
+  request and websocket connect. Exempt: static assets AND the read-only
+  market-study terminal (`/terminal`, `/api/terminal/*`, see `_token_exempt`
+  in `api/server.py`), which serves public market data and no account,
+  position or broker state. Prefer
   an SSH tunnel (`ssh -L 8321:127.0.0.1:8321 host`) or an authenticated
   reverse proxy with TLS even so — the token is sent in clear over plain
   HTTP.

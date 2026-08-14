@@ -84,12 +84,20 @@ def test_no_block_when_empty_or_none() -> None:
 def test_system_prompt_byte_identical() -> None:
     # The Anthropic backend cache-controls tools+system as the frozen prefix;
     # identity text must ride the user turn only. Hashes pin the current prompt
-    # bytes (last updated for the position-sizing/risk-case section) — any
-    # drift busts the prompt cache and fails here until consciously re-pinned.
+    # bytes — any drift busts the prompt cache and fails here until consciously
+    # re-pinned.
+    #
+    # SYSTEM_PROMPT: unchanged (last updated for the position-sizing/risk-case
+    # section).
+    # CHAT_SYSTEM_PROMPT: consciously re-pinned 2026-08. It advertised tools for
+    # "performance, execution quality, ... backtests", none of which exist in
+    # ToolDispatcher — of that list only suggest_position_size is real — which
+    # is a hallucination surface aimed straight at the operator. It now names the
+    # real catalog and states that those three are unavailable.
     assert hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest() == (
         "bb906e82e5f209633bf0b5f42c7c3d1eacc6bf88a195051b55dac0e595dc73b6")
     assert hashlib.sha256(CHAT_SYSTEM_PROMPT.encode()).hexdigest() == (
-        "324ff9971e78a1aba9b6dc7d90e6e57c6125d67bc767a2926f2069ab73c670c1")
+        "563406ad6e227f9d1589d5c7b87ae19c9b4bab6c87019b7518b817ea627dbd7c")
     assert "Instrument identities" not in SYSTEM_PROMPT
     assert "Instrument identities" not in CHAT_SYSTEM_PROMPT
 
