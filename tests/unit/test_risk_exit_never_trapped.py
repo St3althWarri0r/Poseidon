@@ -26,9 +26,15 @@ from decimal import Decimal
 
 import pytest
 
+from poseidon.core.config import RiskConfig
 from poseidon.core.errors import RiskViolation
 from poseidon.core.models import Order, OrderSide, OrderType
-from poseidon.risk.rules import OrdersPerDayRule, ReduceOnlyRule, SlippageProtectionRule
+from poseidon.risk.rules import (
+    OrderNotionalRule,
+    OrdersPerDayRule,
+    ReduceOnlyRule,
+    SlippageProtectionRule,
+)
 
 from .test_risk import ctx
 
@@ -107,6 +113,51 @@ def test_entry_limit_band_is_unchanged() -> None:
                       order_type=OrderType.LIMIT, limit_price=Decimal("102.50"),
                       strategy="momentum")
         SlippageProtectionRule().check(ctx(entry, price="100.00"))
+
+
+# -- OrderNotionalRule: the MAX bound ------------------------------------------
+#
+# The min bound was already exempted for exits, with a comment explaining that
+# an under-min exit "cannot be restructured to pass". The max bound was not,
+# on the stated reasoning that "an over-max exit can be split" — but nothing in
+# the tree splits one. The guardian sizes to the whole position
+# (guardian.py:201 -> :246-248) and halt-flatten does too (manager.py:866), so
+# a position above max_order_notional could never be closed: the stop re-armed
+# and re-rejected every 60s tick, and flatten_all refused it as well.
+
+def _tight_cap() -> RiskConfig:
+    return RiskConfig(max_order_notional=25_000)
+
+
+def test_max_notional_never_blocks_an_exit() -> None:
+    """A 500-share position at $100 is $50k — above a $25k cap. It must still
+    be closable, or the guardian's stop is structurally un-executable."""
+    exit_order = Order(symbol="XYZ", side=OrderSide.SELL, quantity=Decimal("500"),
+                       order_type=OrderType.MARKET, strategy="guardian")
+    OrderNotionalRule().check(ctx(exit_order, price="100.00", config=_tight_cap()))
+
+
+def test_max_notional_still_blocks_an_oversized_entry() -> None:
+    entry = Order(symbol="XYZ", side=OrderSide.BUY, quantity=Decimal("500"),
+                  order_type=OrderType.MARKET, strategy="momentum")
+    with pytest.raises(RiskViolation, match="order_notional_bounds"):
+        OrderNotionalRule().check(ctx(entry, price="100.00", config=_tight_cap()))
+
+
+def test_min_notional_still_exempts_exits() -> None:
+    """The pre-existing min-bound exemption must survive this change."""
+    tiny = Order(symbol="XYZ", side=OrderSide.SELL, quantity=Decimal("1"),
+                 order_type=OrderType.MARKET, strategy="guardian")
+    OrderNotionalRule().check(ctx(tiny, price="1.00",
+                                  config=RiskConfig(min_order_notional=500)))
+
+
+def test_min_notional_still_blocks_a_tiny_entry() -> None:
+    tiny = Order(symbol="XYZ", side=OrderSide.BUY, quantity=Decimal("1"),
+                 order_type=OrderType.MARKET, strategy="momentum")
+    with pytest.raises(RiskViolation, match="order_notional_bounds"):
+        OrderNotionalRule().check(ctx(tiny, price="1.00",
+                                      config=RiskConfig(min_order_notional=500)))
 
 
 # -- the pairing that makes the above safe ------------------------------------

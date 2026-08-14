@@ -376,14 +376,23 @@ class OrderNotionalRule(RiskRule):
     name = "order_notional_bounds"
 
     def check(self, ctx: RiskContext) -> None:
+        if ctx.order.side.is_risk_reducing:
+            # BOTH bounds are entry filters. Neither may apply to an exit.
+            #
+            # The min bound never did: an under-min exit cannot be restructured
+            # to pass, so a sub-min position could never be closed.
+            #
+            # The max bound used to, on the reasoning that "an over-max exit can
+            # be split" — but nothing in the tree splits one. The guardian sizes
+            # to the whole position (guardian.py:201 -> :246-248) and
+            # _build_flatten_exit does the same (manager.py:866), so a position
+            # above max_order_notional was structurally un-closable: the stop
+            # re-armed and re-rejected every tick, and flatten_all refused it
+            # too, which also disarmed the halt kill-switch for that position.
+            # Reachable at ordinary account sizes via a dedicated sleeve.
+            return
         if ctx.notional > ctx.config.max_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} exceeds max {ctx.config.max_order_notional}")
-        if ctx.order.side.is_risk_reducing:
-            # The min bound is an anti-churn entry filter. It must not apply to
-            # exits: unlike an over-max exit (which can be split), an under-min
-            # exit cannot be restructured to pass, so a sub-min position could
-            # never be closed — guardian stops included.
-            return
         if ctx.notional < ctx.config.min_order_notional:
             raise RiskViolation(self.name, f"notional {ctx.notional:.2f} below min {ctx.config.min_order_notional}")
 
