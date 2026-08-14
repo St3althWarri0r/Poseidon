@@ -276,24 +276,33 @@ class ApplicationKernel:
         # written by the dashboard Settings view and read at construction, while
         # the broker-switch demotion is in-memory only — so a restart could
         # otherwise come up AUTONOMOUS against a LIVE account.
-        clamped = clamp_mode_for_broker(self.order_manager.mode, is_paper=self.broker.is_paper)
-        if clamped is not self.order_manager.mode:
+        #
+        # Computed from the PERSISTED config mode and passed straight into
+        # OrderManager, so there is never an instant where the order manager
+        # exists armed autonomous against real money. (An earlier version read
+        # self.order_manager.mode here — before the order manager was built —
+        # and crashed startup outright.)
+        boot_mode = clamp_mode_for_broker(cfg.mode, is_paper=self.broker.is_paper)
+        self.risk = RiskEngine(cfg.risk, self.portfolio, self.router, self.clock, self.bus,
+                               halt_file=cfg.data_dir / "HALT")
+        self.approvals = ApprovalQueue(self.bus)
+        self.order_manager = OrderManager(
+            self.broker, self.risk, self.approvals, self.db, self.audit, self.bus,
+            mode=boot_mode,
+        )
+        if boot_mode is not cfg.mode:
             log.warning("demoting mode at startup: live broker with autonomous persisted",
-                        was=self.order_manager.mode.value, now=clamped.value,
-                        broker=self.broker.name)
-            await self.set_mode(clamped)
+                        was=cfg.mode.value, now=boot_mode.value, broker=self.broker.name)
+            # Re-run the bookkeeping set_mode owns: the audit record, and
+            # clearing the durable autonomy consent latch (leaving AUTONOMOUS
+            # consumes the grant). Idempotent — the mode is already boot_mode.
+            await self.set_mode(boot_mode)
             await self.bus.publish(Topics.NOTIFY, {
                 "level": "critical", "title": "Autonomous demoted at startup",
                 "body": (f"The persisted mode was AUTONOMOUS but '{self.broker.name}' is a "
                          "LIVE account. Poseidon started in APPROVAL instead. Re-arm "
                          "Autonomous deliberately if that is what you intend."),
             })
-        self.risk = RiskEngine(cfg.risk, self.portfolio, self.router, self.clock, self.bus,
-                               halt_file=cfg.data_dir / "HALT")
-        self.approvals = ApprovalQueue(self.bus)
-        self.order_manager = OrderManager(
-            self.broker, self.risk, self.approvals, self.db, self.audit, self.bus, mode=cfg.mode
-        )
         # Rehydrate the daily order counter so a mid-session restart cannot
         # silently reset max_orders_per_day. Count from the Eastern day start
         # (in UTC) to match the engine's Eastern-midnight roll.
