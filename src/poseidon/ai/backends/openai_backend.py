@@ -22,7 +22,8 @@ from .base import LLMResponse, StopReason, ToolCall, ToolResult
 log = structlog.get_logger(__name__)
 
 
-def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _to_openai_tools(tools: list[dict[str, Any]], *,
+                     strict: bool = False) -> list[dict[str, Any]]:
     """Translate Poseidon's Anthropic-shaped tool defs to OpenAI function tools.
 
     ``strict`` is carried through. ``submit_decision`` declares it alongside
@@ -41,7 +42,7 @@ def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "description": t.get("description", ""),
             "parameters": t["input_schema"],
         }
-        if t.get("strict"):
+        if strict and t.get("strict"):
             fn["strict"] = True
         out.append({"type": "function", "function": fn})
     return out
@@ -75,7 +76,8 @@ class OpenAICompatibleBackend:
             "max_tokens": max_tokens or self._cfg.max_tokens,
         }
         if tools:
-            payload["tools"] = _to_openai_tools(tools)
+            payload["tools"] = _to_openai_tools(
+                tools, strict=self._cfg.strict_tools)
             # LM Studio (and many OpenAI-compatible servers) accept tool_choice
             # only as a string ("auto"/"required"/"none"), NOT a specific-function
             # object. force_tool is only used where exactly one tool is offered

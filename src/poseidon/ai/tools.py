@@ -7,6 +7,7 @@ instructed to fold that into ``data_gaps`` and decline to trade on it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from ..core.config import (
     SnapshotConfig,
 )
 from ..core.errors import ConfigError, DataError
+from ..core.symbols import is_crypto_symbol
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
 from ..risk.engine import RiskEngine
@@ -533,11 +535,27 @@ class ToolDispatcher:
         account = self._portfolio.account
         if account is None:
             raise DataError("no account snapshot — sync the portfolio first")
+        # Size within the BROKER's per-order cap for this asset class, and allow
+        # sub-unit quantities where the asset is fractional. Without both, a
+        # large account proposes orders the broker refuses (20% of $42M is 42x
+        # Alpaca's $200k crypto cap) and a small one floors to zero shares of
+        # anything priced above its balance — the trader silently stops trading
+        # at each end of the range.
+        is_crypto = is_crypto_symbol(symbol)
+        cap: float | None = None
+        if self._broker_limits is not None:
+            per_order = (self._broker_limits() or {}).get("max_order_notional") or {}
+            raw_cap = per_order.get("crypto" if is_crypto else "equity")
+            if raw_cap is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    cap = float(raw_cap)
         result = suggest_size(
             equity=float(account.equity), price=float(price), daily_vol=vol,
             risk_budget_pct=self._risk_config.position_risk_budget_pct,
             max_position_pct=self._risk_config.max_position_pct,
             buying_power=float(account.buying_power),
+            max_order_notional=cap,
+            fractional=is_crypto,
         )
         result["symbol"] = symbol.upper()
         return result
