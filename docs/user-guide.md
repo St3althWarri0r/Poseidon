@@ -187,11 +187,11 @@ auto-tagged as crypto (no asset-class picker needed), quoted 24/7, and
 fractional sizes (e.g. `0.05 BTC`) are allowed. Crypto orders clear the full
 risk engine with only two exemptions — the market-hours gate (crypto trades
 around the clock) and the equity share-count volume floor; see
-docs/risk-controls.md. Crypto is **recommended paper-only** today — and note that
-this is a recommendation, **not an enforced gate**. The only broker-side check is
-the `CRYPTO` capability (`execution/manager.py`), which the live Alpaca and
-Public.com brokers both advertise, so a crypto order placed on a live broker
-**will** be submitted. Crypto needs a crypto-capable
+docs/risk-controls.md. Crypto is **paper-only by default and this is enforced**:
+a crypto order on a real-money broker is refused unless you deliberately set
+`risk.allow_live_crypto: true`. (Until the 2026-08 audit this was only a
+recommendation — both live brokers advertise the crypto capability, so the
+claim had nothing behind it.) Crypto needs a crypto-capable
 data provider configured (enable `alpaca` — see docs/api-configuration.md);
 only `BASE/USD` pairs are supported (a stablecoin pair like `BTC/USDT` is
 rejected with a clear message).

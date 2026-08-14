@@ -224,10 +224,9 @@ Notes:
   stocks endpoint. Because crypto trades 24/7 over a looser REST cadence, its
   real-time freshness gate is its own knob — `data.crypto_real_time_max_age_seconds`
   (default 60s) — while equities stay strict at `data.real_time_max_age_seconds`
-  (default 5s). Crypto trading is **recommended paper-only** today — a
-  recommendation, **not an enforced gate**: the live Alpaca and Public.com
-  brokers both advertise the `CRYPTO` capability, so a crypto order placed on a
-  live broker will be submitted. See docs/broker-setup.md for the live follow-on.
+  (default 5s). Crypto trading is **paper-only by default, and enforced**: a
+  crypto order on a real-money broker is refused unless `risk.allow_live_crypto`
+  is set true. See docs/broker-setup.md for the live follow-on.
 - Alpha Vantage quotes are end-of-day: the freshness policy grades them
   DELAYED/STALE, so they can inform research but never orders — that is by
   design, not a bug.

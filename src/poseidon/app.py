@@ -161,6 +161,22 @@ def _candidate_line(cand: ScoredCandidate) -> str:
 _MODEL_STALE_SECONDS = 45 * 60
 
 
+def clamp_mode_for_broker(mode: TradingMode, *, is_paper: bool) -> TradingMode:
+    """AUTONOMOUS is not permitted on a LIVE broker without a deliberate re-arm.
+
+    Demotion-only: RESEARCH and APPROVAL are never raised, and a paper broker is
+    never clamped. Applied at BOOT as well as on a broker switch, because the
+    in-session demotion is in-memory only — `set_mode` never writes config,
+    while the *persisted* mode (which the dashboard Settings view can write) is
+    what `mode=cfg.mode` reads at construction. Without this, arming autonomous
+    on paper and later connecting a live account meant the next restart came up
+    AUTONOMOUS against real money.
+    """
+    if mode is TradingMode.AUTONOMOUS and not is_paper:
+        return TradingMode.APPROVAL
+    return mode
+
+
 class ApplicationKernel:
     def __init__(self, config: AppConfig, vault: Vault) -> None:
         self.config = config
@@ -256,6 +272,22 @@ class ApplicationKernel:
 
         self.router = self._build_router()
         self.broker = await self._build_broker()
+        # Boot-time clamp (see clamp_mode_for_broker): the persisted mode is
+        # written by the dashboard Settings view and read at construction, while
+        # the broker-switch demotion is in-memory only — so a restart could
+        # otherwise come up AUTONOMOUS against a LIVE account.
+        clamped = clamp_mode_for_broker(self.order_manager.mode, is_paper=self.broker.is_paper)
+        if clamped is not self.order_manager.mode:
+            log.warning("demoting mode at startup: live broker with autonomous persisted",
+                        was=self.order_manager.mode.value, now=clamped.value,
+                        broker=self.broker.name)
+            await self.set_mode(clamped)
+            await self.bus.publish(Topics.NOTIFY, {
+                "level": "critical", "title": "Autonomous demoted at startup",
+                "body": (f"The persisted mode was AUTONOMOUS but '{self.broker.name}' is a "
+                         "LIVE account. Poseidon started in APPROVAL instead. Re-arm "
+                         "Autonomous deliberately if that is what you intend."),
+            })
         self.risk = RiskEngine(cfg.risk, self.portfolio, self.router, self.clock, self.bus,
                                halt_file=cfg.data_dir / "HALT")
         self.approvals = ApprovalQueue(self.bus)

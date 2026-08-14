@@ -77,6 +77,17 @@ class RiskEngine:
 
     # -- accounting ----------------------------------------------------------
 
+
+    @property
+    def config(self) -> RiskConfig:
+        """Read-only view of the validated risk config.
+
+        The order manager needs a couple of policy flags (e.g.
+        ``allow_live_crypto``) at submit time; exposing the model here beats
+        threading individual flags through, and it is immutable in practice —
+        callers must not mutate it.
+        """
+        return self._config
     def set_cycle_attribution(self, signals: list[object]) -> None:
         """Record which strategy signalled which symbols this cycle, so a
         sleeve cap can only apply to symbols its strategy actually surfaced."""

@@ -616,6 +616,13 @@ class OrderManager:
             return f"broker '{broker.name}' does not support options orders"
         if order.asset_class is AssetClass.CRYPTO and BrokerCapability.CRYPTO not in caps:
             return f"broker '{broker.name}' does not support crypto orders"
+        if (order.asset_class is AssetClass.CRYPTO and not broker.is_paper
+                and not self._risk.config.allow_live_crypto):
+            # Not a capability question — a deliberate real-money gate. Both live
+            # brokers advertise CRYPTO, so without this the documented
+            # "crypto is paper-only" was a claim with nothing behind it.
+            return (f"crypto on the LIVE broker '{broker.name}' is disabled — set "
+                    "risk.allow_live_crypto: true to trade crypto with real money")
         if order.quantity % 1 != 0 and BrokerCapability.FRACTIONAL_SHARES not in caps:
             return f"broker '{broker.name}' does not support fractional quantities"
         if order.extended_hours and BrokerCapability.EXTENDED_HOURS not in caps:
