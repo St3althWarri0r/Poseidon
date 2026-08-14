@@ -78,7 +78,7 @@ Every rule is documented with its rationale in docs/risk-controls.md.
 | Field | Default | Notes |
 | --- | --- | --- |
 | `enabled` | true | position guardian (exit-plan enforcement, docs/risk-controls.md#position-guardian) |
-| `interval_seconds` | 60 | watch cadence during market hours |
+| `interval_seconds` | 60 | watch cadence; runs 24/7 — the equity session gate is applied per symbol, so crypto stops are enforced around the clock |
 
 ## `reports`
 
@@ -106,7 +106,7 @@ exactly one of:
 `only_market_hours: true` gates the trigger on the regular session.
 Defaults added automatically when absent: a market-hours `review_cycle`
 every `ai.review_interval_seconds`, a nightly `audit_verify` at 02:15,
-and market-hours `position_guardian` (60 s) and `risk_metrics` (15 min)
+and 24/7 `position_guardian` (60 s, per-symbol session gate) and market-hours `risk_metrics` (15 min)
 refreshes.
 
 ## `notifications[]`

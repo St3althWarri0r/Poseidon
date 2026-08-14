@@ -62,7 +62,13 @@ class _StubAgent:
                         market_session: object, market_regime: object = None,
                         trade_lessons: object = None, analysis_packets: object = None,
                         instrument_identities: object = None,
-                        screener_candidates: list[str] | None = None) -> Decision:
+                        screener_candidates: list[str] | None = None,
+                        # Absorb whatever else run_cycle grows. This stub only
+                        # asserts on watchlist/candidates, so a new kwarg on the
+                        # real agent must not become a TypeError here — that is
+                        # the same stub-signature drift that left
+                        # tools/ui_verify.py red for a month.
+                        **_kw: object) -> Decision:
         self.captured_watchlist = list(watchlist)
         self.captured_candidates = None if screener_candidates is None else list(screener_candidates)
         self.calls += 1

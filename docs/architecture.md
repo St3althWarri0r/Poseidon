@@ -20,7 +20,7 @@ src/poseidon/
 ├── core/          domain models, enums, errors, config, event bus, market clock, DI
 ├── security/      encrypted vault, tamper-evident audit log
 ├── storage/       async SQLite (WAL): orders, decisions, equity, audit, kv
-├── data/          provider ABC, 6 providers, failover router (staleness gate)
+├── data/          provider ABC, 10 providers, failover router (staleness gate)
 ├── brokers/       broker ABC, plugin registry, 6 live plugins + 6 documented stubs
 ├── portfolio/     portfolio state + continuous sync service
 ├── risk/          20 pre-trade rules, circuit breaker, cooldowns
@@ -58,7 +58,7 @@ during market hours, plus any custom cron schedules) or manually:
    and rendered into the notification report.
 4. **Execution.** For each proposed trade the order manager:
    - refuses outright in research mode;
-   - runs all 18 risk rules against a *fresh* quote (any data failure
+   - runs all 22 risk rules against a *fresh* quote (any data failure
      blocks the order);
    - in approval mode, queues for the human with a 15-minute TTL and
      re-runs the risk rules after approval;

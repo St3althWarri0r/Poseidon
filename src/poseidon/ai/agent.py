@@ -10,6 +10,7 @@ the prompt cache stays warm across cycles.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -149,8 +150,15 @@ class ClaudeAgent:
                         trade_lessons: list[TradeLesson] | None = None,
                         analysis_packets: list[AnalysisPacket] | None = None,
                         instrument_identities: dict[str, str] | None = None,
-                        screener_candidates: list[str] | None = None) -> Decision:
-        """Run one full review cycle and return the validated Decision."""
+                        screener_candidates: list[str] | None = None,
+                        broker_limits: dict[str, Any] | None = None) -> Decision:
+        """Run one full review cycle and return the validated Decision.
+
+        ``broker_limits`` is the live broker's ``order_limits()`` — data only,
+        supplied by the caller that already holds the broker. It goes into the
+        prompt so the caps reach the model deterministically rather than only
+        when it elects to call ``get_risk_status``.
+        """
         cycle_id = uuid.uuid4().hex[:12]
         self._dispatcher.sources_used.clear()
         self._dispatcher.reset_cycle_budget()  # per-cycle tool-output ceiling starts fresh
@@ -163,6 +171,7 @@ class ClaudeAgent:
             trade_lessons=trade_lessons, analysis_packets=analysis_packets,
             instrument_identities=instrument_identities,
             screener_candidates=screener_candidates,
+            broker_limits=broker_limits,
             max_render_chars=self._config.analysis.max_render_chars,
             budget=self._config.budget,
         )
@@ -297,6 +306,7 @@ class ClaudeAgent:
                       analysis_packets: list[AnalysisPacket] | None = None,
                       instrument_identities: dict[str, str] | None = None,
                       screener_candidates: list[str] | None = None,
+                      broker_limits: dict[str, Any] | None = None,
                       max_render_chars: int = 1200,
                       budget: CycleBudgetConfig | None = None) -> str:
         signals = ClaudeAgent._bounded_signals(
@@ -363,6 +373,20 @@ class ClaudeAgent:
                 "these are not orders):\n"
                 + "\n".join(f"- {line}" for line in screener_candidates) + "\n\n"
             )
+        # Broker per-order caps stated up front, rather than left behind an
+        # OPTIONAL get_risk_status call. A model that skips that call sizes from
+        # its own arithmetic, hits the broker preflight AFTER submit_decision has
+        # ended the cycle, and — with no rejected-order channel into the next
+        # prompt — re-proposes the identical over-cap order every cycle. Renders
+        # nothing for a broker declaring no limits, so the default is unchanged.
+        limits_block = ""
+        if broker_limits:
+            limits_block = (
+                "BROKER PER-ORDER CAPS — hard limits the broker enforces itself, "
+                "independent of the risk engine. Size every SINGLE order within "
+                "them; a larger position is built, and exited, across cycles:\n"
+                f"{json.dumps(broker_limits, sort_keys=True)}\n\n"
+            )
         analysis_block = ""
         if analysis_packets:
             # Each render() is bounded to max_render_chars and already collapsed
@@ -385,6 +409,7 @@ class ClaudeAgent:
             f"Quantitative strategy signals this cycle (candidates to verify with live data, "
             f"not orders): {signals}\n\n"
             f"{candidate_block}"
+            f"{limits_block}"
             f"{lessons_block}"
             f"{analysis_block}"
             "Begin your review. Gather the live data you need with tools, then call "

@@ -23,12 +23,28 @@ log = structlog.get_logger(__name__)
 
 
 def _to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Translate Poseidon's Anthropic-shaped tool defs to OpenAI function tools."""
-    return [{"type": "function", "function": {
-        "name": t["name"],
-        "description": t.get("description", ""),
-        "parameters": t["input_schema"],
-    }} for t in tools]
+    """Translate Poseidon's Anthropic-shaped tool defs to OpenAI function tools.
+
+    ``strict`` is carried through. ``submit_decision`` declares it alongside
+    ``additionalProperties: false`` and a complete ``required`` list, and that
+    is what makes a malformed decision structurally impossible on the Anthropic
+    path. Dropping it here meant the local model — the backend the live config
+    actually uses — received no grammar-constrained decoding, leaving
+    ``required``/``enum``/``additionalProperties`` decorative. Only propagate it
+    where the source tool asks for it: forcing ``strict`` onto a loose read-only
+    tool schema would start rejecting valid calls.
+    """
+    out: list[dict[str, Any]] = []
+    for t in tools:
+        fn: dict[str, Any] = {
+            "name": t["name"],
+            "description": t.get("description", ""),
+            "parameters": t["input_schema"],
+        }
+        if t.get("strict"):
+            fn["strict"] = True
+        out.append({"type": "function", "function": fn})
+    return out
 
 
 def _map_finish(finish_reason: str | None, calls: list[ToolCall]) -> StopReason:

@@ -36,7 +36,8 @@ dashboard run 24/7.
 
 Exit plans are not suggestions. When an entry fills, its stop-loss /
 take-profit is armed; the guardian checks armed levels against live quotes
-every minute during market hours and acts by mode — alert (research),
+every minute, 24/7 — equity plans act only during market hours, crypto plans
+around the clock — and acts by mode: alert (research),
 propose (approval), execute (autonomous). Armed plans are visible on the
 dashboard's *Exit plans* card, and every trigger notifies you. See
 docs/risk-controls.md#position-guardian.
@@ -54,7 +55,7 @@ you're notified). A daily digest lands on your notification channels at
 
 ## The dashboard (http://127.0.0.1:8321)
 
-A sidebar-navigated app with eight views. The header is always present:
+A sidebar-navigated app with ten views (the eight below plus **Dry run** and **Settings**). The header is always present:
 mode switch (Research / Approval / Auto), market session, **market
 regime**, health, circuit state, *Run cycle*, and **HALT** (kill switch —
 opens the circuit breaker until *Resume*; asks for confirmation). Action
@@ -186,7 +187,11 @@ auto-tagged as crypto (no asset-class picker needed), quoted 24/7, and
 fractional sizes (e.g. `0.05 BTC`) are allowed. Crypto orders clear the full
 risk engine with only two exemptions — the market-hours gate (crypto trades
 around the clock) and the equity share-count volume floor; see
-docs/risk-controls.md. Crypto is **paper-only** today and needs a crypto-capable
+docs/risk-controls.md. Crypto is **recommended paper-only** today — and note that
+this is a recommendation, **not an enforced gate**. The only broker-side check is
+the `CRYPTO` capability (`execution/manager.py`), which the live Alpaca and
+Public.com brokers both advertise, so a crypto order placed on a live broker
+**will** be submitted. Crypto needs a crypto-capable
 data provider configured (enable `alpaca` — see docs/api-configuration.md);
 only `BASE/USD` pairs are supported (a stablecoin pair like `BTC/USDT` is
 rejected with a clear message).

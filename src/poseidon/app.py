@@ -1308,6 +1308,21 @@ class ApplicationKernel:
                     analysis_packets=packets,
                     instrument_identities=identities,
                     screener_candidates=[_candidate_line(c) for c in ranked],
+                    # Data-only per-order caps. Stated in the prompt so the
+                    # model cannot fail to receive them by declining to call
+                    # get_risk_status — a local model skipping an optional tool
+                    # is the expected case, and the broker preflight only
+                    # rejects AFTER the cycle has already ended.
+                    #
+                    # `self.broker` is declared but only bound in start(), so a
+                    # kernel driven without it (research harnesses) has none;
+                    # the caps are optional metadata and the prompt block is
+                    # simply omitted when absent.
+                    broker_limits=(
+                        broker.order_limits()
+                        if (broker := getattr(self, "broker", None)) is not None
+                        else {}
+                    ),
                 )
             except AgentRefusedError as exc:
                 log.warning("agent refused; cycle skipped", error=str(exc))

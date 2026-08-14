@@ -102,6 +102,9 @@ automatically, and `Restart=always` covers crashes.
 ```bash
 systemctl --user disable --now poseidon
 rm -rf ~/.local/share/poseidon ~/.local/bin/poseidon
-rm -rf ~/.config/poseidon          # includes the vault — keys are gone
+rm -rf ~/.config/poseidon          # config only
+# NOTE: the vault is vault.bin under the DATA dir (~/.local/share/poseidon),
+# removed by the line above it — not ~/.config. Back that file up: losing it
+# is unrecoverable and every broker credential goes with it.
 rm ~/.config/systemd/user/poseidon.service
 ```

@@ -7,7 +7,7 @@ from live, authoritative data providers — never from memory, never estimated.
 ```
 ┌────────────┐   signals   ┌──────────────┐  decisions  ┌─────────────┐  orders  ┌─────────┐
 │ Strategy   │────────────▶│ Claude agent │────────────▶│ Risk engine │─────────▶│ Broker  │
-│ screeners  │             │ (tool loop   │             │ 20 rules +  │          │ plugin  │
+│ screeners  │             │ (tool loop   │             │ 22 rules +  │          │ plugin  │
 └────────────┘             │  live data)  │             │ circuit brk │          └─────────┘
       ▲                    └──────┬───────┘             └─────────────┘               │
       │        live quotes/chains/news/calendars              ▲                       │
