@@ -24,7 +24,12 @@ from ..core.config import (
     SnapshotConfig,
 )
 from ..core.errors import ConfigError, DataError
-from ..core.symbols import crypto_form_hint, is_crypto_symbol
+from ..core.symbols import (
+    canonical_crypto_pair,
+    crypto_form_hint,
+    is_crypto_symbol,
+    is_known_crypto_base,
+)
 from ..data.router import DataRouter
 from ..portfolio.state import PortfolioState
 from ..risk.engine import RiskEngine
@@ -93,6 +98,54 @@ def annotate_untrusted(text: str) -> str:
     if warning:
         return f"[injection warning: {warning}]\n{text}"
     return text
+
+
+# BASE ticker charset: letters/digits plus the punctuation real tickers use
+# (BRK.B, BF-B) and the crypto pair slash. Bounded at 21 = the longest pair
+# _CRYPTO_RE admits (15-char base + '/' + 5-char quote).
+_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9./-]{0,20}$")
+
+
+def clean_symbol(raw: str) -> str:
+    """Validate and normalize a model-supplied symbol BEFORE it can be routed.
+
+    Model output is untrusted input. An empty or corrupted symbol used to be
+    forwarded to every provider in turn, and ``DataRouter._route`` scores those
+    upstream rejections as PROVIDER failures — ``record_failure`` puts a healthy
+    provider in the penalty box (15s, doubling to 600s). So one bad generation
+    degraded live routing for every legitimate symbol that followed it. Observed
+    on 2026-08-14 from ``{"symbol": ""}``: Alpaca 400, Finnhub "no quote for ",
+    AlphaVantage rate-limited, all three penalized, for a symbol that could not
+    have matched anything.
+
+    Crypto shape gets two deliberately different treatments:
+
+    * ``BTCUSD`` / ``BTC-USD`` → ``BTC/USD``. Unambiguous once the base is a
+      known crypto base, so it is FIXED rather than reported.
+    * ``BTC`` → :class:`DataError` naming ``BTC/USD``. AMBIGUOUS, because an
+      equity ticker could share the name, so it is REPORTED and never guessed —
+      the same reasoning as :func:`crypto_form_hint`.
+    """
+    if not isinstance(raw, str):
+        raise DataError("symbol must be a string")
+    s = raw.strip().upper()
+    if not s:
+        raise DataError(
+            "symbol is required — an empty symbol cannot match any instrument. "
+            "Supply a ticker (AAPL) or a crypto pair (BTC/USD)."
+        )
+    if not _SYMBOL_RE.match(s):
+        raise DataError(
+            f"{raw[:40]!r} is not a valid symbol. Use a ticker like AAPL or "
+            "BRK.B, or a crypto pair like BTC/USD."
+        )
+    pair = canonical_crypto_pair(s)
+    if pair != s and is_crypto_symbol(pair) and is_known_crypto_base(pair.split("/")[0]):
+        return pair
+    hint = crypto_form_hint(s)
+    if hint is not None:
+        raise DataError(hint)
+    return s
 
 
 class ToolDispatcher:
@@ -203,19 +256,13 @@ class ToolDispatcher:
     # -- data tools --------------------------------------------------------------
 
     async def _tool_get_quote(self, symbol: str) -> dict[str, Any]:
-        # A bare crypto base ("ADA") routes as an equity ticker, finds nothing,
-        # and yields a data gap saying "unavailable" — true but useless, since
-        # the data exists and only the SHAPE was wrong. Name the right form so
-        # the model can retry this cycle. Deliberately not rewritten: an equity
-        # ticker could share the name, and guessing is what a tool must not do.
-        hint = crypto_form_hint(symbol)
-        if hint is not None:
-            raise DataError(hint)
+        symbol = clean_symbol(symbol)
         quote = await self._router.quote(symbol, allow_delayed=self._allow_delayed)
         self.sources_used.add(quote.source)
         return quote.model_dump(mode="json")
 
     async def _tool_get_bars(self, symbol: str, timeframe: str, limit: int) -> dict[str, Any]:
+        symbol = clean_symbol(symbol)
         bars = await self._router.bars(symbol, timeframe=timeframe, limit=limit)
         for b in bars[:1]:
             self.sources_used.add(b.source)
@@ -242,6 +289,7 @@ class ToolDispatcher:
                 "income) apply to equities/ETFs only; for a crypto candidate use "
                 "a directional strategy or record it as unsuitable and move on."
             )
+        underlying = clean_symbol(underlying)
         exp = date.fromisoformat(expiration) if expiration else None
         chain = await self._router.option_chain(underlying, expiration=exp,
                                                 allow_delayed=self._allow_delayed)
@@ -249,6 +297,7 @@ class ToolDispatcher:
         return chain.model_dump(mode="json")
 
     async def _tool_get_news(self, symbols: list[str], limit: int) -> dict[str, Any]:
+        symbols = [clean_symbol(s) for s in symbols]
         articles = await self._router.news(symbols or None, limit=limit)
         for a in articles[:1]:
             self.sources_used.add(a.source)
@@ -272,6 +321,7 @@ class ToolDispatcher:
 
     async def _tool_get_earnings_calendar(self, days_ahead: int,
                                           symbols: list[str]) -> dict[str, Any]:
+        symbols = [clean_symbol(s) for s in symbols]
         events = await self._router.earnings(days_ahead=days_ahead, symbols=symbols or None)
         for e in events[:1]:
             self.sources_used.add(e.source)
@@ -284,6 +334,10 @@ class ToolDispatcher:
         return {"events": [e.model_dump(mode="json") for e in events]}
 
     async def _tool_get_market_snapshot(self, symbol: str) -> dict[str, Any]:
+        # Guard at the ENTRANCE: build_snapshot returns None for any failure, so
+        # without this the actionable "use BTC/USD" cause was flattened into
+        # "no live snapshot available for BTC" — true, and useless to the model.
+        symbol = clean_symbol(symbol)
         snap = await build_snapshot(self._router, symbol, config=self._snapshot_config,
                                     allow_delayed=self._allow_delayed)
         if snap is None or snap.payload is None:
@@ -321,6 +375,7 @@ class ToolDispatcher:
         if disabled is not None:
             return disabled
         cfg = self._fundamentals
+        symbol = clean_symbol(symbol)
         report = await self._router.fundamentals(symbol)
         self.sources_used.add(report.source)  # provenance → Decision.data_sources
         payload: dict[str, Any] = report.model_dump(mode="json")  # Decimal → exact str
@@ -345,6 +400,7 @@ class ToolDispatcher:
         disabled = self._fundamentals_disabled()
         if disabled is not None:
             return disabled
+        symbol = clean_symbol(symbol)
         bounded = max(1, min(limit, self._fundamentals.max_filings))
         filings = await self._router.filings(symbol, limit=bounded)
         out: list[dict[str, Any]] = []
@@ -361,6 +417,7 @@ class ToolDispatcher:
         disabled = self._fundamentals_disabled()
         if disabled is not None:
             return disabled
+        symbol = clean_symbol(symbol)
         bounded = max(1, min(limit, self._fundamentals.max_insider))
         rows = await self._router.insider_transactions(symbol, limit=bounded)
         if not rows:
@@ -472,7 +529,8 @@ class ToolDispatcher:
                 "(ai.pm_tools.correlation=false)")
         from ..analytics.correlation import gather_correlation_matrix
 
-        capped = symbols[: cfg.correlation_max_symbols]  # cap BEFORE any fetch
+        # Cap BEFORE any fetch, then validate every survivor.
+        capped = [clean_symbol(s) for s in symbols[: cfg.correlation_max_symbols]]
         report = await gather_correlation_matrix(
             self._router, capped, window_days=cfg.correlation_window_days,
             method="pearson", min_overlap=cfg.correlation_min_overlap)
@@ -541,6 +599,7 @@ class ToolDispatcher:
         """Vol-targeted size suggestion, from live quote + live bar history."""
         from ..analytics.sizing import daily_volatility, suggest_size
 
+        symbol = clean_symbol(symbol)
         quote = await self._router.quote(symbol, allow_delayed=self._allow_delayed)
         self.sources_used.add(quote.source)
         price = quote.mid or quote.last
