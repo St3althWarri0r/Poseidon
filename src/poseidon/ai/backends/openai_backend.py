@@ -48,6 +48,38 @@ def _to_openai_tools(tools: list[dict[str, Any]], *,
     return out
 
 
+# A server-side failure to parse the MODEL's own output — not a bad request.
+# LM Studio + gpt-oss-20b hits this intermittently ("The model produced output
+# that does not match the expected peg-native format"): measured at ~6% on a
+# live deployment, 70 failures against 1074 completed cycles. The identical
+# request succeeds on retry, and no property of the request reproduces it
+# (prompt size, tool count, strict, max_tokens and multi-turn depth were each
+# bisected against the live endpoint). Losing a whole review cycle to one bad
+# generation is pure waste, so it is retried ONCE — and only this class:
+# context overflow and auth are deterministic and must surface immediately.
+#
+# Safe to retry because a completion places no order: the order path is
+# downstream of submit_decision, so a repeated request cannot double-execute.
+_TRANSIENT_GENERATION_MARKERS = (
+    "predict stream returned an error",
+    "does not match the expected",
+    "peg-native",
+)
+
+_CONTEXT_OVERFLOW_MARKERS = (
+    "exceed_context_size", "context_length_exceeded",
+    "exceeds the available context size", "maximum context length",
+    "context window", "prompt is too long",
+)
+
+
+def _is_transient_generation_error(body: str) -> bool:
+    lower = body.lower()
+    if any(m in lower for m in _CONTEXT_OVERFLOW_MARKERS):
+        return False  # deterministic — a retry burns the cycle and hides the remedy
+    return any(m in lower for m in _TRANSIENT_GENERATION_MARKERS)
+
+
 def _map_finish(finish_reason: str | None, calls: list[ToolCall]) -> StopReason:
     if calls or finish_reason == "tool_calls":
         return "tool_use"
@@ -65,6 +97,24 @@ class OpenAICompatibleBackend:
             timeout=httpx.Timeout(120.0, connect=10.0),
             transport=transport,
         )
+
+    async def _post_with_retry(self, payload: dict[str, Any]) -> httpx.Response:
+        """POST once, retrying a single time if the server failed to parse its
+        own model's output. Any other status is re-raised for the caller's
+        classifier."""
+        for attempt in (0, 1):
+            r = await self._client.post("/chat/completions", json=payload)
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError:
+                body = " ".join((r.text or "").split())
+                if attempt == 0 and _is_transient_generation_error(body):
+                    log.warning("model produced unparseable output; retrying once",
+                                status=r.status_code, body=body[:200])
+                    continue
+                raise
+            return r
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def complete(self, messages: list[Any], *, tools: list[dict[str, Any]],
                        system: str, force_tool: str | None = None,
@@ -84,8 +134,7 @@ class OpenAICompatibleBackend:
             # (the algorithm reviewer), so "required" forces that single tool.
             payload["tool_choice"] = "required" if force_tool else "auto"
         try:
-            r = await self._client.post("/chat/completions", json=payload)
-            r.raise_for_status()
+            r = await self._post_with_retry(payload)
             data = r.json()
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             # Connect-phase failure: the backend could not be reached at all
@@ -116,10 +165,7 @@ class OpenAICompatibleBackend:
             # unrelated error ("contextlib", "exceeded") cannot trigger the
             # remedy and a long preamble cannot hide it.
             lower = full.lower()
-            if any(marker in lower for marker in (
-                    "exceed_context_size", "context_length_exceeded",
-                    "exceeds the available context size", "maximum context length",
-                    "context window", "prompt is too long")):
+            if any(marker in lower for marker in _CONTEXT_OVERFLOW_MARKERS):
                 detail += (f"; fix: reload the model with a larger context length (>=32768) — "
                            f"LM Studio: App Settings > Default Context Length, or "
                            f"`lms load {self.model} --context-length 32768`")
