@@ -84,6 +84,30 @@ def canonical_crypto_pair(symbol: str) -> str:
     return s
 
 
+def is_known_crypto_base(symbol: str) -> bool:
+    """True iff ``symbol`` is a BASE in the configured crypto universe (``ADA``).
+
+    Shape alone cannot answer "is this crypto?" for a slashless symbol — ``ADA``
+    could be an equity ticker and ``BTCUSD`` could be one too — so the universe
+    file is the authority. Callers use it two ways: to decide that splitting
+    ``BTCUSD`` into ``BTC/USD`` is safe rather than a guess, and to decide that a
+    bare base deserves guidance instead of a doomed provider lookup.
+
+    Never raises: a missing/unreadable universe means "unknown", and guidance
+    must never break a data path.
+    """
+    s = symbol.strip().upper()
+    if not s or "/" in s or "-" in s:
+        return False
+    from ..data.universe import load_universe
+
+    try:
+        bases = {p.split("/")[0] for p in load_universe("crypto")}
+    except Exception:  # noqa: BLE001 - classification must never break a data path
+        return False
+    return s in bases
+
+
 def crypto_form_hint(symbol: str) -> str | None:
     """Guidance when ``symbol`` looks like a BARE crypto base (``ADA``, ``AAVE``).
 
@@ -96,15 +120,7 @@ def crypto_form_hint(symbol: str) -> str | None:
     Returns None for anything already pair-shaped, or not a known crypto base.
     """
     s = symbol.strip().upper()
-    if "/" in s or "-" in s:
-        return None
-    from ..data.universe import load_universe
-
-    try:
-        bases = {p.split("/")[0] for p in load_universe("crypto")}
-    except Exception:  # noqa: BLE001 - guidance must never break a data path
-        return None
-    if s not in bases:
+    if not is_known_crypto_base(s):
         return None
     return (f"{s} is a crypto BASE, not a tradeable symbol here — use the "
             f"BASE/QUOTE form, i.e. {s}/USD")
