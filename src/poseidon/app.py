@@ -154,6 +154,13 @@ def _candidate_line(cand: ScoredCandidate) -> str:
             f"r3m={cand.r_3m:+.2f} adv$={_fmt_dollars(cand.dollar_volume)}")
 
 
+# A review cycle is expected at least this often. Generous on purpose: a
+# local-model cycle can run for minutes and the scheduler legitimately skips
+# ticks while one is in flight, so this fires on a genuinely dead or
+# perpetually-failing PM, not on a slow one.
+_MODEL_STALE_SECONDS = 45 * 60
+
+
 class ApplicationKernel:
     def __init__(self, config: AppConfig, vault: Vault) -> None:
         self.config = config
@@ -206,6 +213,8 @@ class ApplicationKernel:
         self.dashboard: DashboardServer
         self.updates: UpdateService
         self._cycle_lock = asyncio.Lock()
+        # Set when a cycle COMPLETES; the model health probe reads it.
+        self._last_cycle_completed_at: datetime | None = None
         # Serializes halt() and resume() so a resume can never interleave with a
         # halt's cancel-all/flatten cleanup (and vice versa) — the breaker latch
         # and the order-cleanup phases must move as one atomic operator action.
@@ -1237,10 +1246,41 @@ class ApplicationKernel:
                 return HealthState.UNHEALTHY, "holiday calendar does not cover today — update Poseidon"
             return HealthState.HEALTHY, None
 
+        async def model_probe() -> tuple[HealthState, str | None]:
+            """Is the PM actually producing decisions?
+
+            There was no probe for the model at all, so a dead or degraded
+            backend was invisible to the health system: a failing cycle logs and
+            publishes SYSTEM_ERROR (deduped to one notification per 5 minutes),
+            and the softer failures — prose instead of a tool call, malformed
+            tool args, hitting max_tool_iterations — persist an ordinary
+            no_action decision that is indistinguishable from a disciplined HOLD.
+
+            This measures the OUTCOME (are cycles completing?) rather than
+            pinging the endpoint, so it catches a reachable-but-useless backend
+            as well as an unreachable one. It never calls the model itself — a
+            health probe must not spend tokens or contend for the endpoint.
+            """
+            if self.agent is None:
+                return HealthState.HEALTHY, None  # research/no-AI deployment
+            since = self._last_cycle_completed_at
+            if since is None:
+                return HealthState.HEALTHY, None  # nothing has run yet
+            idle = (datetime.now(UTC) - since).total_seconds()
+            # Generous: a local-model cycle can take minutes, and the scheduler
+            # legitimately skips ticks while one is in flight.
+            if idle > _MODEL_STALE_SECONDS:
+                return HealthState.UNHEALTHY, (
+                    f"no review cycle completed for {idle / 60:.0f} min — check the "
+                    "model backend is loaded and serving (poseidon doctor)"
+                )
+            return HealthState.HEALTHY, None
+
         self.health.register("broker", broker_probe)
         self.health.register("market_data", data_probe)
         self.health.register("portfolio_sync", sync_probe)
         self.health.register("holiday_calendar", calendar_probe)
+        self.health.register("model", model_probe)
 
     # ------------------------------------------------------------- main cycle
 
@@ -1393,6 +1433,7 @@ class ApplicationKernel:
                     "body": report[:3500],
                 })
                 await self.order_manager.execute_decision(decision)
+            self._last_cycle_completed_at = datetime.now(UTC)
             log.info("review cycle complete", cycle=decision.cycle_id,
                      action=decision.action.value, trades=len(decision.trades),
                      duration_s=round((datetime.now(UTC) - started).total_seconds(), 1))
