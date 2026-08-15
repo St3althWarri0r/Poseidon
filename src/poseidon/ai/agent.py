@@ -177,6 +177,15 @@ class ClaudeAgent:
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         decision_input: dict[str, Any] | None = None
+        # Stall detection: a weak model can loop on calls it has already made
+        # (observed live: a get_portfolio/get_risk_status alternation burning
+        # every iteration — small no-arg results, so the char budgets never
+        # trip). Track exact (tool, args) calls; after max_stalled_iterations
+        # CONSECUTIVE iterations requesting nothing new, abort to a no-action
+        # decision. The dispatcher independently annotates repeated results
+        # (repeat_note), so the model gets explicit warnings before this fires.
+        seen_calls: set[tuple[str, str]] = set()
+        stalled_iterations = 0
 
         def _with_analysis_trace(decision: Decision) -> Decision:
             # Explainability trace: ids only (never packet prose) of the
@@ -205,11 +214,14 @@ class ClaudeAgent:
                     cycle_id, f"cycle ended without a decision: {resp.text[:500]}"))
 
             results: list[ToolResult] = []
+            iteration_calls: list[tuple[str, str]] = []
             for tc in resp.tool_calls:
                 if tc.name == "submit_decision":
                     decision_input = tc.input
                     results.append(ToolResult(tc.id, "decision recorded"))
                     continue
+                iteration_calls.append(
+                    (tc.name, json.dumps(tc.input, sort_keys=True, default=str)))
                 out, is_error = await self._dispatcher.dispatch(tc.name, tc.input)
                 log.info("tool call", cycle=cycle_id, iteration=iteration,
                          tool=tc.name, error=is_error)
@@ -219,6 +231,20 @@ class ClaudeAgent:
             if decision_input is not None:
                 return _with_analysis_trace(
                     self._parse_decision(decision_input, cycle_id, resp.model))
+
+            if iteration_calls and all(c in seen_calls for c in iteration_calls):
+                stalled_iterations += 1
+            else:
+                stalled_iterations = 0
+            seen_calls.update(iteration_calls)
+            stall_limit = self._config.max_stalled_iterations
+            if stall_limit and stalled_iterations >= stall_limit:
+                log.warning("cycle stalled on repeated tool calls", cycle=cycle_id,
+                            stalled_iterations=stalled_iterations)
+                return _with_analysis_trace(self._no_action_decision(
+                    cycle_id,
+                    f"cycle aborted: {stalled_iterations} consecutive iterations repeated "
+                    "identical tool calls without requesting new data"))
 
         log.warning("cycle hit tool-iteration limit", cycle=cycle_id,
                     limit=self._config.max_tool_iterations)

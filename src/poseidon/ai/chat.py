@@ -120,6 +120,13 @@ class ChatService:
         # message must not be able to forge or close one (any case/spacing).
         message = _SESSION_CONTEXT_TAG.sub(lambda m: f"[{m.group(1)}session_context]", message)
         async with self._lock:
+            # Chat owns this dispatcher exclusively (provenance isolation from
+            # the cycle agent), and nothing else ever resets it: without this,
+            # the cumulative tool-output counter spans the whole process
+            # lifetime, and once it crosses the hard ceiling every chat data
+            # tool returns "budget reached" until the engine restarts. One
+            # operator message = one budget cycle.
+            self._dispatcher.reset_cycle_budget()
             history = await self._history_as_messages(_HISTORY_TURNS)
             await self._persist("user", message)
             current = f"<session_context>\n{context}\n</session_context>\n\n{message}"

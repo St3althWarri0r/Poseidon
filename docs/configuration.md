@@ -28,6 +28,7 @@ Secrets never appear in this file: fields named `credential` hold the
 | `input_price_per_mtok` / `output_price_per_mtok` | 5.0 / 25.0 | USD per Mtok for spend estimation |
 | `monthly_budget_usd` | 0 | hard ceiling; review cycles pause when the month's estimated spend reaches it (0 = off) |
 | `max_tool_iterations` | 24 | hard cap on tool round-trips per cycle |
+| `max_stalled_iterations` | 3 | abort the cycle (no action) after this many consecutive iterations that only repeat identical tool calls (0 = off) |
 | `review_interval_seconds` | 300 | default market-hours cycle cadence |
 
 ## `data`
