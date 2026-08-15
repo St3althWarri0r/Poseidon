@@ -59,6 +59,17 @@ _HARD_BUDGET_INSTRUCTION = (
     "Per-cycle data budget reached. Decide with the data you already have, or "
     "record a data_gap. Do not request more market data this cycle."
 )
+# Attached to the SECOND and later byte-identical (tool, arguments) call in a
+# cycle. The live result is still returned in full — the note annotates, never
+# replaces (anti-starvation; a re-fetched quote may legitimately have moved).
+# It exists because the char budgets cannot catch a stalled model alternating
+# small no-arg calls (get_portfolio/get_risk_status): those are budget-exempt
+# by design, so the only honest signal is naming the repetition itself.
+_REPEAT_NOTE = (
+    "identical call #{n} this cycle — you already hold this data. If nothing "
+    "new is needed, stop re-checking: submit your decision, or record what is "
+    "genuinely missing in data_gaps."
+)
 
 # Patterns that resemble prompt-injection inside otherwise-data content (news
 # headlines/summaries the model reads). We ANNOTATE, never rewrite: the item is
@@ -179,12 +190,16 @@ class ToolDispatcher:
         # Cumulative serialized tool-output chars this cycle; reset per cycle by
         # ``reset_cycle_budget()`` (the agent calls it alongside sources_used).
         self._cycle_tool_chars = 0
+        # Exact (tool, canonical-args) call counts this cycle, for _REPEAT_NOTE.
+        self._call_counts: dict[tuple[str, str], int] = {}
 
     def reset_cycle_budget(self) -> None:
-        """Zero the per-cycle cumulative tool-output counter. Called once at the
-        start of each review cycle so the soft/hard ceilings measure THIS cycle,
-        never leaking accumulated output across cycles."""
+        """Zero the per-cycle cumulative tool-output counter and the repeat-call
+        counts. Called once at the start of each review cycle (and per chat
+        message) so the ceilings and repeat notes measure THIS cycle, never
+        leaking accumulated state across cycles."""
         self._cycle_tool_chars = 0
+        self._call_counts.clear()
 
     async def dispatch(self, name: str, tool_input: dict[str, Any]) -> tuple[str, bool]:
         """Execute a tool call. Returns (result_json, is_error)."""
@@ -206,12 +221,16 @@ class ToolDispatcher:
                 })
                 self._cycle_tool_chars += len(payload)
                 return payload, False
+            call_key = (name, json.dumps(tool_input, sort_keys=True, default=str))
+            self._call_counts[call_key] = repeat_n = self._call_counts.get(call_key, 0) + 1
             result = await handler(**tool_input)
             # Soft nudge: substantial data already gathered — attach a converge
             # note but STILL return the real data (anti-starvation preserved).
             if (is_data and isinstance(result, dict)
                     and self._cycle_tool_chars >= budget.soft_cycle_tool_chars):
                 result = {"budget_note": _SOFT_BUDGET_NOTE, **result}
+            if repeat_n >= 2 and isinstance(result, dict):
+                result = {"repeat_note": _REPEAT_NOTE.format(n=repeat_n), **result}
             payload = json.dumps(result, default=str)
             if len(payload) > budget.max_tool_result_chars:
                 payload = self._truncate(result)

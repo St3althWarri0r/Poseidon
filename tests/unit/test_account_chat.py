@@ -323,6 +323,9 @@ class _StubDispatcher:
     def __init__(self) -> None:
         self.dispatched: list[str] = []
 
+    def reset_cycle_budget(self) -> None:
+        pass
+
     async def dispatch(self, name: str, tool_input: dict) -> tuple[str, bool]:
         self.dispatched.append(name)
         return '{"ok": true}', False

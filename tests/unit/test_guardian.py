@@ -129,6 +129,7 @@ async def test_guardian_stop_is_a_marketable_limit_not_a_raw_market_order(tmp_pa
     assert trade.limit_price == Decimal("94.50") * (Decimal(1) - band)
     # ...and it is BELOW the market, or it would rest instead of crossing
     assert trade.limit_price < Decimal("94.50")
+    await db.close()
 
 
 async def test_guardian_take_profit_keeps_the_passive_limit(tmp_path) -> None:
@@ -144,6 +145,7 @@ async def test_guardian_take_profit_keeps_the_passive_limit(tmp_path) -> None:
     trade = kernel.executed_decisions[0].trades[0]
     assert trade.order_type is OrderType.LIMIT
     assert trade.limit_price == Decimal("121"), "take-profit prices at the level, not through it"
+    await db.close()
 
 
 async def test_crypto_stops_are_enforced_while_the_equity_market_is_closed(tmp_path) -> None:

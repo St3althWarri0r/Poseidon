@@ -265,6 +265,11 @@ class AIConfig(StrictModel):
     # Anthropic backend always sends strict and is unaffected by this.
     strict_tools: bool = False
     max_tool_iterations: int = Field(default=24, ge=1, le=100)
+    # Abort the cycle (no action) after this many CONSECUTIVE tool iterations
+    # that only repeat calls already made this cycle — a stalled local model
+    # alternating get_portfolio/get_risk_status otherwise burns the whole
+    # iteration budget on data it already holds. 0 disables the early abort.
+    max_stalled_iterations: int = Field(default=3, ge=0, le=100)
     review_interval_seconds: int = Field(default=300, ge=30)
     # Metering (USD per million tokens; defaults match claude-opus-4-8).
     input_price_per_mtok: float = Field(default=5.0, ge=0)
