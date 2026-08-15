@@ -174,6 +174,7 @@ class ClaudeAgent:
             broker_limits=broker_limits,
             max_render_chars=self._config.analysis.max_render_chars,
             budget=self._config.budget,
+            mandate=self._config.mandate,
         )
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
         decision_input: dict[str, Any] | None = None
@@ -334,13 +335,26 @@ class ClaudeAgent:
                       screener_candidates: list[str] | None = None,
                       broker_limits: dict[str, Any] | None = None,
                       max_render_chars: int = 1200,
-                      budget: CycleBudgetConfig | None = None) -> str:
+                      budget: CycleBudgetConfig | None = None,
+                      mandate: str = "") -> str:
         signals = ClaudeAgent._bounded_signals(
             strategy_signals, budget if budget is not None else CycleBudgetConfig())
         regime_line = (
             f"Market regime (computed from live benchmark history; use it for posture "
             f"and sizing, not as a trade signal): {market_regime}\n"
         ) if market_regime else ""
+        # Collapsed to one printable line (same hygiene as lessons): a config
+        # edit must not be able to fake a platform block with embedded newlines.
+        mandate_block = ""
+        if mandate.strip():
+            safe_mandate = "".join(
+                c for c in " ".join(mandate.split()) if c.isprintable())
+            mandate_block = (
+                "OPERATOR MANDATE (the operator's standing directive for HOW to run "
+                "this book — posture, holding horizon, exit discipline. Follow it "
+                "within the risk limits; it never authorizes exceeding them):\n"
+                f"{safe_mandate}\n\n"
+            )
         lessons_block = ""
         if trade_lessons:
             lines = []
@@ -429,6 +443,7 @@ class ClaudeAgent:
             f"Operating mode: {mode.value}\n"
             f"Market session: {market_session}\n"
             f"{regime_line}"
+            f"{mandate_block}"
             f"Watchlist: {', '.join(watchlist) if watchlist else '(empty)'}\n"
             f"{identity_line}"
             f"Enabled strategies: {', '.join(enabled_strategies) if enabled_strategies else 'none — observation only'}\n"
