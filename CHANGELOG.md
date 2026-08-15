@@ -4,6 +4,96 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.17.0] — 2026-08-15
+
+A hardening release: everything here came out of running v2.16.0 unattended
+against the live paper account and fixing what the deployment's own logs and
+audit sweeps surfaced. No new data sources; the platform's behavior under a
+weak local model and a real broker's edge cases is the whole story.
+
+### Safety
+
+- **Autonomous mode no longer survives a restart onto a LIVE broker.** On
+  boot, `autonomous` + a live (non-paper) broker clamps back to `approval`;
+  crypto trading is additionally gated to paper brokers — enforced in code,
+  not advisory docs.
+- **Crypto stops are enforced 24/7.** The `PositionGuardian` used to return
+  whenever the NYSE session wasn't REGULAR — a crypto position opened Friday
+  evening went unwatched until Monday 09:30 ET. Crypto exit plans are now
+  checked on every guardian tick; the equity session gate survives only for
+  equities (an exchange that is closed cannot execute an exit).
+- **A risk cap can never trap the operator in a position.** Exit orders that
+  *reduce* exposure are exempt from the caps that would have blocked them
+  (over-max positions were previously un-closable); short-option strike basis
+  is pinned so the cap math cannot misprice the risk being reduced.
+- **Alpaca order submission is treated as non-idempotent** (verified against
+  the live paper API): failed submits are never blindly retried into a
+  possible double fill.
+- The algorithm-workshop sandbox escape via a crafted `__subclasses__` walk is
+  closed, and a provider 404 is no longer classified as an outage (it
+  penalty-boxed healthy providers).
+
+### Added
+
+- **Broker-side per-order caps, end to end.** `Broker.order_limits()` is a
+  first-class interface: Alpaca's $200k-per-order crypto notional cap is
+  preflighted broker-side (priced exactly as Alpaca prices it), surfaced to
+  the AI through `get_risk_status` *and* deterministically in the cycle
+  prompt, so the PM sizes within caps instead of discovering them as
+  rejections.
+- **Vault passphrase rotation** (`poseidon vault rekey`) with an operator
+  runbook (`docs/security.md`).
+- **A dashboard Settings view generated from the config schema** — every
+  field, grouped and typed, with restart-required detection; plus fixes so it
+  shows the saved value (not the stale running one) and never falsely flags
+  `Decimal` settings as pending-restart.
+- **Health escalation.** Component health transitions escalate silent→loud
+  (desktop + log), and the health prober now exercises the model backend
+  itself; `poseidon doctor` no longer reports a false green for a server that
+  answers TCP but cannot serve the configured model.
+
+### Fixed — the local-model brain
+
+- **Stalled tool loops abort instead of burning the cycle.** A weak model
+  alternating `get_portfolio`/`get_risk_status` burned all 24 tool iterations
+  on data it already held (10 cycles in one overnight session). The dispatcher
+  now annotates byte-identical repeat calls with an explicit `repeat_note`
+  (real live data still returned), and after `ai.max_stalled_iterations`
+  (default 3) consecutive all-repeat iterations the cycle aborts to an honest
+  no-action decision.
+- **Chat data tools no longer die of old age.** The AI Desk's per-cycle tool
+  budget was never reset, so after ~64k chars of cumulative chat tool output
+  every chat data tool returned "budget reached" until the engine restarted.
+  Each operator message now starts a fresh budget.
+- **Model-supplied symbols are validated at the tool boundary.** Crypto pairs
+  can't reach the options provider (there are no listed crypto options —
+  previously 100+ futile provider calls per session), the model is told the
+  right symbol shape instead of a bare "unavailable", and malformed symbols
+  are rejected before any provider sees them.
+- **Transient generation failures are retried once, resampled.** LM Studio
+  intermittently fails to parse its own model's output (~6% of cycles
+  measured); the retry nudges temperature so an identical bad generation
+  isn't replayed. Context overflow and auth stay fatal-fast, and the overflow
+  error now names the remedy (reload the model with a larger context length).
+- **The read timeout fits a partially-offloaded model** (600s; connect stays
+  10s so a down server still fails fast), sizing works at any account size,
+  strict tools are opt-in (`ai.strict_tools`) because not every server/model
+  pair honors grammar-constrained decoding, and schema enforcement was
+  restored on the local path so `submit_decision` keeps its structural
+  guarantees.
+- Three blockers that kept the trader idle: the regime gate, missing order
+  fields, and retry resampling.
+
+### Fixed — everything else
+
+- The screener no longer nominates candidates the PM cannot quote.
+- Startup crashed when the boot clamp read `order_manager` before it existed.
+- A desktop alert whose body starts with "-" was silently dropped
+  (notify-send parsed it as a flag).
+- Dashboard asset cache busts on content hash, not release version.
+- Guardian stop exits are marketable limits (never raw market orders);
+  take-profits keep the passive limit price.
+
 ## [2.16.0] — 2026-08-13
 
 Round 3 of the starred-repo cross-pollination. The sources this round —
