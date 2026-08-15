@@ -94,7 +94,12 @@ class OpenAICompatibleBackend:
         self._cfg = cfg
         self._client = httpx.AsyncClient(
             base_url=(cfg.base_url or "").rstrip("/"),
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            # Read timeout sized for a partially-offloaded local model, not an
+            # API: Devstral-2 24B at 60% GPU offload measures ~7 tok/s, so a
+            # normal ~700-token decision plus first-cycle prompt processing
+            # exceeds the 120s a hosted endpoint would warrant. Connect stays
+            # short — a down server must still fail fast to BackendUnreachable.
+            timeout=httpx.Timeout(600.0, connect=10.0),
             transport=transport,
         )
 
