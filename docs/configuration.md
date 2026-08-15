@@ -29,6 +29,7 @@ Secrets never appear in this file: fields named `credential` hold the
 | `monthly_budget_usd` | 0 | hard ceiling; review cycles pause when the month's estimated spend reaches it (0 = off) |
 | `max_tool_iterations` | 24 | hard cap on tool round-trips per cycle |
 | `max_stalled_iterations` | 3 | abort the cycle (no action) after this many consecutive iterations that only repeat identical tool calls (0 = off) |
+| `mandate` | `""` | standing operator directive rendered into every cycle prompt (posture, horizon, exit discipline); advisory only, max 1200 chars |
 | `review_interval_seconds` | 300 | default market-hours cycle cadence |
 
 ## `data`

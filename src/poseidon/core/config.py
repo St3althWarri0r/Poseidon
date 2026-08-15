@@ -270,6 +270,11 @@ class AIConfig(StrictModel):
     # alternating get_portfolio/get_risk_status otherwise burns the whole
     # iteration budget on data it already holds. 0 disables the early abort.
     max_stalled_iterations: int = Field(default=3, ge=0, le=100)
+    # Standing operator directive rendered into every cycle prompt (trading
+    # posture, holding horizon, exit discipline). Advisory to the PM's process,
+    # never to the risk engine — it cannot loosen a limit. Bounded so a config
+    # edit can never balloon the prompt; empty renders nothing.
+    mandate: str = Field(default="", max_length=1200)
     review_interval_seconds: int = Field(default=300, ge=30)
     # Metering (USD per million tokens; defaults match claude-opus-4-8).
     input_price_per_mtok: float = Field(default=5.0, ge=0)
