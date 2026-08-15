@@ -4,6 +4,32 @@ All notable, user-facing changes to Poseidon. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); releases are also
 published as GitHub release notes.
 
+## [2.18.0] — 2026-08-15
+
+The constant-scalping release, built the same night v2.17.0 shipped, from
+live failures watched in real time on the paper account.
+
+### Added
+
+- **`ai.mandate`** — a bounded standing directive rendered as an OPERATOR
+  MANDATE block in every cycle's user turn: the operator's word on HOW to run
+  the book (posture, holding horizon, exit discipline). Advisory to the PM's
+  process only; it states explicitly that it never authorizes exceeding risk
+  limits. Collapsed to one printable line so a config edit cannot forge a
+  platform prompt block. First use: the quick in/out scalping directive.
+
+### Fixed
+
+- **A SELL clears same-symbol resting BUYs before it reaches the broker.**
+  Observed live: a stale GTC buy resting at Alpaca made every LINK/USD exit
+  die on their self-trade block ("potential wash trade detected") — from the
+  AI loop and the operator's manual ticket alike, leaving a $200k+ position
+  un-closable. The platform never opens shorts, so an incoming SELL is always
+  position-closing; the opposing resting buy is now canceled first (once,
+  failures audited and skipped, cross-broker rows untouched). BUYs never
+  clear anything, so a guardian's protective take-profit sell always
+  survives a new entry.
+
 ## [2.17.0] — 2026-08-15
 
 A hardening release: everything here came out of running v2.16.0 unattended
