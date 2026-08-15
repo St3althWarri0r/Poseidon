@@ -411,6 +411,13 @@ class OrderManager:
             await self._bus.publish(Topics.ORDER_REJECTED,
                                     {"order": order.model_dump(mode="json"), "reason": reason})
             return order
+        # An incoming SELL is always position-closing (the platform never opens
+        # shorts), and a same-symbol BUY still resting at the broker is doubly
+        # wrong against it: it trips the broker's self-trade block (alpaca 403
+        # "potential wash trade detected" — observed live: a stale GTC buy at
+        # 9.609 made every LINK/USD exit unfillable), and if it later filled it
+        # would re-open the position this exit is closing. Clear them first.
+        await self._clear_opposing_orders(order, broker)
         # The duplicate guard and the actual broker submission must be atomic
         # against other concurrent pipelines, or two of them can both clear
         # the guard and double-submit. Held across retries too (retries are
@@ -799,6 +806,44 @@ class OrderManager:
                 await self._persist(order)
                 log.warning("ambiguous order not live at broker; flagged", order_id=order.id)
         return count
+
+    async def _clear_opposing_orders(self, order: Order, broker: Broker) -> None:
+        """Cancel same-symbol BUY orders still resting at the broker before this
+        SELL is submitted.
+
+        Scope is deliberately narrow — plain SELLs only (options flows and
+        multi-leg orders are untouched), and BUYs never cancel anything, so a
+        guardian's resting protective take-profit SELL can never be cleared by
+        an incoming entry. Mirrors ``cancel_all_open``'s per-order contract:
+        cancel exactly once, any failure is audited and skipped (the exit then
+        proceeds and may still be rejected broker-side — honest, not wedged),
+        and cross-broker rows are never touched."""
+        if order.side is not OrderSide.SELL or order.legs:
+            return
+        placeholders = ", ".join("?" * len(_OPEN_AT_BROKER_STATUSES))
+        rows = await self._db.fetch_all(
+            f"SELECT payload FROM orders WHERE status IN ({placeholders})",
+            _OPEN_AT_BROKER_STATUSES,
+        )
+        for (payload,) in rows:
+            resting = Order.model_validate(json.loads(payload))
+            if (resting.id == order.id
+                    or resting.symbol.upper() != order.symbol.upper()
+                    or resting.side is not OrderSide.BUY
+                    or (resting.broker and resting.broker != broker.name)):
+                continue
+            try:
+                canceled = await broker.cancel_order(resting)
+            except Exception as exc:  # noqa: BLE001 — recorded, never retried:
+                # one wedged cancel must not stall the exit path.
+                await self._audit.append("system", "exit.opposing_cancel_failed",
+                                         {"order_id": resting.id, "symbol": resting.symbol,
+                                          "for_order": order.id, "error": str(exc)})
+                continue
+            await self._persist(canceled)
+            await self._audit.append("system", "exit.opposing_order_canceled",
+                                     {"order_id": resting.id, "symbol": resting.symbol,
+                                      "for_order": order.id})
 
     async def cancel_all_open(self, *, reason: str) -> HaltCleanupSummary:
         """Cancel every order the broker may still hold live — the first cleanup
